@@ -113,25 +113,27 @@ defmodule Tightbeam.HarnessProcessTest do
     :ok = Tightbeam.AccountWriter.ensure_schema(db)
     key = "claude:shared@testhost"
 
+    stdout_runner = fn
+      [
+        _helper,
+        "harness-exec",
+        _identity,
+        lease,
+        "--writer-lock",
+        _lock,
+        "--writer-receipt",
+        receipt,
+        "--",
+        "/bin/true"
+      ] ->
+        send(self(), {:writer_started, lease, receipt})
+        {"transport lost", 255}
+    end
+
     target = %{
       host_config: %{ssh: nil},
       cli_bin: tmp,
       sh: fn
-        [
-          _helper,
-          "harness-exec",
-          _identity,
-          lease,
-          "--writer-lock",
-          _lock,
-          "--writer-receipt",
-          receipt,
-          "--",
-          "/bin/true"
-        ] ->
-          send(self(), {:writer_started, lease, receipt})
-          {"transport lost", 255}
-
         ["cat", path] ->
           case File.read(path) do
             {:ok, bytes} -> {bytes, 0}
@@ -141,7 +143,9 @@ defmodule Tightbeam.HarnessProcessTest do
     }
 
     assert {:error, :unconfirmed_writer_settlement} =
-             Tightbeam.AccountWriter.run(db, key, target, tmp, ["/bin/true"])
+             Tightbeam.AccountWriter.run(db, key, target, tmp, ["/bin/true"],
+               run_command: stdout_runner
+             )
 
     assert_receive {:writer_started, lease, receipt}
     assert {:ok, {:error, :credential_writer_active}} = Tightbeam.AccountWriter.reserve(db, key)
@@ -213,6 +217,38 @@ defmodule Tightbeam.HarnessProcessTest do
              "--",
              "/bin/true"
            ] = opts[:cmd]
+  end
+
+  test "an orphan writer lease is retired only with owning-host revocation proof", %{tmp_dir: tmp} do
+    alias Tightbeam.AccountWriter
+    db = start_supervised!({DB, path: ":memory:", name: :writer_orphan_fixture})
+    :ok = HarnessProcess.ensure_schema(db)
+    :ok = AccountWriter.ensure_schema(db)
+    key = "claude:shared@testhost"
+
+    assert {:ok, {:ok, lease}} = AccountWriter.reserve(db, key)
+    assert :ok = DB.execute(db, "UPDATE account_writer_leases SET acquiredAt=0")
+
+    for {status, expected} <- [{1, :unconfirmed}, {255, :unconfirmed}, {0, :settled}] do
+      target = %{
+        host_config: %{ssh: nil},
+        cli_bin: tmp,
+        sh: fn
+          ["cat", _path] ->
+            {"absent", 1}
+
+          [_, "harness-writer-revoke", lock, receipt] ->
+            assert lock == Tightbeam.Homes.account_writer_lock(tmp)
+            assert Path.basename(receipt) == lease <> ".done"
+            {"", status}
+        end
+      }
+
+      assert AccountWriter.reconcile(db, key, target, tmp) == expected
+    end
+
+    assert {:ok, {:ok, successor}} = AccountWriter.reserve(db, key)
+    refute successor == lease
   end
 
   test "local Cursor launch switches identity before the session helper records it", %{

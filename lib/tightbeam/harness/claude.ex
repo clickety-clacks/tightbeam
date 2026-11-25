@@ -577,9 +577,12 @@ defmodule Tightbeam.Harness.Claude do
         {:subscription, config} when is_map(config) ->
           account = %{"host" => host, "harness" => wire_name(), "slot" => "shared"}
 
-          case Tightbeam.Credentials.with_idle_account_writer(config, account, fn _context ->
-                 [cli_path(state), "catalog-probe" | probe_args]
-               end) do
+          case Tightbeam.Credentials.with_idle_account_writer(
+                 config,
+                 account,
+                 fn _context -> [cli_path(state), "catalog-probe" | probe_args] end,
+                 run_command: sh
+               ) do
             {:ok, result} ->
               parse_catalog_probe(fn _argv -> result end, [], host)
 

@@ -154,3 +154,36 @@ fn losing_the_launcher_keeps_the_owning_host_writer_excluded() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn revoked_account_writer_cannot_start_late() {
+    let root =
+        std::env::temp_dir().join(format!("account-writer-revocation-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let lock = root.join("lease.lock");
+    let receipt = root.join("writer.done");
+    let args = vec![
+        lock.to_string_lossy().into_owned(),
+        receipt.to_string_lossy().into_owned(),
+    ];
+
+    let held = acquire_writer_lock(&lock).unwrap();
+    assert!(revoke_writer(&args).is_err());
+    assert!(!receipt.with_extension("revoked").exists());
+    drop(held);
+    revoke_writer(&args).unwrap();
+
+    fs::write(root.join("release"), "").unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "harness_process::launch_tests::writer_lock_probe",
+        ])
+        .env("TB_TEST_WRITER_ROOT", &root)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(!root.join("ready").exists());
+    assert!(!receipt.exists());
+    fs::remove_dir_all(root).unwrap();
+}

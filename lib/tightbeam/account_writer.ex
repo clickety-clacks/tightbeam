@@ -5,6 +5,8 @@ defmodule Tightbeam.AccountWriter do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
 
+  @launch_grace_ms 2_000
+
   def ensure_schema(db) do
     DB.execute(db, """
     CREATE TABLE IF NOT EXISTS account_writer_leases (
@@ -15,7 +17,7 @@ defmodule Tightbeam.AccountWriter do
     """)
   end
 
-  def run(db, adapter_key, target, home, argv) when is_list(argv) and argv != [] do
+  def run(db, adapter_key, target, home, argv, opts \\ []) when is_list(argv) and argv != [] do
     reconcile(db, adapter_key, target, home)
 
     with {:ok, {:ok, lease}} <- reserve(db, adapter_key) do
@@ -34,7 +36,8 @@ defmodule Tightbeam.AccountWriter do
         "--" | argv
       ]
 
-      result = target.sh.(on_host(target, command))
+      runner = Keyword.get(opts, :run_command, target.sh)
+      result = runner.(on_host(target, command))
 
       case reconcile_lease(db, adapter_key, target, receipt, lease) do
         :settled -> {:ok, result}
@@ -47,14 +50,43 @@ defmodule Tightbeam.AccountWriter do
   end
 
   def reconcile(db, adapter_key, target, home) do
-    with {:ok, [[lease]]} <-
-           DB.query(db, "SELECT leaseId FROM account_writer_leases WHERE adapterKey = ?1", [
-             adapter_key
-           ]) do
-      reconcile_lease(db, adapter_key, target, receipt_path(home, lease), lease)
+    with {:ok, [[lease, acquired_at]]} <-
+           DB.query(
+             db,
+             "SELECT leaseId, acquiredAt FROM account_writer_leases WHERE adapterKey = ?1",
+             [
+               adapter_key
+             ]
+           ) do
+      receipt = receipt_path(home, lease)
+
+      case reconcile_lease(db, adapter_key, target, receipt, lease) do
+        :unconfirmed ->
+          if acquired_at <= System.system_time(:millisecond) - @launch_grace_ms and
+               revoke_on_host(target, home, receipt) and
+               match?({:ok, _}, settle(db, adapter_key, lease)),
+             do: :settled,
+             else: :unconfirmed
+
+        :settled ->
+          :settled
+      end
     else
       _ -> :unconfirmed
     end
+  end
+
+  defp revoke_on_host(target, home, receipt) do
+    helper = Path.join(target.host_config[:cli_bin] || target.cli_bin, "tightbeam")
+
+    command = [
+      helper,
+      "harness-writer-revoke",
+      Tightbeam.Homes.account_writer_lock(home),
+      receipt
+    ]
+
+    match?({_output, 0}, target.sh.(on_host(target, command)))
   end
 
   defp reconcile_lease(db, key, target, receipt, lease) do

@@ -59,7 +59,8 @@ defmodule Tightbeam.Credentials do
   end
 
   @doc "Run one owning-host command that completes and persists an idle account write."
-  def with_idle_account_writer(config, account, command) when is_function(command, 1) do
+  def with_idle_account_writer(config, account, command, opts \\ [])
+      when is_function(command, 1) do
     with {:ok, %{target: target, home: home} = context} <- account_target(config, account) do
       key = "#{account["harness"]}:#{account["slot"]}@#{account["host"]}"
 
@@ -68,7 +69,8 @@ defmodule Tightbeam.Credentials do
         key,
         target,
         home,
-        command.(context)
+        command.(context),
+        opts
       )
     end
   end

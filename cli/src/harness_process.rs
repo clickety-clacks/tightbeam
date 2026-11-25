@@ -123,6 +123,16 @@ fn session_exec_with_mode(
             return Err(error);
         }
     };
+    if let Some(receipt) = writer_receipt {
+        if receipt
+            .with_extension("revoked")
+            .try_exists()
+            .unwrap_or(true)
+        {
+            let _ = writeln!(child_report, "writer_lock");
+            return Err("account writer lease was revoked".into());
+        }
+    }
     if let Err((step, error)) = prepare_session_identity(identity_path, &mut identity, &args[1]) {
         // The parent publishes this only after waitpid. A crash before this write
         // leaves no proof and therefore cannot authorize recovery.
@@ -147,6 +157,34 @@ fn session_exec_with_mode(
     let error = command.exec();
 
     Err(format!("harness command could not be executed: {error}"))
+}
+
+pub fn revoke_writer(args: &[String]) -> Result<(), String> {
+    let [lock, receipt] = args else {
+        return Err("usage: tightbeam harness-writer-revoke <lock-path> <receipt-path>".into());
+    };
+
+    // A free lock alone is insufficient: an SSH command can still be on its
+    // way to this host. Leave a marker under the lock before retiring its lease.
+    let marker = Path::new(receipt).with_extension("revoked");
+    let parent = marker
+        .parent()
+        .ok_or("account writer receipt has no directory")?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!("account writer receipt directory could not be created: {error}")
+    })?;
+    let _lock = acquire_writer_lock(Path::new(lock))?;
+    (|| -> io::Result<()> {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&marker)?
+            .sync_all()?;
+        fs::File::open(parent)?.sync_all()
+    })()
+    .map_err(|error| format!("account writer revocation could not be persisted: {error}"))
 }
 
 fn publish_writer_receipt(path: &Path, lease: &str, code: i32) -> Result<(), String> {
