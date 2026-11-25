@@ -362,7 +362,9 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.ListenerLifecycle, []},
          {Tightbeam.Wakes,
           db: db,
-          holder_prod: true,
+          # Off by default: each check reads every open assignment's holder
+          # wakes on the database writer, at every turn end.
+          holder_prod: false,
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
