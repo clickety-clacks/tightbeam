@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants, createWriteStream, realpathSync } from 'node:fs';
-import { access, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Transform } from 'node:stream';
@@ -42,6 +42,8 @@ export async function install({ tag, platform, home, request = fetch }) {
 
     const payload = join(stage, 'tightbeam');
     await access(join(payload, 'bin', 'tightbeam'), constants.X_OK);
+    const source = JSON.stringify({ tag, archive: name, sha256 });
+    await writeFile(join(payload, 'tightbeam-install-source.json'), source + '\n');
     const destination = join(root, sha256);
     try {
       await rename(payload, destination);
