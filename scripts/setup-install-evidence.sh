@@ -37,24 +37,34 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
   export TIGHTBEAM_FIRST_RUN_ONBOARDING=true
   export DISPLAY=:99
   mkdir "$RUNNER_TEMP/browser-bin"
+  npm install --prefix "$RUNNER_TEMP/browser-tools" playwright@1.58.2
+  "$RUNNER_TEMP/browser-tools/node_modules/.bin/playwright" install chromium
+  export CHROME_BIN
+  CHROME_BIN=$(node -p 'require(process.argv[1]).chromium.executablePath()' "$RUNNER_TEMP/browser-tools/node_modules/playwright")
+  test -x "$CHROME_BIN"
   export PATH="$RUNNER_TEMP/browser-bin:$PATH"
   Xvfb "$DISPLAY" -screen 0 1280x900x24 >"$RUNNER_TEMP/xvfb.log" 2>&1 &
   for i in $(seq 1 20); do
     if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
     sleep 1
   done
-  google-chrome --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 \
+  "$CHROME_BIN" --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 \
     --user-data-dir="$RUNNER_TEMP/onboarding-chrome" about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
   for i in $(seq 1 20); do
     if [ -s "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort" ]; then break; fi
     sleep 1
   done
   export BROWSER_DEBUG_PORT
+  if [ ! -s "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort" ]; then
+    cat "$RUNNER_TEMP/chrome.log"
+    echo 'The browser fixture did not expose its debugging port.' >&2
+    exit 1
+  fi
   BROWSER_DEBUG_PORT=$(head -1 "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort")
   cat > "$RUNNER_TEMP/browser-bin/xdg-open" <<'SHIM'
 #!/bin/sh
 printf '%s\n' "$1" >> "$RUNNER_TEMP/installer-browser-launches.log"
-exec google-chrome --no-sandbox --disable-dev-shm-usage --new-tab \
+exec "$CHROME_BIN" --no-sandbox --disable-dev-shm-usage --new-tab \
   --user-data-dir="$RUNNER_TEMP/onboarding-chrome" "$1" >>"$RUNNER_TEMP/installer-browser-output.log" 2>&1
 SHIM
   chmod +x "$RUNNER_TEMP/browser-bin/xdg-open"
