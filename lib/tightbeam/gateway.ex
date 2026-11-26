@@ -420,7 +420,8 @@ defmodule Tightbeam.Gateway do
          Tightbeam.ListenerLifecycle.listener_spec(
            plug: {Tightbeam.Wire.Router, router_deps},
            port: config.port
-         )
+         ),
+         Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
        ])
     |> Enum.reject(&is_nil/1)
   end

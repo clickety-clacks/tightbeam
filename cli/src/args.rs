@@ -558,6 +558,8 @@ pub enum Command {
         identity: Identity,
         filters: ToplineFilters,
         tree: bool,
+        limit: Option<u32>,
+        after: Option<String>,
     },
     Topline {
         identity: Identity,
@@ -1215,7 +1217,7 @@ COMMANDS:
       fail clearly. Text alone also works with older gateways.
   execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
-           [--session <key>] [--tree]
+           [--session <key>] [--tree | --limit <1..500> [--after <cursor>]]
       The work telemetry the substrate already knows: every work item you can
       see, with its assignment/job/attest/turn counts, who holds it, whether
       anything is running, and how long it has been quiet. --tree renders the
@@ -1223,6 +1225,8 @@ COMMANDS:
       turn that was RUNNING when each item was created, so they record
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
+      --limit pages the flat roster in its existing order. Pass page.nextCursor
+      from the response to --after to get the next page.
       No percentages and no completion estimates: the rows do not support them.
         tightbeam execution-map --origin user --state open --as-user sample-user
         tightbeam execution-map --quiet-over 2h --as-user sample-user
@@ -1928,7 +1932,7 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree | --limit <1..500> [--after <cursor>]]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
 const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
@@ -4138,10 +4142,31 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
+            let limit = nonempty(flags, "limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|limit| (1..=500).contains(limit))
+                        .ok_or("--limit must be an integer from 1 to 500")
+                })
+                .transpose()?;
+
+            let after = nonempty(flags, "after");
+            let tree = flags.contains_key("tree");
+            if after.is_some() && limit.is_none() {
+                return Err("--after requires --limit".to_owned());
+            }
+            if tree && limit.is_some() {
+                return Err("--limit is supported only for the flat execution map".to_owned());
+            }
+
             Ok(Command::Toplines {
                 identity: identity(flags)?,
                 filters: topline_filters(flags)?,
-                tree: flags.contains_key("tree"),
+                tree,
+                limit,
+                after,
             })
         }
         "execution-map-select" => {
@@ -8018,6 +8043,31 @@ mod tests {
                 "--key",
                 "unused",
             ],
+        ] {
+            assert!(parse(strings(&args)).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_map_paging_is_opt_in() {
+        let command = parse(strings(&[
+            "execution-map",
+            "--as-user",
+            "sample-user",
+            "--limit",
+            "25",
+            "--after",
+            "123:wi_example",
+        ]))
+        .unwrap();
+        let body = crate::dispatch::build_request(&command).unwrap().body_json;
+        assert!(body.contains(r#""limit":25"#));
+        assert!(body.contains(r#""after":"123:wi_example""#));
+
+        for args in [
+            vec!["execution-map", "--limit", "0"],
+            vec!["execution-map", "--after", "123:wi_example"],
+            vec!["execution-map", "--tree", "--limit", "25"],
         ] {
             assert!(parse(strings(&args)).is_err());
         }

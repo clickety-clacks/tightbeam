@@ -1587,10 +1587,18 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             filters,
             tree,
+            limit,
+            after,
         } => {
             let mut params = filter_params(filters);
             if *tree {
                 params.push("\"tree\":true".to_owned());
+            }
+            if let Some(limit) = limit {
+                params.push(format!("\"limit\":{limit}"));
+            }
+            if let Some(after) = after {
+                params.push(string_field("after", after));
             }
             Ok(request(identity, "execution-map", vec![], params))
         }
