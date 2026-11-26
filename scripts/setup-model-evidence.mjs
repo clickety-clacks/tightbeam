@@ -17,14 +17,17 @@ const provider = http.createServer(async (request, response) => {
   const welcome = raw.match(/installer[.]first-run-project-ready[.][a-f0-9]{64}/)?.[0];
   let text = REPLY;
   let command;
+  let toolId;
   if (process.env.SETUP_PROJECT_TOOL && welcome) {
     if (last.role === 'tool' && latest.includes('factId')) {
       text = 'Your project is ready in a separate tab.';
     } else if (last.role === 'tool' && latest.includes('sessionKey')) {
       const key = JSON.parse(last.content.match(/\{[\s\S]*\}/)[0]).sessionKey;
-      if (!/^[a-zA-Z0-9:._-]+$/.test(key)) throw new Error('Unexpected project session key');
+      if (!/^[a-zA-Z0-9:._-]+ s_[a-zA-Z0-9_-]+$/.test(key)) throw new Error('Unexpected project session key');
+      toolId = 'call_fixture_condition';
       command = `tightbeam condition --kind ${welcome} --scope '${key}'`;
     } else if (latest.includes('Please create my fixture project')) {
+      toolId = 'call_fixture_spawn';
       command = 'tightbeam spawn --display "Fixture project" --name exec:fixture --archetype default --harness pi --model local/compat-fixture --effort off --key fixture-project';
     } else if (latest.includes('Skip Enzo for now')) {
       text = 'Would you like to set up a project?';
@@ -36,7 +39,7 @@ const provider = http.createServer(async (request, response) => {
   const send = body => response.write(`data: ${JSON.stringify({ ...envelope, ...body })}\n\n`);
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   if (command) {
-    send({ choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'setup_fixture_tool',
+    send({ choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: toolId,
       type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command }) } }] }, finish_reason: null }] });
     send({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
     return response.end('data: [DONE]\n\n');
