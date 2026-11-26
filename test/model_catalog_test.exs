@@ -1298,11 +1298,13 @@ defmodule Tightbeam.ModelCatalogTest do
     missing = {:needs_onboarding, :missing}
     quiet_catalog = unique_name(:optional_harness_missing)
     {:ok, credential_checks} = Agent.start_link(fn -> 0 end)
+    {:ok, clock} = Agent.start_link(fn -> 0 end)
 
     quiet_log =
       capture_log(fn ->
         start_catalog(ctx,
           name: quiet_catalog,
+          now: fn -> Agent.get(clock, & &1) end,
           credential_status: fn
             provider, _host when provider in [:opencode_go, :local_openai] ->
               Agent.update(credential_checks, &(&1 + 1))
@@ -1319,6 +1321,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
         first_check_count = Agent.get(credential_checks, & &1)
         assert first_check_count >= 2
+        Agent.update(clock, fn _ -> :timer.seconds(60) end)
         assert ModelCatalog.get(@host, "pi", quiet_catalog) == expected
 
         await(fn -> Agent.get(credential_checks, & &1) >= first_check_count + 2 end)
@@ -2678,60 +2681,80 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  # O4/I5/AC4 — a credential commit re-derives the catalog immediately, without
-  # waiting for the TTL. Two behaviors, tested apart: the DELETE (a
-  # needs_onboarding outcome is not cached under the full TTL, so the pull
-  # backstop re-derives on the next read) and the PUSH (the wired
-  # `credential-present` recognition re-derives with no read at all).
   describe "credential-present re-derivation (O4/I5/AC4)" do
-    # AC4 fail-before: today a needs_onboarding outcome is cached under the full
-    # TTL via `attempted_at`, so a read after the credential lands — but before
-    # the TTL lapses — still returns the stale needs_onboarding entry. The clock
-    # never advances here; only the world-state (credential presence) changes.
-    test "a needs_onboarding outcome is not cached under the full TTL — the next read re-derives",
-         ctx do
-      present? =
-        start_supervised!(%{
-          id: unique_name(:present),
-          start: {Agent, :start_link, [fn -> false end]}
-        })
+    for {status, reason} <- [
+          {{:needs_onboarding, :missing}, {:needs_onboarding, :missing}},
+          {{:unavailable, :timeout}, {:credential_status_unavailable, :timeout}}
+        ] do
+      test "#{elem(reason, 0)} retries after one minute and refreshes immediately on credential-present",
+           ctx do
+        failure_status = unquote(Macro.escape(status))
+        reason = unquote(Macro.escape(reason))
+        retry_ms = :timer.seconds(60)
+        parent = self()
+        {:ok, clock} = Agent.start_link(fn -> 0 end)
+        {:ok, credential} = Agent.start_link(fn -> failure_status end)
 
-      status = fn _provider ->
-        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
+        log =
+          capture_log(fn ->
+            catalog =
+              start_catalog(ctx,
+                now: fn -> Agent.get(clock, & &1) end,
+                credential_status: fn
+                  :anthropic ->
+                    status = Agent.get(credential, & &1)
+                    send(parent, {:credential_probe, status})
+                    status
+
+                  _provider ->
+                    {:needs_onboarding, :missing}
+                end
+              )
+
+            expected = {[], {:unavailable, reason}}
+            assert_receive {:credential_probe, ^failure_status}, 2_000
+            await(fn -> ModelCatalog.get(@host, "claude", catalog) == expected end)
+
+            Agent.update(clock, fn _ -> retry_ms - 1 end)
+            assert ModelCatalog.get(@host, "claude", catalog) == expected
+            assert ModelCatalog.get(catalog)[{@host, "claude"}] == []
+
+            await(fn ->
+              state = :sys.get_state(catalog)
+              cache = state.entries[{@host, "claude"}]
+              not cache.refreshing and state.background == nil and :queue.is_empty(state.pending)
+            end)
+
+            refute_received {:credential_probe, _}
+
+            Agent.update(clock, fn _ -> retry_ms end)
+            assert ModelCatalog.get(@host, "claude", catalog) == expected
+            assert_receive {:credential_probe, ^failure_status}, 2_000
+
+            # Drain the retry before delivering the credential event. Time stays
+            # fixed at the retry boundary and no read drives the forced probe.
+            await(fn ->
+              cache = :sys.get_state(catalog).entries[{@host, "claude"}]
+              not cache.refreshing and cache.attempted_at == retry_ms
+            end)
+
+            Agent.update(credential, fn _ -> :onboarded end)
+            ModelCatalog.credential_present(@host, :anthropic, catalog)
+            assert_receive {:credential_probe, :onboarded}, 2_000
+            await_fresh(catalog, "claude")
+
+            assert {:ok, %{harness: "claude"}} =
+                     ModelCatalog.route(
+                       @host,
+                       "claude",
+                       Model.new("claude-sonnet-5", effort: "high"),
+                       catalog
+                     )
+          end)
+
+        warning = "model catalog claude on #{@host} refresh degraded: #{inspect(reason)}"
+        assert length(:binary.matches(log, warning)) == 1
       end
-
-      catalog =
-        start_catalog(ctx,
-          ttl_ms: :timer.minutes(15),
-          now: fn -> 0 end,
-          credential_status: status
-        )
-
-      # First boot: no credential in the home yet → catalog is needs_onboarding.
-      await(fn ->
-        match?(
-          {[], {:unavailable, {:needs_onboarding, :missing}}},
-          ModelCatalog.get(@host, "claude", catalog)
-        )
-      end)
-
-      # The credential lands in the home (world-state flips) well under the TTL;
-      # the clock does NOT move, so any re-derivation is driven by the changed
-      # world-state, never by a timer.
-      Agent.update(present?, fn _ -> true end)
-
-      await_fresh(catalog, "claude")
-      {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      assert claude != []
-
-      # End-to-end bar: placement is USABLE, not merely fresh.
-      assert {:ok, %{harness: "claude"}} =
-               ModelCatalog.route(
-                 @host,
-                 "claude",
-                 Model.new("claude-sonnet-5", effort: "high"),
-                 catalog
-               )
     end
 
     # The PUSH: the wired edge itself. A credential commit files the
