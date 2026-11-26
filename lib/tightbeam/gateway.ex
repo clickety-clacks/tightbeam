@@ -418,8 +418,8 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.SentinelSupervisor,
           db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
          Tightbeam.ListenerLifecycle.listener_spec(
-           plug: {Tightbeam.Wire.Router, router_deps},
-           port: config.port
+           [plug: {Tightbeam.Wire.Router, router_deps}, port: config.port] ++
+             if(Application.get_env(:tightbeam, :loopback_only, false), do: [ip: {127, 0, 0, 1}], else: [])
          ),
          Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
        ])

@@ -23,6 +23,7 @@ mod process_tree;
 mod rail_action;
 mod session_connect;
 mod session_rail_scope;
+mod setup;
 mod skills;
 mod transcript;
 mod transport_receipt;
@@ -38,6 +39,16 @@ fn main() {
             "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
         );
         std::process::exit(1);
+    }
+
+    if args.first().is_some_and(|arg| arg == "setup") {
+        match setup::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     if args.first().is_some_and(|arg| arg == "harklight-child") {
