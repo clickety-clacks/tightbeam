@@ -15,6 +15,8 @@ const account = os.userInfo();
 const chatRoot = path.join(home, '.local/share/tightbeam-chat');
 const chatCurrent = path.join(chatRoot, 'current');
 const root = '/opt/tightbeam';
+const quickRoot = path.join(home, '.local/share/tightbeam');
+const chatUrl = 'http://127.0.0.1:4178';
 const env = { ...process.env, TIGHTBEAM_BASE_DIR: base };
 for (const key of ['TIGHTBEAM_TOKEN', 'TIGHTBEAM_GATEWAY_URL', 'TIGHTBEAM_URL', 'TIGHTBEAM_SESSION', 'TIGHTBEAM_SESSION_FILE']) delete env[key];
 
@@ -215,6 +217,41 @@ async function installChat(scratch) {
   fs.symlinkSync(destination, chatCurrent);
 }
 
+function linkTarget(link) {
+  try {
+    return fs.readlinkSync(link);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error(`An unmanaged file already exists at ${link}.`);
+  }
+}
+
+function selectLink(link, target) {
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  const staging = `${link}.setup-${randomUUID()}`;
+  try {
+    fs.symlinkSync(target, staging);
+    fs.renameSync(staging, link);
+  } finally {
+    fs.rmSync(staging, { force: true });
+  }
+}
+
+function installQuick(payload, release) {
+  const builds = path.join(quickRoot, 'builds');
+  const target = path.join(builds, release.commit);
+  fs.mkdirSync(builds, { recursive: true });
+  if (!fs.existsSync(target)) {
+    const staging = fs.mkdtempSync(path.join(builds, '.stage-'));
+    try {
+      fs.cpSync(payload, staging, { recursive: true, verbatimSymlinks: true });
+      fs.renameSync(staging, target);
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  }
+  selectLink(path.join(quickRoot, 'current'), target);
+}
+
 async function stageGateway(scratch, release, activate) {
   const platform = mac ? 'darwin-aarch64' : 'linux-x86_64';
   const version = release.tag.match(/^v([^+]+)/)[1];
@@ -340,16 +377,28 @@ async function setup() {
     const gateway = service('gateway', mode);
     const quickGateway = service('gateway', 'quick');
     const chat = service('chat', 'quick');
-    const release = jsonFile(path.join(path.dirname(cli), '../setup-build.json'));
+    const payload = path.resolve(path.dirname(cli), '..');
+    const release = jsonFile(path.join(payload, 'setup-build.json'));
     const tag = release?.tag;
     const stage = mode === 'full' && (receipt?.mode !== 'full' || receipt.tag !== tag ||
       !fs.existsSync(path.join(root, 'current/tightbeam/bin/tightbeam-gateway')));
     const credentials = path.join(base, 'setup-device-token');
     const needsPair = !fs.existsSync(credentials);
     const needsMain = !receipt?.main;
-    const binary = mode === 'full'
-      ? path.join(root, 'current/tightbeam/bin/tightbeam-gateway')
-      : path.join(path.dirname(cli), 'tightbeam-gateway');
+    const stableBin = mode === 'full' ? path.join(root, 'current/tightbeam/bin') : path.join(quickRoot, 'current/bin');
+    const binary = path.join(stableBin, 'tightbeam-gateway');
+    const quickLink = path.join(quickRoot, 'current');
+    const quickPayload = release && path.join(quickRoot, 'builds', release.commit);
+    const stageQuick = mode === 'quick' &&
+      (!quickPayload || linkTarget(quickLink) !== quickPayload || !fs.existsSync(binary));
+    const commandLink = path.join(home, '.local/bin/tightbeam');
+    const targetCli = path.join(stableBin, 'tightbeam');
+    const currentCommand = linkTarget(commandLink);
+    if (currentCommand && ![path.join(root, 'current/tightbeam/bin/tightbeam'),
+      path.join(quickRoot, 'current/bin/tightbeam')].includes(currentCommand)) {
+      throw new Error(`An unmanaged Tightbeam command already exists at ${commandLink}.`);
+    }
+    const linkCli = currentCommand !== targetCli;
 
     const variables = {
       HOME: home,
@@ -376,14 +425,16 @@ async function setup() {
     const chatFile = (main, admin) => serviceContents('chat', 'quick', process.execPath,
       [path.join(chatCurrent, 'server/chat-server.mjs')], {
         HOME: home, PATH: env.PATH, TIGHTBEAM_BASE_DIR: base,
-        CHAT_DEFAULT_GATEWAY_ORIGIN: chatOrigin, CHAT_DEFAULT_SESSION_KEY: main,
+        CHAT_PUBLIC_ORIGIN: chatUrl, CHAT_DEFAULT_GATEWAY_ORIGIN: chatOrigin, CHAT_DEFAULT_SESSION_KEY: main,
         CHAT_DEFAULT_PRINCIPAL_KEY: admin, CHAT_READ_MARKER_DEVICE_CREDENTIAL_FILE: credentials,
       }, chatCurrent);
     const writeChat = chatConfigChanged || !fs.existsSync(chat.file) || receipt?.chatOrigin !== chatOrigin;
     const startChat = !chatActive || !chat.enabled();
     const providers = providerActions(host);
     const pending = providers.filter(({ needed }) => needed);
-    const needsFirstRun = command(cli, ['onboard', '--first-run', '--check'], { cwd: home }).status === 0;
+    const needsFirstRun = env.TIGHTBEAM_FIRST_RUN_ONBOARDING === 'true' &&
+      !fs.existsSync(path.join(base, 'first-run-onboarding.done')) &&
+      /^  onboard --first-run$/m.test(command(cli, ['help', 'onboard'], { cwd: home }).stdout ?? '');
     const bwrap = available('bwrap');
     const canBubblewrap = () => command(bwrap, ['--unshare-net', '--ro-bind', '/', '/', '/bin/true']).status === 0;
     const readSysctl = (key) => command('sysctl', ['-n', key]).stdout?.trim();
@@ -401,10 +452,11 @@ async function setup() {
     if (Number(process.versions.node.split('.')[0]) < 24) missing.push('Node.js 24 or later');
     if (mode === 'full' && !available('sudo')) missing.push('sudo');
     if (checkNamespaces && !bwrap) missing.push('bubblewrap');
-    if (!stage && !fs.existsSync(binary)) missing.push('the bundled tightbeam-gateway binary');
+    if (!(stage || stageQuick) && !fs.existsSync(binary)) missing.push('the bundled tightbeam-gateway binary');
     if (!mac && command('systemctl', ['--user', 'show-environment']).status !== 0) missing.push('a running systemd user manager');
     if (mac && command('launchctl', ['print', `gui/${account.uid}`]).status !== 0) missing.push('a logged-in macOS desktop session');
     add(missing.length, `Missing prerequisites: ${missing.join(', ')}.`);
+    add(stageQuick, 'Copy the verified Tightbeam package to a stable location in your home directory.');
     add(stage, 'Verify and stage the Tightbeam release under /opt/tightbeam and select it for the system service.');
     add(appArmor, 'Grant bubblewrap access to user namespaces through its AppArmor profile.');
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
@@ -413,6 +465,7 @@ async function setup() {
     add(writeGateway || startGateway, mode === 'quick'
       ? 'Start Tightbeam as a local-only user service with lighter isolation than full mode.'
       : 'Start Tightbeam as a system service that runs your agents under your ordinary user account.');
+    add(linkCli, `Expose the Tightbeam command at ${commandLink}.`);
     add(needsPair, `Pair this computer and create the first Tightbeam administrator for ${account.username}.`);
     for (const { provider } of pending) add(true, `Set up your ${provider} credential for agent turns.`);
     add(needsMain, 'Create your main Tightbeam conversation.');
@@ -427,9 +480,9 @@ async function setup() {
 
     if (missing.length) throw new Error(`Install the missing prerequisites and run setup again: ${missing.join(', ')}.`);
     if (!install.length) return;
-    if (stage && (!/^v[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$/.test(tag ?? '') ||
+    if ((stage || stageQuick) && (!/^v[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$/.test(tag ?? '') ||
         !/^[0-9a-f]{40}$/.test(release?.commit ?? ''))) {
-      throw new Error('Full setup needs a release package with its exact published release provenance.');
+      throw new Error('Setup needs the complete, verified Tightbeam release package.');
     }
     if (!receipt && (gatewayActive || fs.existsSync(gateway.file) || quickGateway.active() || fs.existsSync(quickGateway.file))) {
       throw new Error('A Tightbeam service already exists outside setup. Use its existing installation procedure.');
@@ -465,6 +518,7 @@ async function setup() {
         run('sudo', ['sysctl', '-p', conf]);
       }
       if (checkNamespaces && !canBubblewrap()) throw new Error('The Linux Codex sandbox still cannot create a user namespace.');
+      if (stageQuick) installQuick(payload, release);
       if (stage) await stageGateway(scratch, release, () => {
         if (upgrade) {
           state.gatewayFile ??= fs.readFileSync(quickGateway.file, 'utf8');
@@ -473,7 +527,7 @@ async function setup() {
           removedQuick = true;
         }
       });
-      if (writeGateway || stage || (mac && startGateway)) gateway.install(gatewayFile, scratch, gatewayActive);
+      if (writeGateway || stage || stageQuick || (mac && startGateway)) gateway.install(gatewayFile, scratch, gatewayActive);
       else if (startGateway) gateway.start();
       await waitFor(async () => {
         const descriptor = jsonFile(path.join(base, 'gateway.json'));
@@ -482,6 +536,13 @@ async function setup() {
       }, 'The gateway did not become ready. Check the service log and run setup again.');
       Object.assign(state, { mode, version, advertised, tag });
       save();
+
+      if (linkCli) {
+        selectLink(commandLink, targetCli);
+        if (!(env.PATH ?? '').split(path.delimiter).includes(path.dirname(commandLink))) {
+          console.log(`Add ${path.dirname(commandLink)} to PATH to run tightbeam by name.`);
+        }
+      }
 
       if (needsPair) {
         const result = await pairFirstUser(localOrigin, state.deviceId, state.admin);
@@ -523,12 +584,14 @@ async function setup() {
         chat.start();
       }
       await waitFor(async () => {
-        const target = await getJson('http://127.0.0.1:4178/chat-config.json');
+        const target = await getJson(`${chatUrl}/chat-config.json`);
         return target?.sessionKey === state.main && target?.gateway === chatOrigin;
       }, 'Chat did not serve the installed Main conversation. Check its service log.');
       console.log('Tightbeam Chat is ready at http://127.0.0.1:4178');
-      if (command(cli, ['onboard', '--first-run', '--check'], { cwd: home }).status === 0) {
-        run(cli, ['onboard', '--first-run'], { cwd: home });
+      if (needsFirstRun) {
+        run(targetCli, ['onboard', '--first-run'], {
+          cwd: home, env: { ...env, TIGHTBEAM_CHAT_URL: chatUrl, CHAT_PUBLIC_ORIGIN: chatUrl },
+        });
       }
     } catch (error) {
       if (removedQuick && !gateway.active() && state.gatewayFile) {
