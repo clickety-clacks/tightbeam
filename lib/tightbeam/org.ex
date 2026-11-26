@@ -1323,7 +1323,7 @@ defmodule Tightbeam.Org do
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
-        AND NOT EXISTS (SELECT 1 FROM people_events e WHERE e.wakeId=w.wakeId)
+        AND NOT EXISTS (SELECT 1 FROM people_events e WHERE e.wakeId=w.wakeId AND w.conditionKind IS NULL)
         AND NOT EXISTS (SELECT 1 FROM people_operations o WHERE o.wakeId=w.wakeId)
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_entries e WHERE e.wakeId=w.wakeId

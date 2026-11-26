@@ -1029,9 +1029,18 @@ defmodule Tightbeam.Wakes do
   def delivery_prompt_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
     case get_in_txn(txn, wake_id) do
       nil -> nil
-      wake -> render_delivery_prompt(wake)
+      wake -> append_people_ruling_context(txn, wake, render_delivery_prompt(wake))
     end
   end
+
+  defp append_people_ruling_context(
+         txn,
+         %{condition_kind: "escalation-ruled", wake_id: id},
+         prompt
+       ),
+       do: Tightbeam.PeopleMessages.append_ruling_context_in_txn(txn, id, prompt)
+
+  defp append_people_ruling_context(_txn, _wake, prompt), do: prompt
 
   defp render_delivery_prompt(%{wait_mode: mode, recognition_path: path} = wake)
        when is_binary(mode) and is_binary(path),
@@ -7961,7 +7970,7 @@ defmodule Tightbeam.Wakes do
           do: "[woke: fact #{kind}/#{match.scope || "nil"}]",
           else: "[woke: fallback deadline]"
 
-      stamped_prompt = stamp <> "\n\n" <> wake.prompt
+      stamped_prompt = append_people_ruling_context(txn, wake, stamp <> "\n\n" <> wake.prompt)
 
       Txn.q(
         txn,

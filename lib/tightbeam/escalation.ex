@@ -1100,7 +1100,7 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc false
-  def rule_people_decision_in_txn(txn, message, response) do
+  def rule_people_decision_in_txn(txn, message, response, holder) do
     request_id = message["decision_request_id"]
     address = message["answer_rule"]["address"]
     choice = Enum.find(message["choices"], &(&1["id"] == response))
@@ -1120,7 +1120,7 @@ defmodule Tightbeam.Escalation do
       }
 
       with {:ok, answer} <- normalize_operator_answer(call),
-           {result, _fact_id} <- operator_rule_in_txn(txn, call, request_id, answer, []),
+           {result, fact_id} <- operator_rule_in_txn(txn, call, request_id, answer, []),
            false <- Map.has_key?(result, :code) do
         unless coordinator_request?(request) do
           transition =
@@ -1134,7 +1134,21 @@ defmodule Tightbeam.Escalation do
           Wakes.row_commit_in_txn(txn, List.wrap(transition))
         end
 
-        :ok
+        wake_id =
+          case Txn.q(
+                 txn,
+                 """
+                 SELECT wakeId FROM wakes WHERE conditionKind=?1 AND conditionScope=?2
+                   AND sessionKey=?3 AND origin='process:tightbeam' AND prompt=?4
+                   AND state='pending'
+                 """,
+                 [@terminal_condition_kind, request_id, holder, terminal_notification(request_id)]
+               ) do
+            [[id]] -> id
+            _ -> nil
+          end
+
+        {:ok, wake_id, fact_id}
       else
         _ -> :ineligible
       end

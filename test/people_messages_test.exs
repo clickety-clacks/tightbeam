@@ -156,6 +156,31 @@ defmodule Tightbeam.PeopleMessagesTest do
     assert %{accepted: true} = call(db, @relay, "event", answer)
     assert %{accepted: true, duplicate: true} = call(db, @relay, "event", answer)
 
+    assert {:ok, [[ruling_wake]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM people_events WHERE kind='answer' AND event='ruling'"
+             )
+
+    assert {:ok, [[^ruling_wake]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert {:ok, prompt} =
+             DB.transaction(db, &Tightbeam.Wakes.delivery_prompt_in_txn(&1, ruling_wake))
+
+    assert prompt =~ "Fixture Person"
+    assert prompt =~ ~s("answer_disposition":"ruled")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wakes WHERE prompt LIKE '%answer_disposition%ruled%'"
+             )
+
     assert {:ok, [["ruled", "user:" <> @owner, "accept"]]} =
              DB.query(db, "SELECT status,ruledBy,decision FROM decision_requests WHERE id=?1", [
                request.id

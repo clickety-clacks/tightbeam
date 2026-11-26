@@ -93,7 +93,17 @@ defmodule Tightbeam.PeopleMessages do
             end
           end)
 
-        result
+        case result do
+          {acknowledgment, fact_id} when is_integer(fact_id) ->
+            Wakes.nudge_matching(Tightbeam.WakeScheduler, fact_id)
+            acknowledgment
+
+          {acknowledgment, nil} ->
+            acknowledgment
+
+          acknowledgment ->
+            acknowledgment
+        end
     end
   end
 
@@ -571,10 +581,11 @@ defmodule Tightbeam.PeopleMessages do
                (kind != "chat" or present?(content["body"])),
              "invalid event content"
            ) do
-      disposition = answer_disposition(txn, conversation, kind, params)
+      {disposition, ruling_wake, ruling_fact} =
+        answer_disposition(txn, conversation, kind, params)
+
       payload = Map.put(params, "answer_disposition", disposition)
-      name = if speaker, do: speaker["display_name"], else: "Delivery service"
-      wake = notify(txn, conversation, "People message #{kind} from #{name}", payload)
+      wake = ruling_wake || notify_event(txn, conversation, payload)
 
       Txn.q(
         txn,
@@ -592,11 +603,12 @@ defmodule Tightbeam.PeopleMessages do
         )
       end
 
-      %{accepted: true, duplicate: false}
+      {%{accepted: true, duplicate: false}, ruling_fact}
     end
   end
 
-  defp answer_disposition(_txn, _conversation, kind, _params) when kind != "answer", do: nil
+  defp answer_disposition(_txn, _conversation, kind, _params) when kind != "answer",
+    do: {nil, nil, nil}
 
   defp answer_disposition(txn, conversation, "answer", params) do
     message = conversation.message
@@ -606,23 +618,28 @@ defmodule Tightbeam.PeopleMessages do
       case message["answer_rule"] do
         %{"kind" => "first"} ->
           mark_answered(txn, conversation.id)
-          "settled"
+          {"settled", nil, nil}
 
         %{"kind" => "named", "address" => address} ->
           with %{"address" => ^address} <- params["speaker"],
-               :ok <-
-                 Escalation.rule_people_decision_in_txn(txn, message, params["content"]["answer"]) do
+               {:ok, wake, fact} <-
+                 Escalation.rule_people_decision_in_txn(
+                   txn,
+                   message,
+                   params["content"]["answer"],
+                   conversation.holder
+                 ) do
             mark_answered(txn, conversation.id)
-            "ruled"
+            {"ruled", wake, fact}
           else
-            _ -> "advice"
+            _ -> {"advice", nil, nil}
           end
 
         _ ->
-          "advice"
+          {"advice", nil, nil}
       end
     else
-      "advice"
+      {"advice", nil, nil}
     end
   end
 
@@ -642,21 +659,58 @@ defmodule Tightbeam.PeopleMessages do
 
   defp valid_speaker?(_, _server), do: false
 
-  defp notify(_txn, %{holder: nil}, _title, _payload), do: nil
+  @doc false
+  def append_ruling_context_in_txn(txn, wake_id, prompt) do
+    case Txn.q(
+           txn,
+           """
+           SELECT e.payload,c.id,c.message FROM people_events e
+           JOIN people_conversations c ON c.id=e.conversation
+           WHERE e.wakeId=?1 AND e.kind='answer'
+           """,
+           [wake_id]
+         ) do
+      [[payload, id, message]] ->
+        conversation = %{id: id, message: JSON.decode!(message)}
+        prompt <> "\n\n" <> event_prompt(conversation, JSON.decode!(payload))
+
+      [] ->
+        prompt
+    end
+  end
+
+  defp notify_event(txn, conversation, payload) do
+    notify_prompt(txn, conversation.holder, event_prompt(conversation, payload))
+  end
+
+  defp event_prompt(conversation, payload) do
+    name = get_in(payload, ["speaker", "display_name"]) || "Delivery service"
+    message_prompt(conversation, "People message #{payload["kind"]} from #{name}", payload)
+  end
 
   defp notify(txn, conversation, title, payload) do
+    notify_prompt(txn, conversation.holder, message_prompt(conversation, title, payload))
+  end
+
+  defp message_prompt(conversation, title, payload) do
     notice =
       Map.merge(payload, %{
         "conversation_id" => conversation.id,
         "work_item_id" => conversation.message["work_item_id"]
       })
 
+    title <> "\n\n" <> JSON.encode!(notice)
+  end
+
+  defp notify_prompt(_txn, nil, _prompt), do: nil
+
+  defp notify_prompt(txn, session, prompt) do
     Wakes.schedule_in_txn(txn, %{
-      session_key: conversation.holder,
+      session_key: session,
       origin: "process:tightbeam",
       class: "fyi",
       due_at: System.system_time(:millisecond),
-      prompt: title <> "\n\n" <> JSON.encode!(notice)
+      prompt: prompt
     }).wake_id
   end
 
@@ -669,6 +723,7 @@ defmodule Tightbeam.PeopleMessages do
       Enum.each(rows, fn [id] ->
         {:ok, conversation} = conversation(txn, id)
         move_pending_wakes(txn, id, session, successor)
+        handoff_ruling_context(txn, conversation, successor)
 
         if successor do
           Txn.q(txn, "UPDATE people_conversations SET holder=?2 WHERE id=?1", [id, successor])
@@ -745,7 +800,7 @@ defmodule Tightbeam.PeopleMessages do
       txn,
       """
       SELECT w.wakeId FROM wakes w
-      WHERE w.state='pending' AND w.wakeId IN (
+      WHERE w.state='pending' AND w.conditionKind IS NULL AND w.wakeId IN (
         SELECT wakeId FROM people_events WHERE conversation=?1 UNION
         SELECT wakeId FROM people_operations WHERE conversation=?1
       )
@@ -765,6 +820,30 @@ defmodule Tightbeam.PeopleMessages do
             outcome: %{kind: "no_replacement"}
           })
       end
+    end)
+  end
+
+  defp handoff_ruling_context(txn, conversation, successor) do
+    pending =
+      Txn.q(
+        txn,
+        """
+        SELECT e.event,e.payload FROM people_events e
+        JOIN wakes w ON w.wakeId=e.wakeId
+        WHERE e.conversation=?1 AND e.kind='answer'
+          AND w.conditionKind='escalation-ruled' AND w.state='pending'
+        """,
+        [conversation.id]
+      )
+
+    Enum.each(pending, fn [event, payload] ->
+      replacement = notify_event(txn, %{conversation | holder: successor}, JSON.decode!(payload))
+
+      Txn.q(
+        txn,
+        "UPDATE people_events SET wakeId=?3 WHERE conversation=?1 AND kind='answer' AND event=?2",
+        [conversation.id, event, replacement]
+      )
     end)
   end
 
