@@ -319,16 +319,10 @@ defmodule Tightbeam.RowReactions.Reminder do
         "session_key" => recipient(notice.to),
         "owner_user_id" => ref("event.org"),
         "origin" => "process:tightbeam",
-        "work_item_id" => placeholder(subject, event_kind, "work_item_id"),
         "prompt" => prompt(subject, event_kind, notice.parts),
         "due_at" => op("add", [ref("event.at"), notice.after_ms]),
         "on_unavailable" => "skip"
       }
-      |> then(fn value ->
-        if subject == :assignment,
-          do: Map.put(value, "assignment_id", placeholder(subject, event_kind, "assignment_id")),
-          else: value
-      end)
 
     %{"slot" => slot, "kind" => "notice", "when" => true, "value" => value}
   end

@@ -183,8 +183,6 @@ defmodule Tightbeam.RowReactionsReminderTest do
       assert holder["on_unavailable"] == "skip"
       assert holder["origin"] == "process:tightbeam"
       assert holder["owner_user_id"] == "owner"
-      assert holder["assignment_id"] == "asg_1"
-      assert holder["work_item_id"] == "wi_1"
       assert holder["prompt"] == "Finished asg_1 on wi_1."
       assert holder["wake_id"] =~ ~r/\Aw_rem_[0-9a-f]{64}\z/
 
@@ -265,8 +263,7 @@ defmodule Tightbeam.RowReactionsReminderTest do
       assert guard == %{"op" => "eq", "args" => [%{"ref" => "event.operation"}, "created"]}
 
       [delivery_owner, anchor] = reaction["effects"]
-      assert delivery_owner["value"]["work_item_id"] == %{"ref" => "event.workItemId"}
-      refute Map.has_key?(delivery_owner["value"], "assignment_id")
+      assert inspect(delivery_owner["value"]["prompt"]) =~ "event.workItemId"
       assert anchor["value"]["session_key"] == %{"ref" => "anchor.session_key"}
 
       assert anchor["value"]["due_at"] == %{
