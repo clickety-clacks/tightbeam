@@ -109,6 +109,9 @@ impl CommandContext {
             // Current spelling changed; preserve the existing operation.
             Return { .. } => ("cli.return_request", DispatchPath),
             OperatorAsk { .. } => ("cli.operator_ask", DispatchPath),
+            SavedRuleSet { .. } => ("cli.rule_set", DispatchPath),
+            SavedRuleWithdraw { .. } => ("cli.rule_withdraw", DispatchPath),
+            SavedRuleShow { .. } => ("cli.rule_show", DispatchPath),
             OperatorRule { .. } => ("cli.operator_rule", DispatchPath),
             OperatorWithdraw { .. } => ("cli.operator_withdraw", DispatchPath),
             DecisionRequests { .. } => ("cli.decision_requests", DispatchPath),
@@ -349,6 +352,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | ArtifactContentFetch { .. }
         | ArtifactContentCapacity { .. }
         | Artifacts { .. }
+        | SavedRuleShow { .. }
         | FactDemand { .. }
         | FactProducers { .. }
         | List { .. }
@@ -506,6 +510,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Return { .. }
         | OperatorAsk { .. }
         | OperatorRule { .. }
+        | SavedRuleSet { .. }
+        | SavedRuleWithdraw { .. }
         | OperatorWithdraw { .. }
         | AssignmentStopTurn { .. }
         | CancelTurn { .. }

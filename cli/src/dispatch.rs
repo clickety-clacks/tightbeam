@@ -1224,6 +1224,44 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "operator-ask", vec![], params))
         }
+        Command::SavedRuleSet {
+            identity,
+            role,
+            file,
+        } => {
+            let toml =
+                fs::read_to_string(file).map_err(|error| format!("cannot read {file}: {error}"))?;
+            Ok(request(
+                identity,
+                "rule-set",
+                vec![],
+                vec![string_field("role", role), string_field("toml", &toml)],
+            ))
+        }
+        Command::SavedRuleWithdraw {
+            identity,
+            role,
+            name,
+        } => Ok(request(
+            identity,
+            "rule-withdraw",
+            vec![],
+            vec![string_field("role", role), string_field("name", name)],
+        )),
+        Command::SavedRuleShow {
+            identity,
+            role,
+            session,
+        } => {
+            let mut params = Vec::new();
+            if let Some(role) = role {
+                params.push(string_field("role", role));
+            }
+            if let Some(session) = session {
+                params.push(string_field("sessionKey", session));
+            }
+            Ok(request(identity, "rule-show", vec![], params))
+        }
         Command::OperatorRule {
             identity,
             request_id,
@@ -4377,6 +4415,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Answer { identity, .. }
         | Command::Return { identity, .. }
         | Command::OperatorAsk { identity, .. }
+        | Command::SavedRuleSet { identity, .. }
+        | Command::SavedRuleWithdraw { identity, .. }
+        | Command::SavedRuleShow { identity, .. }
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }

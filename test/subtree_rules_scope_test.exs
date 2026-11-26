@@ -755,6 +755,211 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
 
   defp load!(base_dir), do: Rules.load!(base_dir, @verbs)
 
+  describe "saved rules" do
+    setup ctx do
+      Application.put_env(:tightbeam, :subtree_rules, true)
+      load!(ctx.base_dir)
+      :ok
+    end
+
+    test "saves atomically, applies immediately, and keeps revision history", ctx do
+      seed_work_item!(ctx.db, "wi-member", "member", nil)
+      seed_work_item!(ctx.db, "wi-outsider", "outsider", nil)
+      toml = scoped_rule("saved-close", "work-item-close", nil)
+      params = %{role: "team:alpha", toml: toml}
+      name = %{role: "team:alpha", name: "saved-close"}
+
+      assert %{code: "denied"} = saved_call(ctx, "rule-set", "outsider", params)
+
+      assert %{code: "invalid_saved_rule"} =
+               saved_call(ctx, "rule-set", "lead", %{
+                 params
+                 | toml: toml <> "\n[[rule]]\nname = \"bad\""
+               })
+
+      assert %{rules: []} = saved_call(ctx, "rule-show", "lead", %{})
+
+      assert %{rules: [%{revision: first, content_sha256: hash}]} =
+               saved_call(ctx, "rule-set", "lead", params)
+
+      assert byte_size(hash) == 64
+
+      assert_denied_by(
+        Rules.evaluate(ctx.db, user_call("work-item-close", "wi-member")),
+        "saved-close"
+      )
+
+      assert :ok = Rules.evaluate(ctx.db, user_call("work-item-close", "wi-outsider"))
+
+      Application.put_env(:tightbeam, :subtree_rules, false)
+      assert %{code: "feature_disabled"} = saved_call(ctx, "rule-show", "lead", %{})
+      assert :ok = Rules.evaluate(ctx.db, user_call("work-item-close", "wi-member"))
+      Application.put_env(:tightbeam, :subtree_rules, true)
+
+      :ok = Tightbeam.Roles.bind(ctx.db, "team:alpha", "successor")
+      assert %{code: "denied"} = saved_call(ctx, "rule-withdraw", "lead", name)
+      assert :ok = Rules.evaluate(ctx.db, user_call("work-item-close", "wi-member"))
+
+      assert %{rules: [%{revision: second}]} =
+               saved_call(ctx, "rule-set", "successor", params)
+
+      assert second > first
+      assert %{withdrawn_revision: ^second} = saved_call(ctx, "rule-withdraw", "successor", name)
+      assert %{rules: []} = saved_call(ctx, "rule-show", "lead", %{})
+
+      assert {:ok, [[^first, "lead", "successor"], [^second, "successor", "successor"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT revision,authoredBy,endedBy FROM saved_rules ORDER BY revision"
+               )
+    end
+
+    test "rejects foreign scope and reports inactive anchors", ctx do
+      toml = scoped_rule("checked-scope", "work-item-close", "review:alpha")
+      params = %{role: "team:alpha", toml: toml}
+
+      assert %{code: "invalid_saved_rule"} = saved_call(ctx, "rule-set", "lead", params)
+
+      params = %{params | toml: scoped_rule("checked-scope", "work-item-close", "team:alpha")}
+      assert %{rules: [_]} = saved_call(ctx, "rule-set", "lead", params)
+
+      assert %{rules: [%{name: "checked-scope", covers_nobody: false}]} =
+               saved_call(ctx, "rule-show", "lead", %{session_key: "member"})
+
+      assert %{rules: []} = saved_call(ctx, "rule-show", "lead", %{session_key: "outsider"})
+
+      assert {:ok, [%{role: "team:alpha", name: "checked-scope"}]} =
+               DB.transaction(ctx.db, &Tightbeam.SavedRules.anchored_to(&1, ["lead"]))
+
+      :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='lead'")
+
+      assert %{rules: [%{anchor_session_key: nil, covers_nobody: true}]} =
+               saved_call(ctx, "rule-show", "member", %{session_key: "member"})
+    end
+
+    test "a saved check keeps the executable used to validate its revision", ctx do
+      bytes = "#!/bin/sh\nprintf 'blocked\\n'\n"
+      script = Path.join(ctx.base_dir, "identity/rails/scripts/check-saved")
+      File.mkdir_p!(Path.dirname(script))
+      File.write!(script, bytes)
+      File.chmod!(script, 0o700)
+
+      toml = """
+      [[rule]]
+      name = "with-check"
+      verb = "work-item-close"
+      text = "blocked"
+
+      [rule.check]
+      script = "check-saved"
+      returns = ["blocked"]
+      effects = { blocked = "deny" }
+      """
+
+      assert %{rules: [%{name: "with-check"}]} =
+               saved_call(ctx, "rule-set", "lead", %{role: "team:alpha", toml: toml})
+
+      File.rm!(script)
+
+      assert [%{check: %{published_bytes: ^bytes}}] =
+               Tightbeam.SavedRules.compiled(ctx.db, "rule", "work-item-close")
+    end
+
+    test "saved reminders use the identity reminder compiler when available", ctx do
+      toml = """
+      [[reminder]]
+      name = "check-new-work"
+      on = "work-item-created"
+
+      [[reminder.notify]]
+      to = "anchor"
+      after = "1h"
+      text = "Review the new work, {anchor_name}."
+      """
+
+      result = saved_call(ctx, "rule-set", "lead", %{role: "team:alpha", toml: toml})
+
+      if Code.ensure_loaded?(Tightbeam.RowReactions.Reminder) do
+        assert %{rules: [%{kind: "reminder", revision: revision}]} = result
+        create_role!(ctx.db, "team:beta", "lead")
+
+        assert %{rules: [%{revision: second_revision}]} =
+                 saved_call(ctx, "rule-set", "lead", %{role: "team:beta", toml: toml})
+
+        seed_work_item!(ctx.db, "wi-reminder", "member", nil)
+
+        DB.transaction(ctx.db, fn txn ->
+          Tightbeam.RowReactions.observe_work_item_in_txn(
+            txn,
+            "wi-reminder",
+            "created",
+            %{kind: "fixture", id: "saved-reminder", at: 1_000, principal: {:user, @owner}},
+            %{}
+          )
+        end)
+
+        assert {:ok,
+                [
+                  ["lead", "Review the new work, lead.", ^revision],
+                  ["lead", "Review the new work, lead.", ^second_revision]
+                ]} =
+                 DB.query(ctx.db, """
+                 SELECT w.sessionKey,w.prompt,json_extract(a.plan,'$.provenance.saved_rule_revision')
+                 FROM row_reaction_actions a
+                 JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+                 ORDER BY json_extract(a.plan,'$.provenance.saved_rule_revision')
+                 """)
+      else
+        assert %{code: "invalid_saved_rule"} = result
+        assert %{rules: []} = saved_call(ctx, "rule-show", "lead", %{})
+      end
+    end
+
+    test "saved reactions carry their revision and withdrawal cancels pending delivery", ctx do
+      toml = scoped_reaction_toml()
+      params = %{role: "team:alpha", toml: toml}
+
+      assert %{rules: [%{revision: revision, content_sha256: hash}]} =
+               saved_call(ctx, "rule-set", "lead", params)
+
+      seed_work_item!(ctx.db, "wi-member", "member", nil)
+
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.RowReactions.observe_work_item_in_txn(
+          txn,
+          "wi-member",
+          "created",
+          %{kind: "fixture", id: "saved-observation", at: 1_000, principal: {:user, @owner}},
+          %{}
+        )
+      end)
+
+      assert {:ok, [[wake_id, ^revision, ^hash]]} =
+               DB.query(ctx.db, """
+               SELECT json_extract(result,'$.wake_id'),
+                      json_extract(plan,'$.provenance.saved_rule_revision'),
+                      json_extract(plan,'$.provenance.content_sha256')
+               FROM row_reaction_actions
+               """)
+
+      assert %{withdrawn_revision: ^revision} =
+               saved_call(ctx, "rule-withdraw", "lead", %{
+                 role: "team:alpha",
+                 name: "scoped-observe"
+               })
+
+      assert {:ok, :held} =
+               DB.transaction(ctx.db, &Tightbeam.RowReactions.prepare_in_txn(&1, wake_id))
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id])
+    end
+  end
+
+  defp saved_call(ctx, verb, session, params) do
+    Tightbeam.SavedRules.command(ctx.db, verb, %{principal: {:session, session}, params: params})
+  end
+
   defp scoped_rule(name, verb, role) do
     scope = if role, do: ~s(scope = { subtree_of = "role:#{role}" }\n), else: ""
 

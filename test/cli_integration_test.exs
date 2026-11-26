@@ -214,6 +214,53 @@ defmodule Tightbeam.CliIntegrationTest do
     }
   end
 
+  test "rule set, show, and withdraw reach the gateway as the active role holder", ctx do
+    previous = Application.get_env(:tightbeam, :subtree_rules)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :subtree_rules),
+        else: Application.put_env(:tightbeam, :subtree_rules, previous)
+    end)
+
+    Application.put_env(:tightbeam, :subtree_rules, true)
+    file = Path.join(ctx.workdir, "saved.toml")
+
+    File.write!(file, """
+    [[rule]]
+    name = "example-rule"
+    verb = "work-item-close"
+    text = "Example refusal"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
+    """)
+
+    run = fn args ->
+      System.cmd(ctx.binary, ["rule" | args], cd: ctx.workdir, stderr_to_stdout: true)
+    end
+
+    assert {saved, 0} = run.(["set", "--role", "cli-holder", "--file", "saved.toml"])
+
+    assert %{"rules" => [%{"name" => "example-rule", "revision" => revision}]} =
+             JSON.decode!(saved)
+
+    assert_receive {:cli_call, %{verb: "rule-set", principal: {:session, "cli-holder"}}}
+
+    assert {shown, 0} = run.(["show", "--role", "cli-holder", "--session", "cli-holder"])
+
+    assert %{"rules" => [%{"name" => "example-rule", "revision" => ^revision}]} =
+             JSON.decode!(shown)
+
+    assert {withdrawn, 0} = run.(["withdraw", "--role", "cli-holder", "--name", "example-rule"])
+    assert %{"name" => "example-rule"} = JSON.decode!(withdrawn)
+
+    assert {empty, 0} = run.(["show"])
+    assert %{"rules" => []} = JSON.decode!(empty)
+
+    Application.put_env(:tightbeam, :subtree_rules, false)
+    assert {disabled, 1} = run.(["show"])
+    assert disabled =~ "feature_disabled"
+  end
+
   test "session-connect composes explicit organization identity with automatic session identity",
        ctx do
     start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})

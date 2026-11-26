@@ -431,6 +431,21 @@ pub enum Command {
         deadline_ms: Option<String>,
         supersedes: Option<String>,
     },
+    SavedRuleSet {
+        identity: Identity,
+        role: String,
+        file: String,
+    },
+    SavedRuleWithdraw {
+        identity: Identity,
+        role: String,
+        name: String,
+    },
+    SavedRuleShow {
+        identity: Identity,
+        role: Option<String>,
+        session: Option<String>,
+    },
     OperatorRule {
         identity: Identity,
         request_id: String,
@@ -1005,6 +1020,10 @@ COMMANDS:
       Read exact retained evidence as the authorized source, custodian, owner, or admin.
   harness-health-retry <incidentId>
       Run the existing recovery probe now for an open usage-limit incident.
+
+  rule set --role <name> --file <toml>
+  rule withdraw --role <name> --name <rule>
+  rule show [--role <name>] [--session <key>]
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
@@ -3594,6 +3613,30 @@ fn parse_with_optional_catalog(
                     reason: nonempty(flags, "reason")
                         .ok_or_else(|| "--reason is required".to_owned())?,
                 })
+            }
+        }
+        "rule" => {
+            let role = nonempty(flags, "role");
+            let usage = "usage: tightbeam rule set --role <name> --file <toml> | rule withdraw --role <name> --name <rule> | rule show [--role <name>] [--session <key>]";
+            let required_role = || role.clone().ok_or_else(|| "--role is required".to_owned());
+
+            match parsed.positional.as_slice() {
+                [_, operation] if operation == "set" => Ok(Command::SavedRuleSet {
+                    identity: identity(flags)?,
+                    role: required_role()?,
+                    file: nonempty(flags, "file").ok_or_else(|| "--file is required".to_owned())?,
+                }),
+                [_, operation] if operation == "withdraw" => Ok(Command::SavedRuleWithdraw {
+                    identity: identity(flags)?,
+                    role: required_role()?,
+                    name: nonempty(flags, "name").ok_or_else(|| "--name is required".to_owned())?,
+                }),
+                [_, operation] if operation == "show" => Ok(Command::SavedRuleShow {
+                    identity: identity(flags)?,
+                    role,
+                    session: nonempty(flags, "session"),
+                }),
+                _ => Err(usage.to_owned()),
             }
         }
         "operator-ask" => {
@@ -7633,6 +7676,7 @@ mod tests {
                 "retire",
                 "retire-withdraw",
                 "role-bind",
+                "rule",
                 "sentinel",
                 "session-connect",
                 "session-reparent",
@@ -9023,7 +9067,6 @@ mod tests {
             "probe",
             "facts-read",
             "artifact-get",
-            "rule",
             "waive",
             "revoke-waiver",
             "withdraw",

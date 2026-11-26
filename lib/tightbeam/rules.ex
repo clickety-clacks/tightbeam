@@ -529,11 +529,7 @@ defmodule Tightbeam.Rules do
     rules =
       Enum.filter(rules, fn rule ->
         try do
-          validate_producer_existence!(rule)
-          validate_remedy_reachability!(rule, rules, verbs)
-
-          if rule.remedy && not escaping_static_producer?(rule),
-            do: validate_producer_cycles!(rule, rules)
+          validate_rule_graph!(rule, rules, verbs)
 
           true
         rescue
@@ -569,7 +565,8 @@ defmodule Tightbeam.Rules do
       reactions: reactions,
       declarations: declarations,
       revision: identity_manifest_sha,
-      active_admission_contract: %{"attest" => "legacy"}
+      active_admission_contract: %{"attest" => "legacy"},
+      saved_rule_loader: %{base_dir: base_dir, verbs: verbs}
     })
 
     RuleRuntime.install_admission(&evaluate/2)
@@ -611,6 +608,13 @@ defmodule Tightbeam.Rules do
       event,
       facts
     )
+  end
+
+  @doc false
+  def reaction_plans(db, event, facts) do
+    reactions = Map.get(effective_snapshot(), :reactions, [])
+    saved = Tightbeam.SavedRules.compiled(db, "reaction")
+    Tightbeam.RowReactions.Plan.evaluate(reactions ++ saved, event, facts)
   end
 
   @doc false
@@ -768,8 +772,8 @@ defmodule Tightbeam.Rules do
   @doc "Return the dry statute decision and the actor-owned close/consume work."
   @spec decide(GenServer.server(), map()) :: {term(), [term()], [String.t()]}
   def decide(db, call) do
-    rules = effective_snapshot().rules
     verb = Map.fetch!(call, :verb)
+    rules = effective_snapshot().rules ++ Tightbeam.SavedRules.compiled(db, "rule", verb)
     edge = edge(call)
 
     case unavailable_source(db, call, verb) do
@@ -1141,7 +1145,10 @@ defmodule Tightbeam.Rules do
 
     domain = field(transition, :domain)
 
-    :persistent_term.get(@persist_key, [])
+    identity_rules = :persistent_term.get(@persist_key, [])
+    saved_rules = Tightbeam.SavedRules.compiled(txn, "rule", verb)
+
+    (identity_rules ++ saved_rules)
     |> Enum.filter(fn rule ->
       verb in rule.verbs and "row-commit" in rule.edges and
         rule.effect in ["notice", "remedy"] and
@@ -2190,6 +2197,65 @@ defmodule Tightbeam.Rules do
     _ -> true
   end
 
+  @doc false
+  def compile_saved!(role, kind, definition, hash, revision \\ nil, check_bytes \\ nil) do
+    snapshot = effective_snapshot()
+    %{base_dir: base_dir, verbs: verbs} = snapshot.saved_rule_loader
+    identifier = Base.url_encode64(definition["name"], padding: false)
+    short_name = definition["name"]
+    name = "saved:#{role}/#{short_name}"
+    path = Path.join([base_dir, "identity", "saved-rules", role, "#{identifier}.toml"])
+
+    case kind do
+      "rule" ->
+        definition =
+          if check_bytes do
+            update_in(definition, ["check"], &Map.put(&1, :published_bytes, check_bytes))
+          else
+            definition
+          end
+
+        rule =
+          validate_rule!(path, 1, definition, verbs, base_dir, snapshot.revision, :substrate, [])
+
+        %{rule | name: "#{name}@#{revision || hash}"}
+
+      kind when kind in ["reaction", "reminder"] ->
+        family = "#{name}@#{revision || hash}"
+
+        definition =
+          if kind == "reminder", do: Map.put(definition, "name", family), else: definition
+
+        case Tightbeam.RowReactions.Loader.compile!(
+               %{kind => [definition]},
+               path,
+               base_dir,
+               hash,
+               hash,
+               :substrate
+             ) do
+          [{:reaction, %{mode: :event} = rail}] ->
+            provenance =
+              Map.merge(rail.provenance, %{
+                "content_sha256" => hash,
+                "saved_rule_revision" => revision
+              })
+
+            %{rail | name: name, short_name: short_name, family: family, provenance: provenance}
+
+          _ ->
+            raise ArgumentError, "#{kind} is unavailable or is not an event reaction"
+        end
+    end
+  end
+
+  @doc false
+  def validate_saved_statutes!(definitions) do
+    snapshot = effective_snapshot()
+    rules = snapshot.rules ++ definitions
+    Enum.each(definitions, &validate_rule_graph!(&1, rules, snapshot.saved_rule_loader.verbs))
+  end
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
     relative = Path.relative_to(path, Path.join(base_dir, "identity"))
@@ -2830,6 +2896,7 @@ defmodule Tightbeam.Rules do
   defp validate_check!(nil, _base_dir, _owner, _fail), do: nil
 
   defp validate_check!(check, base_dir, owner, fail) when is_map(check) do
+    {published_bytes, check} = Map.pop(check, :published_bytes)
     unknown = unknown_keys(check, @check_keys)
     if unknown != [], do: fail.("check has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -2839,9 +2906,11 @@ defmodule Tightbeam.Rules do
     identity_path = check_identity_path(base_dir, owner, script, fail)
     path = Path.join([base_dir, "identity", identity_path])
 
-    case File.stat(path) do
-      {:ok, %File.Stat{type: :regular, mode: mode}} when (mode &&& 0o111) != 0 -> :ok
-      _ -> fail.("check script must be an existing executable regular file: #{path}")
+    if is_nil(published_bytes) do
+      case File.stat(path) do
+        {:ok, %File.Stat{type: :regular, mode: mode}} when (mode &&& 0o111) != 0 -> :ok
+        _ -> fail.("check script must be an existing executable regular file: #{path}")
+      end
     end
 
     returns = Map.get(check, "returns")
@@ -2872,6 +2941,9 @@ defmodule Tightbeam.Rules do
       timeout_ms: timeout_ms,
       effects: effects
     }
+    |> then(fn check ->
+      if published_bytes, do: Map.put(check, :published_bytes, published_bytes), else: check
+    end)
   end
 
   defp validate_check!(_check, _base_dir, _owner, fail), do: fail.("check must be a table")
@@ -3132,6 +3204,14 @@ defmodule Tightbeam.Rules do
     |> MapSet.difference(allowed)
     |> MapSet.to_list()
     |> Enum.sort()
+  end
+
+  defp validate_rule_graph!(rule, rules, verbs) do
+    validate_producer_existence!(rule)
+    validate_remedy_reachability!(rule, rules, verbs)
+
+    if rule.remedy && not escaping_static_producer?(rule),
+      do: validate_producer_cycles!(rule, rules)
   end
 
   defp validate_producer_existence!(%{check: check}) when not is_nil(check), do: :ok

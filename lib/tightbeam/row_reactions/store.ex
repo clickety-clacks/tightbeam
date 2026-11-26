@@ -88,7 +88,7 @@ defmodule Tightbeam.RowReactions.Store do
       nil ->
         put_event(txn, event, Map.delete(facts, Tightbeam.RowReactions.Plan.subtree_facts_key()))
 
-        for plan <- Rules.reaction_plans(event, Map.put(facts, "original", facts)),
+        for plan <- Rules.reaction_plans(txn, event, Map.put(facts, "original", facts)),
             plan.selected,
             do: insert(txn, plan, "pending", nil, event["at"])
 
@@ -108,7 +108,7 @@ defmodule Tightbeam.RowReactions.Store do
 
   def reconcile(txn, event, original, current, at) do
     plans =
-      Rules.reaction_plans(event, Map.put(current, "original", original))
+      Rules.reaction_plans(txn, event, Map.put(current, "original", original))
       |> Map.new(&{id(&1.identity), &1})
 
     for action <- actions(txn, event["org"], event["id"]), action["status"] == "pending" do
