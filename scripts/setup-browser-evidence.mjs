@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
 
-const endpoint = 'http://127.0.0.1:9222/json/list';
+const endpoint = `http://127.0.0.1:${process.env.BROWSER_DEBUG_PORT}/json/list`;
 async function find(check, label) {
   for (let i = 0; i < 120; i++) {
     try {
@@ -12,6 +12,7 @@ async function find(check, label) {
     } catch {}
     await pause(500);
   }
+  console.error('Browser targets at timeout:', await (await fetch(endpoint)).text());
   throw new Error(`Timed out waiting for ${label}`);
 }
 const tabs = async () => (await (await fetch(endpoint)).json()).filter((tab) => tab.type === 'page');

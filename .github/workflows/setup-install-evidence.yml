@@ -49,3 +49,5 @@ jobs:
             ${{ runner.temp }}/browser-evidence.log
             ${{ runner.temp }}/installer-browser-launches.log
             ${{ runner.temp }}/installer-browser-output.log
+            ${{ runner.temp }}/browser-targets.log
+            ${{ runner.temp }}/chrome.log

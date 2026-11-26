@@ -43,12 +43,14 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
     if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
     sleep 1
   done
-  google-chrome --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 \
+  google-chrome --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 \
     --user-data-dir="$RUNNER_TEMP/onboarding-chrome" about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
   for i in $(seq 1 20); do
-    if curl --silent --fail http://127.0.0.1:9222/json/version >/dev/null; then break; fi
+    if [ -s "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort" ]; then break; fi
     sleep 1
   done
+  export BROWSER_DEBUG_PORT
+  BROWSER_DEBUG_PORT=$(head -1 "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort")
   cat > "$RUNNER_TEMP/browser-bin/xdg-open" <<'SHIM'
 #!/bin/sh
 printf '%s\n' "$1" >> "$RUNNER_TEMP/installer-browser-launches.log"
@@ -64,6 +66,9 @@ collect_logs() {
   kill "$model_pid" 2>/dev/null || true
   if [ "$status" != 0 ]; then
     if [ "$platform" = linux-x86_64 ]; then
+      if [ -n "${BROWSER_DEBUG_PORT:-}" ]; then
+        curl --silent --fail "http://127.0.0.1:$BROWSER_DEBUG_PORT/json/list" > "$RUNNER_TEMP/browser-targets.log" || true
+      fi
       journalctl --user -n 120 -u tightbeam -u tightbeam-chat --no-pager || true
       sudo journalctl -n 120 -u tightbeam --no-pager || true
     else
@@ -120,7 +125,7 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
   test "$(wc -l < "$RUNNER_TEMP/installer-browser-launches.log")" -eq 2
   grep -F 'Open Tightbeam Chat (Main):' "$RUNNER_TEMP/first-turn.log"
   grep -F 'Open Tightbeam Chat (project exec):' "$RUNNER_TEMP/first-turn.log"
-  curl --silent --fail http://127.0.0.1:9222/json/list | node -e '
+  curl --silent --fail "http://127.0.0.1:$BROWSER_DEBUG_PORT/json/list" | node -e '
     const tabs = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
     const routes = tabs.filter(({url}) => url.startsWith("http://127.0.0.1:4178/")).map(({url}) => new URL(url));
     const sessions = routes.map(({searchParams}) => searchParams.get("session"));
