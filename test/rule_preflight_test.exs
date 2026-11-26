@@ -167,6 +167,32 @@ defmodule Tightbeam.RulePreflightTest do
     end
   end
 
+  test "the selector uses the database marker to choose the preview", %{base: base} do
+    path = Path.join(base, "state.db")
+    assert {:ok, conn} = Exqlite.Sqlite3.open(path)
+
+    try do
+      assert Tightbeam.Identity.RailScopeMigration.pending_for_database!(path)
+
+      assert :ok =
+               Exqlite.Sqlite3.execute(conn, """
+               CREATE TABLE rail_scope_migrations (migrationId TEXT, reportJson TEXT)
+               """)
+
+      assert Tightbeam.Identity.RailScopeMigration.pending_for_database!(path)
+
+      assert :ok =
+               Exqlite.Sqlite3.execute(conn, """
+               INSERT INTO rail_scope_migrations VALUES ('rail-scope-v1',
+                 '{"schema":"tightbeam-rail-scope-migration/v1","status":"complete","source_revision":"before","result_revision":"after"}')
+               """)
+
+      refute Tightbeam.Identity.RailScopeMigration.pending_for_database!(path)
+    after
+      Exqlite.Sqlite3.close(conn)
+    end
+  end
+
   test "publishing a candidate checks its committed rule references", %{base: base} do
     dir = Path.join(base, "identity")
     live = Identity.live_revision!(base)
@@ -195,10 +221,12 @@ defmodule Tightbeam.RulePreflightTest do
 
   test "startup law loading warns when an orphan is already installed", %{base: base} do
     write!(Path.join(base, "identity"), "rules/orphan.toml", orphan_rule())
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        Gateway.load_law!(%{base_dir: base})
+        Gateway.load_law!(%{base_dir: base, db: db})
       end)
 
     assert log =~

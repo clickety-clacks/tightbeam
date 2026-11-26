@@ -7,6 +7,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   identity repository so it survives a refused boot without becoming served law.
   """
 
+  alias Exqlite.Sqlite3
   alias Tightbeam.{AdminProjection, DB, Identity}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity.{Provenance, TomlEdit}
@@ -333,33 +334,45 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
   @doc false
   def pending_for_database!(path) do
-    table =
-      sqlite_read!(path, """
-      SELECT name FROM sqlite_schema
-      WHERE type = 'table' AND name = 'rail_scope_migrations';
-      """)
+    {:ok, conn} = Sqlite3.open(path, mode: :readonly)
 
-    if table == "" do
-      true
-    else
-      path
-      |> sqlite_read!(
-        "SELECT reportJson FROM rail_scope_migrations WHERE migrationId = '#{@migration_id}';"
-      )
-      |> case do
-        "" -> true
-        report -> decode_completed_report!([[report]]) == :not_complete
+    try do
+      :ok = Sqlite3.execute(conn, "BEGIN")
+
+      case marker_rows!(conn, """
+           SELECT name FROM sqlite_schema
+           WHERE type = 'table' AND name = 'rail_scope_migrations'
+           """) do
+        [] ->
+          true
+
+        [["rail_scope_migrations"]] ->
+          conn
+          |> marker_rows!(
+            "SELECT reportJson FROM rail_scope_migrations WHERE migrationId = '#{@migration_id}'"
+          )
+          |> decode_completed_report!()
+          |> case do
+            :not_complete -> true
+            {:complete, _} -> false
+          end
       end
+    after
+      Sqlite3.close(conn)
     end
+  rescue
+    error ->
+      raise ArgumentError, "cannot read the rail migration marker: #{Exception.message(error)}"
   end
 
-  defp sqlite_read!(path, query) do
-    case System.cmd("sqlite3", ["-batch", "-readonly", path, query], stderr_to_stdout: true) do
-      {output, 0} ->
-        String.trim(output)
+  defp marker_rows!(conn, sql) do
+    {:ok, statement} = Sqlite3.prepare(conn, sql)
 
-      {_output, status} ->
-        raise ArgumentError, "cannot read the rail migration marker (sqlite3 exit #{status})"
+    try do
+      {:ok, rows} = Sqlite3.fetch_all(conn, statement)
+      rows
+    after
+      Sqlite3.release(conn, statement)
     end
   end
 

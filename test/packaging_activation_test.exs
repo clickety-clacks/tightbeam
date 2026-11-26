@@ -181,7 +181,9 @@ defmodule Tightbeam.PackagingActivationTest do
     original_rules = File.read!(rule_file)
     original_sha = :crypto.hash(:sha256, original_rules)
 
-    {output, status} = select(install_root, candidate_stage["buildId"], "ok")
+    state_db = Path.join([install_root, "installed-base", "state.db"])
+    File.write!(state_db, "fixture for the candidate's marker reader")
+    {output, status} = select(install_root, candidate_stage["buildId"], "with-state-db")
 
     assert status == 0
     assert output =~ ~s(rules/preflight.toml: policy "legacy": purpose "retired" is retired)
@@ -270,6 +272,10 @@ defmodule Tightbeam.PackagingActivationTest do
         "      case \"$2\" in *Tightbeam.RulePreflight.run*) ;; *) exit 43 ;; esac\n" <>
         "      [ -r \"$TIGHTBEAM_BASE_DIR/identity/rules/preflight.toml\" ] || exit 44\n" <>
         "      [ ! -w \"$TIGHTBEAM_BASE_DIR/identity/rules\" ] || exit 45\n" <>
+        "      if [ \"$TB_RULE_PREFLIGHT_MODE\" = with-state-db ]; then\n" <>
+        "        [ -r \"$TIGHTBEAM_RULE_PREFLIGHT_DB\" ] || exit 46\n" <>
+        "        [ \"$TIGHTBEAM_RULE_PREFLIGHT_DB\" != \"$TIGHTBEAM_BASE_DIR/state.db\" ] || exit 47\n" <>
+        "      fi\n" <>
         "      printf '%s\\n' 'TIGHTBEAM_RULE_PREFLIGHT_JSON:{\"complete\":true,\"recording_available\":true,\"warnings\":[\"rules/preflight.toml: policy \\\"legacy\\\": purpose \\\"retired\\\" is retired; policy has no effect\"],\"unavailable_verbs\":[],\"skipped_policies\":[]}'\n" <>
         "      exit 0 ;;\n" <>
         "  esac\n" <>
