@@ -41,16 +41,22 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
     path
   end
 
-  defp fake_ssh!(dir, warning \\ "") do
+  defp fake_ssh!(dir, warning \\ "", login_env \\ []) do
     # Like ssh: skip the options and host, give the rest to a shell, keep stdin open.
     path = Path.join(dir, "ssh")
     warning = if warning == "", do: "", else: warning <> "\n"
+
+    login_env =
+      Enum.map_join(login_env, "\n", fn {name, value} ->
+        "export #{name}=#{Support.shell_quote(value)}"
+      end)
 
     File.write!(path, """
     #!/bin/sh
     printf %s #{Support.shell_quote(warning)} >&2
     while [ "$1" = "-o" ]; do shift 2; done
     shift
+    #{login_env}
     exec sh -c "$*"
     """)
 
@@ -91,24 +97,34 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   end
 
   @tag :tmp_dir
-  test "recovery resolves a HOME-dependent Node shim before clearing the environment", ctx do
-    shim = Path.join(ctx.tmp_dir, "node")
+  test "SSH recovery resolves Node with the target host's login PATH and HOME", ctx do
+    remote_bin = Path.join(ctx.tmp_dir, "remote-bin")
+    remote_home = Path.join(ctx.tmp_dir, "remote-home")
+    File.mkdir_p!(remote_bin)
+    File.mkdir_p!(remote_home)
+    shim = Path.join(remote_bin, "node")
     marker = Path.join(ctx.tmp_dir, "shim-ran")
 
     File.write!(shim, """
     #!/bin/sh
-    [ "$HOME" = #{Support.shell_quote(System.fetch_env!("HOME"))} ] || exit 1
-    printf '%s' "$1" > #{Support.shell_quote(marker)}
+    [ "$HOME" = #{Support.shell_quote(remote_home)} ] || exit 1
+    printf '%s\\n' "$1" >> #{Support.shell_quote(marker)}
     exec #{Support.shell_quote(real_node!())} "$@"
     """)
 
     File.chmod!(shim, 0o755)
+
+    fake_ssh!(ctx.tmp_dir, "", [
+      {"HOME", remote_home},
+      {"PATH", remote_bin <> ":" <> System.fetch_env!("PATH")}
+    ])
+
     with_fixture_path(ctx.tmp_dir)
 
     fake_claude_adapter!(ctx.tmp_dir)
     binary = fake_cli!(ctx.tmp_dir, "claude", @claude_help, [])
-    assert {{:succeeded, nil}, _} = run(ctx, "claude", binary, nil, 20_000)
-    assert File.read!(marker) == "-p"
+    assert {{:succeeded, nil}, _} = run(ctx, "claude", binary, "fixture@remote", 20_000)
+    assert File.read!(marker) == "-p\n"
     assert File.exists?(binary <> ".called")
   end
 
