@@ -95,6 +95,8 @@ defmodule Tightbeam.DB do
   @admission_poll_ms 10
   @admission_poll_max_ms 250
   @admission_report_ms 10_000
+  @owed_wait_ms 1_000
+  @owed_report_ms 30_000
   @startup_progress_ms 5_000
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}
@@ -128,15 +130,22 @@ defmodule Tightbeam.DB do
   again cannot repeat an effect.
 
   Inside this scope a refused call therefore waits outside the owner's queue
-  until the queue is back under its limit and is then sent again as an ordinary
-  call with its ordinary timeout. The queue limit is unchanged and binds every
-  other caller. Each wait is logged. Calls that carry their own deadline
-  (`transaction_until/3`, `query_until/4`) keep returning the refusal.
+  until the queue is back under its limit and is then sent again. The queue
+  limit is unchanged and binds every other caller. Each wait is logged.
+
+  Once sent, an owed call waits for its answer without a client timeout, for
+  the same reason: a timeout raised in a lane, a coordinator or an adapter drops
+  the work. It is also the only safe wait for a write, whose effect a timeout
+  would leave unknown. The wait ends with the database process, and once the
+  waiting process has been told to stop it is bounded by the ordinary timeout.
+  A wait is logged every 30 s, naming its caller. Calls that carry their own deadline (`transaction_until/3`,
+  `query_until/4`) keep their deadline and the refusal.
 
   `owed_work/0` marks the calling process for its lifetime; `owed_work/1` marks
   it while `fun` runs. `refusable/1` is the way back: inside a marked process it
   runs `fun` with the ordinary refusal, for the calls that process makes on
-  behalf of a caller who can be told to retry.
+  behalf of a caller who can be told to retry. A call it does send is still
+  waited for: a timeout would end the process that owes the other work.
   """
   @spec owed_work() :: :ok
   def owed_work do
@@ -160,7 +169,8 @@ defmodule Tightbeam.DB do
 
   @spec refusable((-> result)) :: result when result: term()
   def refusable(fun) when is_function(fun, 0) do
-    previous = Process.delete(@owed_work_key)
+    previous = Process.get(@owed_work_key)
+    if previous != nil, do: Process.put(@owed_work_key, :refusable)
 
     try do
       fun.()
@@ -173,16 +183,104 @@ defmodule Tightbeam.DB do
   def owed_work?, do: Process.get(@owed_work_key) == true
 
   @doc false
-  # Block until the owner's queue is back under its limit. Returns the wait in ms.
+  def waits_for_answer?, do: Process.get(@owed_work_key) != nil
+
+  @doc false
+  # `GenServer.call/3` for owed work, sent once: it ends with an answer or the
+  # server.
+  def owed_call(server, request, operation) do
+    now = System.monotonic_time(:millisecond)
+    owed_wait(:gen_server.send_request(server, request), operation, now, owed_report_ms())
+  end
+
+  @doc false
+  # Not the client timeout, which an installation may set to minutes.
+  def owed_report_ms, do: min(@owed_report_ms, call_timeout())
+
+  defp owed_wait(id, operation, started, report_at) do
+    case :gen_server.wait_response(id, min(@owed_wait_ms, owed_report_ms())) do
+      {:reply, reply} ->
+        reply
+
+      {:error, {reason, _server}} ->
+        exit({reason, {GenServer, :call, [:redacted]}})
+
+      :timeout ->
+        waited = System.monotonic_time(:millisecond) - started
+
+        cond do
+          waited >= call_timeout() and stopping?() ->
+            case :gen_server.receive_response(id, 0) do
+              {:reply, reply} -> reply
+              _ -> exit({:timeout, {GenServer, :call, [:redacted]}})
+            end
+
+          waited < report_at ->
+            owed_wait(id, operation, started, report_at)
+
+          true ->
+            Logger.warning(
+              "database has not answered owed #{operation} after #{waited}ms; " <>
+                "caller=#{owed_caller()} pid=#{inspect(self())}"
+            )
+
+            owed_wait(id, operation, started, waited + owed_report_ms())
+        end
+    end
+  end
+
+  # A process that traps exits finds its supervisor's stop in its mailbox, where
+  # a blocked call would never read it. Leave it there for the process to handle.
+  defp stopping? do
+    parent =
+      case Process.get(:"$ancestors") do
+        [parent | _] when is_atom(parent) -> Process.whereis(parent)
+        [parent | _] -> parent
+        _ -> nil
+      end
+
+    receive do
+      {:EXIT, ^parent, _reason} = stop ->
+        send(self(), stop)
+        true
+    after
+      0 -> false
+    end
+  end
+
+  # A tail call leaves no frame; the process then names itself.
+  defp owed_caller do
+    {:current_stacktrace, frames} = Process.info(self(), :current_stacktrace)
+
+    process =
+      case {Process.info(self(), :registered_name), Process.get(:"$initial_call")} do
+        {{:registered_name, name}, _} when is_atom(name) -> inspect(name)
+        {_, {module, function, arity}} -> Exception.format_mfa(module, function, arity)
+        _ -> "unknown"
+      end
+
+    Enum.find_value(frames, process, fn {module, function, arity, _location} ->
+      name = Atom.to_string(module)
+
+      if String.starts_with?(name, "Elixir.Tightbeam.") and
+           module not in [__MODULE__, DBObservation, __MODULE__.Reader],
+         do: Exception.format_mfa(module, function, arity)
+    end)
+  end
+
+  @doc false
+  # Block until the owner's queue is back under its limit, or the process is
+  # told to stop. Returns whether the call may be sent.
   def await_admission(server, operation) do
     started = System.monotonic_time(:millisecond)
     Logger.warning("database overloaded; owed work is waiting to send #{operation}")
-    waited = admission_wait(server, operation, started, started, @admission_poll_ms)
+    admitted? = admission_wait(server, operation, started, started, @admission_poll_ms)
+    waited = System.monotonic_time(:millisecond) - started
 
-    if waited >= @admission_report_ms,
+    if admitted? and waited >= @admission_report_ms,
       do: Logger.warning("database overload passed; owed #{operation} sent after #{waited}ms")
 
-    waited
+    admitted?
   end
 
   defp admission_wait(server, operation, started, reported, pause) do
@@ -192,7 +290,10 @@ defmodule Tightbeam.DB do
 
     cond do
       not overloaded?(server) ->
-        now - started
+        true
+
+      now - started >= call_timeout() and stopping?() ->
+        false
 
       now - reported >= @admission_report_ms ->
         Logger.warning(
@@ -455,7 +556,8 @@ defmodule Tightbeam.DB do
     else
       case reader(server, "SELECT 1") do
         reader when is_pid(reader) ->
-          Tightbeam.DB.Reader.read_transaction(reader, fun, call_timeout())
+          timeout = if waits_for_answer?(), do: :infinity, else: call_timeout()
+          Tightbeam.DB.Reader.read_transaction(reader, fun, timeout)
 
         _ ->
           # Private in-memory databases have no separate connection pool.
@@ -768,12 +870,10 @@ defmodule Tightbeam.DB do
 
       # A refused call was never sent. Owed work asks again once the queue has
       # room; every other caller is handed the refusal.
-      if unsent? and owed_work?() and match?({:error, %Overloaded{}}, reply) do
-        await_admission(server, operation)
-        observed_call(server, request, operation, budget)
-      else
-        reply
-      end
+      if unsent? and owed_work?() and match?({:error, %Overloaded{}}, reply) and
+           await_admission(server, operation),
+         do: observed_call(server, request, operation, budget),
+         else: reply
     end
   end
 
@@ -849,16 +949,31 @@ defmodule Tightbeam.DB do
       :ok = load_topline_unicode(conn)
       if path == ":memory:", do: :ok = Tightbeam.Recognition.ensure_sqlite_schema(conn)
       {:ok, retry} = Tightbeam.Recognition.start_link(self(), path == ":memory:")
+      audits = start_audits(path)
       readers = open_readers(path)
       :persistent_term.put({__MODULE__, self()}, readers)
 
       {:ok,
-       %{conn: conn, readers: readers, retry: retry, admission: admission, reference_fences: %{}}}
+       %{
+         conn: conn,
+         readers: readers,
+         retry: retry,
+         audits: audits,
+         admission: admission,
+         reference_fences: %{}
+       }}
     rescue
       error ->
         :ok = Sqlite3.close(conn)
         reraise error, __STACKTRACE__
     end
+  end
+
+  defp start_audits(":memory:"), do: nil
+
+  defp start_audits(_path) do
+    {:ok, audits} = Tightbeam.DispatchAudit.start_link(self())
+    audits
   end
 
   defp open_readers(":memory:"), do: []
@@ -895,9 +1010,13 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  def terminate(_reason, %{conn: conn, readers: readers, retry: retry}) do
-    Process.unlink(retry)
-    Process.exit(retry, :shutdown)
+  def terminate(_reason, %{conn: conn, readers: readers, retry: retry, audits: audits}) do
+    for child <- [retry, audits], is_pid(child) do
+      Process.unlink(child)
+      Process.exit(child, :shutdown)
+    end
+
+    :persistent_term.erase({Tightbeam.DispatchAudit, self()})
     :persistent_term.erase({Tightbeam.Recognition, self()})
     :persistent_term.erase({Tightbeam.FilingRemedy, self()})
     :persistent_term.erase({__MODULE__, self()})

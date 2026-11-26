@@ -3,16 +3,17 @@ defmodule Tightbeam.HarklightFeedCustody do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  def arm_launch(db, handle, owner, explicit?) do
+  # A launch row left by an earlier feed is taken over. The child's lifetime
+  # lock, not this row, keeps two children from running at once.
+  def arm_launch(db, handle, owner) do
     case DB.query(
            db,
            """
            INSERT INTO harklight_feed_launches(handle,owner) VALUES(?1,?2)
            ON CONFLICT(handle) DO UPDATE SET owner=excluded.owner
-           WHERE ?3=1
            RETURNING handle
            """,
-           [handle, owner, if(explicit?, do: 1, else: 0)]
+           [handle, owner]
          ) do
       {:ok, [[^handle]]} -> :ok
       _ -> {:error, :feed_launch_unavailable}

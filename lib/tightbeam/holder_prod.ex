@@ -164,7 +164,7 @@ defmodule Tightbeam.HolderProd do
                        FROM wakes w WHERE w.sessionKey=a.holderKey
                          AND w.state IN ('fired','canceled')
                          AND w.consumer='prompt' AND w.digest=0
-                         AND NOT (w.waitMode IS 'dependency' AND w.assignmentId IS NULL
+                         AND NOT (?5=1 AND w.waitMode IS 'dependency' AND w.assignmentId IS NULL
                            AND w.work_item_id IS NOT NULL AND w.obligationRef IS w.work_item_id)
                          AND NOT (w.origin='process:tightbeam'
                            AND COALESCE(substr(w.obligationRef,1,length(?2))=?2,0))
@@ -204,7 +204,7 @@ defmodule Tightbeam.HolderProd do
          AND NOT EXISTS (
            SELECT 1 FROM wakes w
            WHERE w.sessionKey=e.holderKey AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-             AND NOT (w.waitMode IS 'dependency' AND w.assignmentId IS NULL
+             AND NOT (?5=1 AND w.waitMode IS 'dependency' AND w.assignmentId IS NULL
                AND w.work_item_id IS NOT NULL AND w.obligationRef IS w.work_item_id)
              AND (w.assignmentId=e.id OR w.assignmentId IS NULL)
              AND (w.creatorSessionKey=e.holderKey OR
@@ -447,7 +447,7 @@ defmodule Tightbeam.HolderProd do
     query = if is_nil(assignment_id), do: @candidates, else: @single_candidate
 
     txn
-    |> Txn.q(query, [assignment_id, @marker, at, if(report_only, do: 1, else: 0)])
+    |> Txn.q(query, [assignment_id, @marker, at, if(report_only, do: 1, else: 0), if(Tightbeam.WorkItemWaits.enabled?(), do: 1, else: 0)])
     |> Enum.map(fn [
                      id,
                      holder,

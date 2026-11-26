@@ -173,6 +173,8 @@ jobs:
           linux_source="candidate-stage/tightbeam-$version-linux-x86_64-$short_sha.tgz"
           test -f "$darwin_source"
           test -f "$linux_source"
+          python3 packaging/extract-payload.py --inventory-only "$darwin_source"
+          python3 packaging/extract-payload.py --inventory-only "$linux_source"
 
           release_dir="$RUNNER_TEMP/release"
           mkdir -p "$release_dir"

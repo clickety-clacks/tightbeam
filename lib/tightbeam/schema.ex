@@ -2154,6 +2154,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_attest_lifecycle_actor(db)
     :ok = upgrade_holder_role_v1(db)
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
+    :ok = Tightbeam.Org.ensure_running_model_columns(db)
     :ok = Tightbeam.RecordEvents.ensure_schema(db)
     :ok = Tightbeam.HolderProd.ensure_schema(db)
     # This table rebuild follows all predecessor migrations so a refusal above

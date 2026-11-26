@@ -96,6 +96,7 @@ if phase == "prepare" do
   File.chmod!(agent, 0o755)
 else
   if scenario == "neither-store", do: File.rmdir!(refused_file)
+  File.touch!(Path.join(root, "resume"))
 end
 
 System.put_env("PATH", bin <> ":" <> System.fetch_env!("PATH"))
@@ -107,6 +108,7 @@ for module <- Tightbeam.Harness.all(),
 File.mkdir_p!(Path.join(base, "work"))
 Application.put_env(:tightbeam, :autostart, true)
 {:ok, _} = Application.ensure_all_started(:tightbeam)
+assert is_pid(Process.whereis(Tightbeam.HarklightBounces)), "the gateway runs the bounce worker"
 
 rows = fn sql ->
   {:ok, rows} = DB.query(DB, sql)
@@ -121,7 +123,13 @@ calls = fn ->
   end
 end
 
-pause_rows = fn -> rows.("SELECT diagnostic FROM harklight_feed_pauses") end
+held_rows = fn ->
+  rows.(
+    "SELECT handle FROM harklight_feed_pauses UNION ALL SELECT handle FROM harklight_feed_stops"
+  )
+end
+
+outage_rows = fn -> rows.("SELECT startedAt,diagnostic FROM harklight_listener_outages") end
 checkpoint = "SELECT rev FROM harklight_feed_checkpoints"
 launch = "SELECT owner FROM harklight_feed_launches"
 expected = "listen --follow --session #{handle} --after 8"
@@ -225,8 +233,8 @@ if phase == "prepare" do
     _ ->
       :ok =
         DB.execute(DB, """
-        CREATE TRIGGER reject_pause BEFORE INSERT ON harklight_feed_pauses
-        BEGIN SELECT RAISE(ABORT, 'refuse pause projection'); END;
+        CREATE TRIGGER reject_outage BEFORE INSERT ON harklight_listener_outages
+        BEGIN SELECT RAISE(ABORT, 'refuse outage projection'); END;
         """)
 
       File.mkdir_p!(refused_file)
@@ -247,8 +255,8 @@ if phase == "prepare" do
                    intent |> File.read!() |> :erlang.binary_to_term([:safe])
 
         "sqlite-first" ->
-          :ok = DB.execute(DB, "DROP TRIGGER reject_pause")
-          await.(fn -> pause_rows.() != [] end)
+          :ok = DB.execute(DB, "DROP TRIGGER reject_outage")
+          await.(fn -> outage_rows.() != [] end)
           refute File.exists?(intent)
 
         "neither-store" ->
@@ -256,10 +264,9 @@ if phase == "prepare" do
       end
 
       if scenario == "sqlite-first" do
-        assert [[_]] = pause_rows.()
-        assert rows.(launch) == []
+        assert [[_, _]] = outage_rows.()
       else
-        assert pause_rows.() == []
+        assert outage_rows.() == []
         assert [[_]] = rows.(launch)
       end
 
@@ -268,55 +275,41 @@ if phase == "prepare" do
       Process.sleep(:infinity)
   end
 else
-  if scenario == "clean" do
-    await.(fn -> calls.() == [expected, expected] end)
-    assert pause_rows.() == []
-  else
-    if scenario in ["journal-first", "neither-store"] do
-      HarklightWakes.activate(handle)
-      await.(fn -> Map.has_key?(:sys.get_state(HarklightWakes).retry_timers, handle) end)
-      assert pause_rows.() == []
-      assert [[_]] = rows.(launch)
-      :ok = DB.execute(DB, "DROP TRIGGER reject_pause")
-      await.(fn -> pause_rows.() != [] end)
-    end
-
-    await.(fn -> pause_rows.() != [] end)
-    assert calls.() == [expected]
+  # Nobody retries: the replacement gateway resumes the committed checkpoint.
+  if scenario == "journal-first" do
+    HarklightWakes.activate(handle)
+    await.(fn -> Map.has_key?(:sys.get_state(HarklightWakes).retry_timers, handle) end)
+    assert outage_rows.() == []
+    assert [[_]] = rows.(launch)
     assert rows.(checkpoint) == [[8]]
-    [[diagnostic]] = pause_rows.()
-
-    if scenario in ["journal-first", "sqlite-first", "drain-pause"] do
-      assert diagnostic =~ "internal_error"
-      assert diagnostic =~ "fixture-original-id"
-
-      if scenario != "drain-pause" do
-        at = recovery_time |> File.read!() |> String.to_integer()
-        assert rows.("SELECT updatedAt FROM harklight_wake_handles") == [[at]]
-      end
-
-      assert rows.(launch) == []
-    else
-      assert diagnostic =~ "feed_custody_uncertain"
-      assert diagnostic =~ "before the feed outcome was recorded"
-      refute diagnostic =~ "fixture-original-id"
-      assert [[_]] = rows.(launch)
-    end
-
-    File.touch!(Path.join(root, "resume"))
-    HarklightWakes.activate(handle, true)
-    # Let ordinary activation pass through listener admission.
-    Process.sleep(350)
-    assert calls.() == [expected]
-    assert rows.(checkpoint) == [[8]]
-
-    assert %{counts: %{listening: 1}} =
-             HarklightWakes.retry_command(DB, %{params: %{handle: handle}})
-
-    assert calls.() == [expected, expected]
-    assert rows.(checkpoint) == [[9]]
-    assert pause_rows.() == []
+    :ok = DB.execute(DB, "DROP TRIGGER reject_outage")
   end
+
+  if scenario in ["journal-first", "sqlite-first", "drain-pause"] do
+    await.(fn -> outage_rows.() != [] end)
+    [[started, diagnostic]] = outage_rows.()
+
+    assert diagnostic =~ "internal_error"
+    assert diagnostic =~ "fixture-original-id"
+
+    if scenario in ["journal-first", "sqlite-first"] do
+      at = recovery_time |> File.read!() |> String.to_integer()
+      assert started == at
+    end
+  end
+
+  # sqlite-first can retry in the first gateway before it is killed.
+  await.(fn ->
+    all = calls.()
+
+    length(all) >= 2 and Enum.uniq(all) == [expected] and
+      MapSet.size(:sys.get_state(HarklightWakes).starts_in_flight) == 0
+  end)
+
+  if scenario != "sqlite-first", do: assert(calls.() == [expected, expected])
+  if scenario != "clean", do: await.(fn -> rows.(checkpoint) == [[9]] end)
+  assert held_rows.() == []
+  assert [["active"]] = rows.("SELECT state FROM harklight_wake_handles")
 
   :ok = Application.stop(:tightbeam)
   File.touch!(Path.join(root, "restart-ready"))
