@@ -49,6 +49,10 @@ defmodule Tightbeam.Harness.Claude do
   def install_package, do: "@agentclientprotocol/claude-agent-acp"
 
   @impl true
+  def check_launch(opts, host, run),
+    do: Tightbeam.Harness.ClaudeCli.prepare_launch(opts, host, run)
+
+  @impl true
   def cli_binary, do: "claude"
 
   @impl true
@@ -966,12 +970,10 @@ defmodule Tightbeam.Harness.Claude do
     # checkout of the RETIRED TypeScript project, so the gateway's turn path
     # depended on a directory nothing in this repo owns or installs.
     Map.get(target, :adapter_binary) ||
-      Path.join([
-        target.host_config.base_dir,
-        "adapters",
-        "node_modules",
-        ".bin",
-        "claude-agent-acp"
-      ])
+      installed_adapter(Path.join(target.host_config.base_dir, "adapters"))
   end
+
+  @doc false
+  def installed_adapter(adapter_root),
+    do: Path.join([adapter_root, "node_modules", ".bin", "claude-agent-acp"])
 end

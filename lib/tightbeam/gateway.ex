@@ -278,10 +278,13 @@ defmodule Tightbeam.Gateway do
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
-    adapter_opts = fn key, context ->
-      adapter_config
-      |> Map.merge(Map.new(context))
-      |> Placement.adapter_opts(key)
+    adapter_opts = fn {harness, _, host} = key, context ->
+      config = Map.merge(adapter_config, Map.new(context))
+
+      with {:ok, opts} <- Placement.adapter_opts(config, key) do
+        run = config[:sh_out] || &Tightbeam.Harness.Support.system_cmd_out/1
+        Harness.check_launch(Harness.module!(harness), opts, host, run)
+      end
     end
 
     socket_deps = %{
