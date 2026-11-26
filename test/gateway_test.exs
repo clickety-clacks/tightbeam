@@ -62,6 +62,10 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harklight-send harklight-revise harklight-progress harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-retry harklight-follow harklight-briefings-catchup)
 
+    expected =
+      expected ++
+        ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup)
+
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
     expected =
