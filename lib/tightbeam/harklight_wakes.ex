@@ -11,6 +11,8 @@ defmodule Tightbeam.HarklightWakes do
     DB,
     ErrorDiagnostic,
     HarklightFailures,
+    HarklightItemIds,
+    HarklightSend,
     HarklightLifecycle,
     Org,
     Placement,
@@ -233,6 +235,7 @@ defmodule Tightbeam.HarklightWakes do
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
          :ok <- ensure_pending_open_schema(db),
+         :ok <- HarklightItemIds.ensure_schema(db),
          :ok <- Outage.ensure_schema(db),
          :ok <- HarklightFailures.ensure_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
@@ -3419,7 +3422,8 @@ defmodule Tightbeam.HarklightWakes do
     Process.flag(:trap_exit, true)
 
     with executable when is_binary(executable) <- System.find_executable("harklight-agent"),
-         {:ok, db, start} <- GenServer.call(manager, {:feed_start, handle}, :infinity) do
+         {:ok, db, start} <- GenServer.call(manager, {:feed_start, handle}, :infinity),
+         :ok <- hydrate_feed_items(db, handle) do
       case start do
         {:pending, open, older} ->
           open_pending(manager, db, executable, handle, open, older, state_delays)
@@ -3433,6 +3437,16 @@ defmodule Tightbeam.HarklightWakes do
     end
   rescue
     _ -> finish(manager, handle, "listener_failed")
+  end
+
+  defp hydrate_feed_items(db, handle) do
+    if HarklightItemIds.enabled?() do
+      with {:ok, runner} <- HarklightSend.runner([]) do
+        HarklightItemIds.ensure_handle(db, handle, runner)
+      end
+    else
+      :ok
+    end
   end
 
   defp record_feed_ready(manager, handle, delays) do
@@ -4558,7 +4572,15 @@ defmodule Tightbeam.HarklightWakes do
            [handle, item_id]
          ) do
       [[sender]] -> {:ok, sender, item_id}
-      [] -> registered_migrated_item(txn, handle, item_id, item)
+      [] ->
+        if HarklightItemIds.enabled?() do
+          case HarklightItemIds.migrated_in_txn(txn, item_id) do
+            {:ok, ^handle, sender, local_id} -> {:ok, sender, local_id}
+            _ -> :unregistered
+          end
+        else
+          registered_migrated_item(txn, handle, item_id, item)
+        end
     end
   end
 

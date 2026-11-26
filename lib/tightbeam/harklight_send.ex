@@ -4,6 +4,7 @@ defmodule Tightbeam.HarklightSend do
   alias Tightbeam.{
     DB,
     HarklightFailures,
+    HarklightItemIds,
     HarklightLifecycle,
     HarklightReceipts,
     HarklightWakes,
@@ -643,7 +644,7 @@ defmodule Tightbeam.HarklightSend do
     with {:ok, record} <- change_target(db, message, call.params[:handle]),
          :ok <- resolved(record),
          {:ok, runner} <- runner(opts),
-         {:ok, item_id} <- change_item_id(runner, record),
+         {:ok, item_id} <- change_item_id(db, runner, record),
          {:ok, args} <- change_args(command, call.params, Map.put(record, :item_id, item_id)),
          {:ok, journal_id} <- journal_id(runner) do
       op_id = Id.uuid4()
@@ -898,9 +899,37 @@ defmodule Tightbeam.HarklightSend do
   defp reply_target_args(args, nil), do: args
   defp reply_target_args(args, entry), do: args ++ ["--in-reply-to", entry]
 
-  defp change_item_id(_runner, %{request: %{"protocol" => 2}, message_id: id}), do: {:ok, id}
+  defp change_item_id(_db, _runner, %{request: %{"protocol" => 2}, message_id: id}), do: {:ok, id}
 
-  defp change_item_id(runner, %{request: %{"message" => %{"message_id" => legacy_id}}} = record) do
+  defp change_item_id(db, runner, %{request: %{"message" => %{"message_id" => _}}} = record) do
+    if HarklightItemIds.enabled?() do
+      with {:ok, item_id} <- HarklightItemIds.resolve(db, record, runner),
+           {:ok, message} <- read_change_item(runner, ["message-get", "--item-id", item_id]) do
+        if message["item_id"] == item_id and message["sender"] == record.sender_id and
+             message["session"] in [nil, record.handle],
+          do: {:ok, item_id},
+          else: {:error, {:refused, "harklight_result_mismatch"}}
+      end
+    else
+      legacy_change_item_id(runner, record)
+    end
+  end
+
+  defp change_item_id(_db, runner, %{unrecorded: true} = record) do
+    with {:ok, message} <-
+           read_change_item(runner, ["message-get", "--item-id", record.message_id]) do
+      if message["item_id"] == record.message_id and message["session"] == record.handle,
+        do: {:ok, message["item_id"]},
+        else: {:error, {:refused, "harklight_session_mismatch"}}
+    end
+  end
+
+  defp change_item_id(_db, _runner, record), do: {:ok, record.message_id}
+
+  defp legacy_change_item_id(
+         runner,
+         %{request: %{"message" => %{"message_id" => legacy_id}}} = record
+       ) do
     with {:ok, message} <-
            read_change_item(runner, [
              "message-get",
@@ -915,17 +944,6 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
-  defp change_item_id(runner, %{unrecorded: true} = record) do
-    with {:ok, message} <-
-           read_change_item(runner, ["message-get", "--item-id", record.message_id]) do
-      if message["item_id"] == record.message_id and message["session"] == record.handle,
-        do: {:ok, message["item_id"]},
-        else: {:error, {:refused, "harklight_session_mismatch"}}
-    end
-  end
-
-  defp change_item_id(_runner, record), do: {:ok, record.message_id}
-
   defp read_change_item(runner, args) do
     case runner.(args) do
       {output, 0} ->
@@ -933,6 +951,12 @@ defmodule Tightbeam.HarklightSend do
           {:ok, %{"message" => %{"item_id" => item} = message}}
           when is_binary(item) and item != "" ->
             {:ok, message}
+
+          {:ok, %{"view" => "account", "item" => %{"item_id" => item} = message}}
+          when is_binary(item) and item != "" ->
+            if HarklightItemIds.enabled?(),
+              do: {:ok, message},
+              else: {:error, "harklight_result_mismatch"}
 
           _ ->
             {:error, "harklight_result_mismatch"}
@@ -1342,7 +1366,7 @@ defmodule Tightbeam.HarklightSend do
       record = HarklightLifecycle.lookup(db, id)
 
       case if(match?(%{sender_id: sender} when sender == input.sender, record),
-             do: change_item_id(runner, record),
+             do: change_item_id(db, runner, record),
              else: {:ok, id}
            ) do
         {:ok, item_id} -> {:cont, {:ok, [[id, item_id] | targets]}}
