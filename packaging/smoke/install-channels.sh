@@ -15,6 +15,7 @@ done
 
 mkdir "$scratch/home"
 tarball=$(npm pack "$scratch/$target/npm" --pack-destination "$scratch" --silent)
+npm publish "$scratch/$tarball" --dry-run --access public --tag latest
 export TIGHTBEAM_BASE_DIR="$scratch/state"
 if HOME="$scratch/home" npx --yes --package "$scratch/$tarball" tightbeam --mode quick --dry-run >"$scratch/npx.log" 2>&1; then
   cat "$scratch/npx.log"
@@ -63,12 +64,12 @@ update_tap "$previous"
 brew tap --custom-remote "$tap" "$scratch/tap"
 brew install "$formula"
 brew test "$formula"
-old_prefix=$(brew --prefix --installed "$formula")
+old_prefix=$(cd "$(brew --prefix --installed "$formula")" && pwd -P)
 update_tap "$target"
 git -C "$(brew --repo "$tap")" pull --ff-only
 brew upgrade "$formula"
 brew test "$formula"
-new_prefix=$(brew --prefix --installed "$formula")
+new_prefix=$(cd "$(brew --prefix --installed "$formula")" && pwd -P)
 test "$old_prefix" != "$new_prefix"
 jq -e --slurpfile npm "$npm_source" '. == $npm[0]' "$new_prefix/libexec/tightbeam-install-source.json"
 "$new_prefix/bin/tightbeam" --version | grep -F "${release_version%%+*}"
