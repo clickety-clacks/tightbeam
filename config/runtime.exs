@@ -1,5 +1,9 @@
 import Config
 
+config :tightbeam,
+       :pi_typed_turn_failures_enabled,
+       System.get_env("TIGHTBEAM_PI_TYPED_TURN_FAILURES") == "1"
+
 if config_env() != :test do
   case System.get_env("TIGHTBEAM_COORDINATOR_HOLD_DECISIONS") do
     nil -> :ok
