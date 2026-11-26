@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
-import { archives, platforms, releaseIdentity, releaseUrl, repository } from './release.mjs';
+import { archives, platforms, releaseIdentity, releaseUrl } from './release.mjs';
 
 async function download(url, request) {
   const response = await request(url, { signal: AbortSignal.timeout(300_000) });
@@ -17,13 +17,6 @@ async function download(url, request) {
 }
 
 export async function install({ tag, platform, home, request = fetch }) {
-  const release = await download(
-    'https://api.github.com/repos/' + repository + '/releases/tags/' + encodeURIComponent(tag),
-    request,
-  ).then(response => response.json());
-  if (release.tag_name !== tag || release.draft !== false || release.prerelease !== false) {
-    throw new Error('Expected a published stable release for ' + tag);
-  }
   const checksums = await download(releaseUrl(tag, 'SHA256SUMS'), request)
     .then(response => response.text());
   const { name, sha256 } = archives(tag, checksums)[platform];
