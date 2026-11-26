@@ -6,6 +6,7 @@ on:
       - ".github/workflows/install-channels-smoke.yml"
       - "packaging/npm/**"
       - "packaging/*install-channels*"
+      - "packaging/smoke/install-channels.sh"
   workflow_dispatch:
     inputs:
       release_tag:

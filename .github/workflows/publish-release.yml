@@ -41,6 +41,8 @@ jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      install_channels: ${{ steps.channels.outputs.enabled }}
     permissions:
       actions: read
       contents: read
@@ -82,6 +84,15 @@ jobs:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Detect install channels in the selected candidate
+        id: channels
+        run: |
+          if [ -f packaging/npm/package.json ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify main commit and unused release tag
         shell: bash
@@ -221,7 +232,7 @@ jobs:
         with:
           name: release-payload-${{ inputs.candidate_sha }}
           path: ${{ runner.temp }}/release/
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   publish:
@@ -259,6 +270,7 @@ jobs:
           ' release/release-provenance.json > /dev/null
 
       - name: Check publication credentials
+        if: needs.prepare.outputs.install_channels == 'true'
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -296,7 +308,8 @@ jobs:
             release/release-provenance.json
 
   distribute:
-    needs: publish
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.install_channels == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

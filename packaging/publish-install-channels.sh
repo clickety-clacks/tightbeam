@@ -12,7 +12,12 @@ metadata="$channel_dir/registry.json"
 
 status=$(curl -sS --retry 3 -o "$metadata" -w '%{http_code}' "$registry/tightbeam/$version")
 case "$status" in
-  404) npm publish "$channel_dir/$tarball" --registry "$registry" --access public --tag latest ;;
+  404)
+    if ! npm publish "$channel_dir/$tarball" --registry "$registry" --access public --tag latest; then
+      echo "npm publication failed. Check npm Trusted Publishing for publish-release.yml or the NPM_TOKEN secret." >&2
+      exit 1
+    fi
+    ;;
   200) jq -e --arg integrity "$integrity" '.dist.integrity == $integrity' "$metadata" >/dev/null ;;
   *) echo "npm release lookup failed (HTTP $status)" >&2; exit 1 ;;
 esac

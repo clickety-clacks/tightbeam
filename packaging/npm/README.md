@@ -28,7 +28,7 @@ Publishing on the npm package for owner **clickety-clacks**, repository
 Trusted Publishing can replace the npm token after the bootstrap release.
 
 If GitHub publication succeeds and distribution fails, correct the cause and
-rerun the failed job in the same release workflow. The job verifies the exact
+rerun the failed job in the same release workflow within the 30-day artifact retention window. The job verifies the exact
 release is still GitHub's latest, accepts an existing npm version only if its
 tarball integrity matches, and verifies npm latest and the remote tap after
 updating them.
