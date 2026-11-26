@@ -543,6 +543,10 @@ pub enum Command {
         target_id: String,
     },
     Transcript {
+        roles: Vec<String>,
+        no_notices: bool,
+        since: Option<String>,
+        text: bool,
         identity: Identity,
         session: Option<String>,
         name: Option<String>,
@@ -1195,11 +1199,20 @@ COMMANDS:
       Compute physical breathing from one durable snapshot. Both answers exit 0.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
+             [--role <role,...>] [--no-notices] [--since <time>] [--format json|text]
       Read a session's conversation from the substrate's own rows. --name is a
       LOOKUP: it returns candidate sessions to choose from, never content.
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
+      Recover with --no-notices --format text; --role assistant reads just replies. --role repeats or
+      accepts commas (user, assistant, system, tool). --no-notices hides process
+      user notices and batches with only process-authored included members;
+      mixed agent batches stay. Filters apply before limit and paging.
+      --since accepts ISO 8601 with timezone or durations (30m, 2h, 1d).
+      JSON is the default. Text includes UTC headers and paging cursors.
+      Filters require gateway capability transcript-filters-v1; older gateways
+      fail clearly. Text alone also works with older gateways.
   execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
            [--session <key>] [--tree]
@@ -1570,6 +1583,7 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
+    "no-notices",
     "abort",
     "admin",
     "all",
@@ -1641,6 +1655,7 @@ fn split_args(args: Vec<String>) -> Flags {
                 if matches!(
                     name,
                     "memento"
+                        | "role"
                         | "value"
                         | "kind-prefix"
                         | "kind"
@@ -4074,7 +4089,40 @@ fn parse_with_optional_catalog(
             if before.is_some() && after.is_some() {
                 return Err("transcript takes at most one of --before or --after".to_owned());
             }
+            for flag in ["role", "since", "format"] {
+                if flags.contains_key(flag) && nonempty(flags, flag).is_none() {
+                    return Err(format!("--{flag} requires a value"));
+                }
+            }
+            let roles: Vec<String> = parsed
+                .repeated
+                .get("role")
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.split(','))
+                .map(|role| role.trim().to_owned())
+                .collect();
+            if roles
+                .iter()
+                .any(|role| !["user", "assistant", "system", "tool"].contains(&role.as_str()))
+            {
+                return Err("--role requires user, assistant, system, or tool".to_owned());
+            }
+            let format = nonempty(flags, "format").unwrap_or_else(|| "json".to_owned());
+            if !["json", "text"].contains(&format.as_str()) {
+                return Err("--format requires json or text".to_owned());
+            }
+            if name.is_some() && format == "text" {
+                return Err(
+                    "--format text requires --session; use JSON name lookup to choose a session"
+                        .to_owned(),
+                );
+            }
             Ok(Command::Transcript {
+                roles,
+                no_notices: flags.contains_key("no-notices"),
+                since: nonempty(flags, "since"),
+                text: format == "text",
                 identity: identity(flags)?,
                 session,
                 name,
@@ -10099,5 +10147,48 @@ mod tests {
         assert_eq!(update.flags.get("title"), Some(&"--prefixed".to_owned()));
         assert!(!update.flags.contains_key("prefixed"));
         assert!(!update.missing_values.contains("title"));
+    }
+    #[test]
+    fn transcript_filters_accept_single_repeat_and_comma_roles() {
+        for (roles, expected) in [
+            (vec!["--role", "assistant"], vec!["assistant"]),
+            (
+                vec!["--role", "user", "--role", "assistant"],
+                vec!["user", "assistant"],
+            ),
+            (vec!["--role", "user,assistant"], vec!["user", "assistant"]),
+        ] {
+            let mut argv = vec![
+                "transcript",
+                "--session",
+                "session-key",
+                "--format",
+                "text",
+                "--no-notices",
+                "--since",
+                "30m",
+            ];
+            argv.extend(roles);
+            let command = parse(argv.into_iter().map(str::to_owned).collect()).unwrap();
+            match command {
+                Command::Transcript {
+                    roles,
+                    no_notices,
+                    since,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(roles, expected);
+                    assert!(no_notices && text);
+                    assert_eq!(since.as_deref(), Some("30m"));
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+        for flag in [vec!["--role", "bogus"], vec!["--format", "yaml"]] {
+            let mut argv = vec!["transcript", "--session", "session-key"];
+            argv.extend(flag);
+            assert!(parse(argv.into_iter().map(str::to_owned).collect()).is_err());
+        }
     }
 }

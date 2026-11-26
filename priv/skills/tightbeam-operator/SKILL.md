@@ -84,12 +84,21 @@ needs their decision. Keep identifiers as supporting detail and say what each on
 
 ### Read conversation history
 
-Use `tightbeam transcript --session '<exact session key>' --limit 20 --as-user '<user ID>'`.
+Use `tightbeam transcript --session '<exact session key>' --limit 20 --no-notices --format text --as-user '<user ID>'`.
 If you only have a display name, use
 `tightbeam transcript --name '<display name>' --as-user '<user ID>'` to find
 candidate session keys. Page back with `--before <oldestId>` or catch up with
 `--after <newestId>`, using the returned cursor. Never open or query `state.db`.
 The gateway applies your transcript access through the CLI.
+
+
+Recovery keeps all roles; `--no-notices` hides process-authored user notices and
+batches whose included members are all process-authored. Mixed agent batches stay.
+Use `--role assistant` for just your replies (roles repeat or accept commas).
+Text has UTC headers and paging cursors; JSON is the default. Filters precede
+`--limit` and require a gateway advertising `transcript-filters-v1` (older gateways
+fail clearly). `--since` accepts ISO 8601 with timezone or `30m`, `2h`, `1d`;
+keep filters unchanged and use an absolute time for a stable paging boundary.
 
 ### Watch one session live
 
