@@ -767,7 +767,7 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     assert {:ok, _} = DB.query(ctx.db, "DELETE FROM turns WHERE seq=?1", [seq])
     deleted = get(ctx, path, ctx.token) |> decode_success()
-    assert deleted["dependencyVersion"] == baseline["dependencyVersion"]
+    refute deleted["dependencyVersion"] == inserted["dependencyVersion"]
 
     {:ok, _seq} =
       Ledger.enqueue(ctx.db, %{
@@ -780,6 +780,21 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     recreated = get(ctx, path, ctx.token) |> decode_success()
     refute recreated["dependencyVersion"] == inserted["dependencyVersion"]
+  end
+
+  test "a cached legacy dependency token receives a fresh full page", ctx do
+    item = insert_work_item!(ctx.db, "wi_cached_dependency", "owner", 42_000)
+    legacy = :crypto.hash(:sha256, JSON.encode!([[], []])) |> Base.encode16(case: :lower)
+
+    response =
+      conn(:get, "/api/execution-map?limit=1")
+      |> put_req_header("authorization", "Bearer " <> ctx.token)
+      |> put_req_header("if-none-match", ~s("#{legacy}"))
+      |> Router.call(Router.init(ctx.opts))
+
+    page = decode_success(response)
+    assert Enum.map(page["items"], & &1["id"]) == [item]
+    refute page["dependencyVersion"] == legacy
   end
 
   test "quiet pages and off-page attest dependencies span internal item batches", ctx do

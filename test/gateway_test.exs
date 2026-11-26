@@ -10099,7 +10099,7 @@ defmodule Tightbeam.GatewayTest do
   test "unknown model status degrades and tune never composes it as a model ref", ctx do
     base_dir = role_test_base("unknown-model-status")
     Archetypes.load!(base_dir)
-    make_model_unknown(ctx.db, "k1")
+    Tightbeam.GuardGatewayFixture.make_model_unknown(ctx.db, "k1")
 
     status = Gateway.session_status("k1", ctx.db)
 
@@ -17392,34 +17392,6 @@ defmodule Tightbeam.GatewayTest do
         work_item_id: fixture.work_item_id
       }
     })
-  end
-
-  defp make_model_unknown(db, session_key) do
-    {:ok, [[sidecar_trigger]]} =
-      DB.query(
-        db,
-        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
-      )
-
-    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-
-    try do
-      :ok =
-        DB.execute(
-          db,
-          """
-          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
-          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
-          DROP TABLE sessions;
-          ALTER TABLE sessions_with_unknown RENAME TO sessions;
-          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
-          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
-          #{sidecar_trigger};
-          """
-        )
-    after
-      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    end
   end
 
   defp role_test_base(suffix, ready? \\ true) do
