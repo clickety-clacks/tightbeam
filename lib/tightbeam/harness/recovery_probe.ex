@@ -8,6 +8,8 @@ defmodule Tightbeam.Harness.RecoveryProbe do
   @error_limit 512
   @help_output_limit 65_536
   @selection_output_limit 4_096
+  @node_unavailable_exit 69
+  @node_ready "tightbeam-node-ready\n"
   @schema_text """
   {"type":"object",
    "properties":{"ok":{"type":"boolean","enum":[true]}},
@@ -143,20 +145,47 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       {:inconclusive, "recovery check timed out during binary selection"}
     else
       root = Path.join(host_config.base_dir, "adapters")
-      env = "env -i PATH=#{shell_path_assignment(path)} HOME=#{Support.shell_quote(home)} "
-      command = env <> selection_command(harness, root, pin, host_config)
+      command = selection_script(path, home, selection_command(harness, root, pin, host_config))
 
       case port_command(host_config, command, timeout_ms, @selection_output_limit,
-             stderr_to_stdout: harness != "claude"
+             stderr_to_stdout: false
            ) do
-        {:exit, 0, output} -> decode_selected_binary(harness, output)
-        {:ok, output} -> decode_selected_binary(harness, output)
-        {:exit, _status, _output} -> {:uncheckable, "the selected harness CLI is unavailable"}
-        {:timeout, output} -> {:inconclusive, diagnostic(output)}
-        {:transport_error, output} -> {:inconclusive, diagnostic(output)}
-        {:error, reason} -> {:uncheckable, diagnostic(reason)}
+        {:exit, 0, @node_ready <> output} ->
+          decode_selected_binary(harness, output)
+
+        {:exit, _status, @node_ready <> _output} ->
+          {:uncheckable, "the selected harness CLI is unavailable"}
+
+        {:exit, _status, _output} ->
+          {:uncheckable, "Node.js is unavailable for the recovery check"}
+
+        {:timeout, output} ->
+          {:inconclusive, diagnostic(output)}
+
+        {:transport_error, output} ->
+          {:inconclusive, diagnostic(output)}
+
+        {:error, reason} ->
+          {:uncheckable, diagnostic(reason)}
       end
     end
+  end
+
+  defp selection_script(path, home, selector) do
+    env = ~s(env -i PATH="$probe_path" HOME=#{Support.shell_quote(home)})
+
+    # Resolve through the host's configured PATH while HOME still belongs to
+    # the account running the shell. The selector itself confirms Node started.
+    """
+    probe_path=#{shell_path_assignment(path)}
+    probe_node=$(PATH="$probe_path" node -p 'process.execPath') || exit #{@node_unavailable_exit}
+    case "$probe_node" in
+      /*) ;;
+      *) exit #{@node_unavailable_exit} ;;
+    esac
+    [ -x "$probe_node" ] || exit #{@node_unavailable_exit}
+    exec #{env} #{selector}
+    """
   end
 
   defp selection_command("claude", root, pin, host_config) do
@@ -168,14 +197,22 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       end
 
     cwd = if host_config.ssh, do: "", else: Application.get_env(:tightbeam, :cwd, File.cwd!())
-    args = ClaudeCli.selection_args(Claude.installed_adapter(root), cwd)
-    override <> Enum.map_join(args, " ", &Support.shell_quote/1)
+
+    ["node", "-e", script | args] =
+      ClaudeCli.selection_args(Claude.installed_adapter(root), cwd)
+
+    override <> node_selector(script, args)
   end
 
   defp selection_command("codex", root, pin, _host_config) do
-    script = binary_selection_program("codex")
+    node_selector(binary_selection_program("codex"), [root, "codex", pin || ""])
+  end
 
-    "node -e #{Support.shell_quote(script)} #{Support.shell_quote(root)} codex #{Support.shell_quote(pin || "")}"
+  defp node_selector(script, args) do
+    # This prefix distinguishes Node startup failures from selector failures
+    # without spawning another Node process to check the scrubbed environment.
+    script = "process.stdout.write(#{JSON.encode!(@node_ready)});\n" <> script
+    ~s("$probe_node" -e ) <> Enum.map_join([script | args], " ", &Support.shell_quote/1)
   end
 
   defp decode_selected_binary("claude", output) do
@@ -608,7 +645,7 @@ defmodule Tightbeam.Harness.RecoveryProbe do
         {ssh, Support.ssh_opts() ++ [host_config.ssh, "sh", "-c", Support.shell_quote(script)]}
       end
 
-    # A Claude selection result is JSON. Leave transport diagnostics on stderr.
+    # Selection results are structured. Leave transport diagnostics on stderr.
     port_opts = [:binary, :exit_status, :hide, {:args, args}]
 
     port_opts =

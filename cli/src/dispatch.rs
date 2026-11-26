@@ -1539,6 +1539,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             ],
         )),
         Command::Transcript {
+            roles,
+            no_notices,
+            since,
+            text: _,
             identity,
             session,
             name,
@@ -1565,16 +1569,36 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(limit) = limit {
                 params.push(format!("\"limit\":{limit}"));
             }
+            if !roles.is_empty() {
+                params.push(format!(
+                    "\"roles\":{}",
+                    serde_json::to_string(roles).unwrap()
+                ));
+            }
+            if *no_notices {
+                params.push("\"noNotices\":true".to_owned());
+            }
+            if let Some(since) = since {
+                params.push(string_field("since", since));
+            }
             Ok(request(identity, "transcript", vec![], params))
         }
         Command::Toplines {
             identity,
             filters,
             tree,
+            limit,
+            after,
         } => {
             let mut params = filter_params(filters);
             if *tree {
                 params.push("\"tree\":true".to_owned());
+            }
+            if let Some(limit) = limit {
+                params.push(format!("\"limit\":{limit}"));
+            }
+            if let Some(after) = after {
+                params.push(string_field("after", after));
             }
             Ok(request(identity, "execution-map", vec![], params))
         }
@@ -4189,6 +4213,35 @@ where
                     return Err("capability_missing: stale-turn-settlement-v1".to_owned());
                 }
             }
+            if let Command::Transcript {
+                roles,
+                no_notices,
+                since,
+                ..
+            } = &command
+            {
+                if !roles.is_empty() || *no_notices || since.is_some() {
+                    let version = RequestSpec {
+                        attempt_context,
+                        receipt_base_override: None,
+                        path: "/version",
+                        body_json: String::new(),
+                    };
+                    let advertised = send_request(&endpoint, &version, None)?;
+                    if !advertised
+                        .as_ref()
+                        .and_then(|v| v.get("features"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|features| {
+                            features
+                                .iter()
+                                .any(|f| f.as_str() == Some("transcript-filters-v1"))
+                        })
+                    {
+                        return Err("capability_missing: transcript-filters-v1; upgrade the gateway to use transcript filters".to_owned());
+                    }
+                }
+            }
             let request = build_request(&command)?;
             let mut command_failure = None;
             if let Some(result) = send_request(&endpoint, &request, None)? {
@@ -4210,10 +4263,24 @@ where
                     command_failure =
                         Some("harklight-retry: one or more selected handles remain unavailable");
                 }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
-                );
+                if matches!(command, Command::Transcript { text: true, .. }) {
+                    print!(
+                        "{}",
+                        crate::transcript::render_text_with_cursor(
+                            &result,
+                            match &command {
+                                Command::Transcript { before, after, .. } =>
+                                    before.as_deref().or(after.as_deref()),
+                                _ => None,
+                            }
+                        )?
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                    );
+                }
             }
             match command_failure {
                 Some(message) => Err(message.to_owned()),
@@ -5495,6 +5562,66 @@ mod tests {
             first_user_for_target(false, || panic!("remote target attempted local mutation")),
             Ok(crate::users::FirstUser::Dispatch)
         );
+    }
+
+    #[test]
+    fn transcript_filters_probe_capability_and_preserve_request_filters() {
+        use std::cell::RefCell;
+        for supported in [false, true] {
+            let paths = RefCell::new(Vec::new());
+            let command = parse(&[
+                "transcript",
+                "--session",
+                "session-key",
+                "--role",
+                "user",
+                "--role",
+                "assistant",
+                "--no-notices",
+                "--since",
+                "2h",
+                "--limit",
+                "2",
+                "--as",
+                "fixture",
+            ]);
+            let result = run_with(
+                command,
+                || {
+                    Ok(Endpoint {
+                        base: "http://gateway.test".to_owned(),
+                        token: "fixture".to_owned(),
+                        origin: Origin::Provisioned,
+                    })
+                },
+                |_, request, _| {
+                    paths.borrow_mut().push(request.path);
+                    if request.path == "/version" {
+                        return Ok(Some(
+                            serde_json::json!({"features": if supported { vec!["transcript-filters-v1"] } else { vec![] }}),
+                        ));
+                    }
+                    let body: Value = serde_json::from_str(&request.body_json).unwrap();
+                    assert_eq!(
+                        body["params"],
+                        serde_json::json!({"sessionKey": "session-key", "roles": ["user", "assistant"], "noNotices": true, "since": "2h", "limit": 2})
+                    );
+                    Ok(None)
+                },
+                |_, _| panic!("unexpected harness lookup"),
+            );
+            if supported {
+                assert!(result.is_ok());
+                assert_eq!(*paths.borrow(), vec!["/version", "/agent/dispatch"]);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("capability_missing: transcript-filters-v1")
+                );
+                assert_eq!(*paths.borrow(), vec!["/version"]);
+            }
+        }
     }
 
     #[test]
