@@ -4,7 +4,7 @@ Tightbeam is like a machined part for running models in their own harness and ta
 
 Just want to try it? [Use the quick install](#quick-install).
 
-Both install paths support macOS on Apple silicon and Linux on x86-64. Use one package manager. The npx command runs setup for you. With Homebrew, run setup after installing the package.
+Both install paths support macOS on Apple silicon and Linux on x86-64. Have a supported harness CLI on your PATH. Use one package manager. The npx command runs setup for you. With Homebrew, run setup after installing the package.
 
 ## Quick install
 
@@ -42,11 +42,12 @@ tightbeam setup --mode full
 
 Setup shows its plan and asks for confirmation before proceeding. If your coding agent is installing for you, stay available to confirm the plan and authorize administrator access when prompted.
 
-For releases without `tightbeam setup`, follow the [install instructions for your release](https://github.com/clickety-clacks/tightbeam/releases).
+For releases without `tightbeam setup`, follow the [install instructions for your release](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#from-a-release-package).
 
 ## Documentation
 
 - [Agents, archetypes, and settings](docs/AGENTS-AND-SETTINGS.md)
+- [Checking and removing an installation](docs/OPERATING.md)
 - [Existing installations and upgrades](docs/UPGRADE.md)
 - [Architecture](docs/ARCHITECTURE.md) and [adding a machine](docs/SATELLITE.md)
 - [Developing Tightbeam](docs/DEVELOPMENT.md)

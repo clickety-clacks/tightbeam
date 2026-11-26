@@ -23,7 +23,6 @@ Configure model, effort, and context window as separate fields. The model and an
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model for new sessions. Use a model available in the default harness. |
 | `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning effort for models with effort tiers. |
 | `TIGHTBEAM_DEFAULT_CONTEXT` | The default context-window variant where the model offers a choice. |
-| `TIGHTBEAM_SUPERVISION_INTERVAL_MS` | The assignment inactivity reminder interval. Defaults to 30 minutes. Set to `off` to disable these reminders. |
 | `TIGHTBEAM_COORDINATOR_HOLD_DECISIONS` | Set to `false` to suppress decision requests when usage limits or harness holds stop all active coordinators. |
 
 Use a separate base directory and port for each gateway on the same machine. See [Satellite hosts](SATELLITE.md) to add a machine to an existing gateway and [Feature flags](feature-flags.md) for controls on shipped features.
