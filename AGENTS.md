@@ -24,6 +24,17 @@ When lifting or re-imposing a pause, the release owner tells every owner with
 pending merges and confirms each received the update. A previous reopening
 does not carry over to a re-imposed pause.
 
+### Release and install work
+
+Run measurements as soon as they are needed. Measurements on a disposable copy
+of production data run off the production host need no extra approval. Measure
+only timings, counts, and internal code names. Never measure content or
+identities.
+
+Run release and install steps back to back. Start the next step as soon as the
+previous one finishes and the next step's requirements are met. Do not insert
+timed waits, due times, or scheduled checkpoints between steps.
+
 ### Cutting a release
 
 Before building a candidate, pass all three gates in

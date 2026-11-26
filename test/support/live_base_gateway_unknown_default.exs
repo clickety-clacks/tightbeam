@@ -95,7 +95,7 @@ defmodule GuardUnknownDefault do
         runner = Keyword.fetch!(lane_opts, :runner)
 
         # Runtime legacy-null fixture only, after canonical admitted startup.
-        make_model_unknown(db, "k1")
+        Tightbeam.GuardGatewayFixture.make_model_unknown(db, "k1")
 
         assert :appended =
                  Gateway.deliver_prompt("k1", "user:flynn", "use the default",
@@ -120,7 +120,7 @@ defmodule GuardUnknownDefault do
 
         # The session/load-lost fallback consumes the same unknown value: it must
         # create without seeding, then capture the new harness default too.
-        make_model_unknown(db, "k1")
+        Tightbeam.GuardGatewayFixture.make_model_unknown(db, "k1")
 
         assert :appended =
                  Gateway.deliver_prompt("k1", "user:flynn", "fall back to the default",
@@ -152,34 +152,6 @@ defmodule GuardUnknownDefault do
         GenServer.stop(lane)
       end
     end)
-  end
-
-  defp make_model_unknown(db, session_key) do
-    {:ok, [[sidecar_trigger]]} =
-      DB.query(
-        db,
-        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
-      )
-
-    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-
-    try do
-      :ok =
-        DB.execute(
-          db,
-          """
-          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
-          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
-          DROP TABLE sessions;
-          ALTER TABLE sessions_with_unknown RENAME TO sessions;
-          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
-          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
-          #{sidecar_trigger};
-          """
-        )
-    after
-      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    end
   end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)
