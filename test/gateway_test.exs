@@ -8880,6 +8880,31 @@ defmodule Tightbeam.GatewayTest do
     refute_received {:tune_session_closed, _}
   end
 
+  test "a Claude tune load timeout leaves the conversation and stored selection intact", ctx do
+    diagnostic = Tightbeam.ErrorDiagnostic.from_reason(:timeout, operation: "session/load")
+    timeout = Tightbeam.ErrorDiagnostic.diagnosed(:timeout, diagnostic)
+
+    config =
+      claude_tune_fixture(ctx, "timed-out-engine",
+        resident: false,
+        load_result: {:error, timeout}
+      )
+
+    pointer = Org.current_pointer(ctx.db, "k1")
+    model = Org.get(ctx.db, "k1").model
+
+    assert %{ok: false, code: "model_apply_failed", diagnostic: %{"operation" => "session/load"}} =
+             tune_claude_fixture(config)
+
+    assert_receive {:tune_session_loaded, "timed-out-engine", %Model{family: "claude-sonnet-4-6"},
+                    _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == pointer
+    assert Org.get(ctx.db, "k1").model == model
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
   defp claude_tune_fixture(ctx, sid, opts) do
     base_dir = role_test_base(sid)
     Archetypes.load!(base_dir)
