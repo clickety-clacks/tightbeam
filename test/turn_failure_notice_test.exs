@@ -1,7 +1,7 @@
 defmodule Tightbeam.TurnFailureNoticeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Ledger, Model, Org, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Ledger, Model, Org, TurnFailureNotice, Wakes}
 
   alias Tightbeam.Productions.Bubble
 
@@ -119,6 +119,43 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     assert first_prompt =~ @limit_429
     assert refusal_prompt =~ "Turn #{retried.seq}"
     assert refusal_prompt =~ "did not perform work"
+  end
+
+  test "the cross-session receipt check seeks the message dedupe index, never every session's messages",
+       ctx do
+    args = [
+      "w_health_redelivery_parent_7",
+      "bubble:7:",
+      "bubble:7;",
+      "wake-undelivered:7",
+      "\nReason: x",
+      "wake-undelivered:7:",
+      "wake-undelivered:7;"
+    ]
+
+    assert {:ok, plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN " <> TurnFailureNotice.initial_admitted_sql(),
+               args
+             )
+
+    details = Enum.map(plan, &List.last/1)
+
+    assert Enum.any?(
+             details,
+             &(&1 =~ "messages_client_dedupe (sessionKey=? AND deviceId=? AND clientMessageId=?)")
+           ),
+           inspect(details)
+
+    assert Enum.any?(
+             details,
+             &(&1 =~
+                 "messages_client_dedupe (sessionKey=? AND deviceId=? AND clientMessageId>? AND clientMessageId<?)")
+           ),
+           inspect(details)
+
+    refute Enum.any?(details, &(&1 =~ "messages_session")), inspect(details)
   end
 
   defp claim_health_redelivery!(ctx) do
