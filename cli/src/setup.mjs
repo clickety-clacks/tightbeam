@@ -265,11 +265,14 @@ function providerActions(host) {
   return [
     ['claude', 'anthropic', 'ANTHROPIC_API_KEY'],
     ['codex', 'openai', 'OPENAI_API_KEY'],
-    ['pi', 'opencode-go', 'OPENCODE_API_KEY'],
+    env.TIGHTBEAM_LOCAL_OPENAI_ENDPOINT
+      ? ['pi', 'local-openai', 'LOCAL_OPENAI_API_KEY']
+      : ['pi', 'opencode-go', 'OPENCODE_API_KEY'],
     ['cursor', 'cursor', 'CURSOR_API_KEY'],
   ].filter(([harness]) => available(harness))
     .map(([harness, provider, key]) => {
-      const metadata = jsonFile(path.join(base, 'homes', host, harness, '.tightbeam', 'credential.json'));
+      const file = provider === 'local-openai' ? 'local-openai-credential.json' : 'credential.json';
+      const metadata = jsonFile(path.join(base, 'homes', host, harness, '.tightbeam', file));
       return { provider, key, needed: !metadata?.onboarded || metadata.terminal === true };
     });
 }
@@ -488,11 +491,14 @@ async function setup() {
       }
       for (const { provider, key } of pending) {
         const onboard = ['onboard', provider, '--as-user', state.admin];
+        if (provider === 'local-openai') {
+          onboard.push('--name', 'local', '--endpoint', env.TIGHTBEAM_LOCAL_OPENAI_ENDPOINT);
+        }
         if (env[key]) {
           run(cli, [...onboard, '--api-key'], { input: env[key], stdio: ['pipe', 'inherit', 'inherit'], cwd: home });
         } else if (provider === 'opencode-go' && env.TIGHTBEAM_CREDENTIALS_DIRECTORY) {
           run(cli, [...onboard, '--daemon-credential'], { cwd: home });
-        } else if (provider === 'openai' || provider === 'anthropic') {
+        } else if (['openai', 'anthropic', 'local-openai'].includes(provider)) {
           run(cli, onboard, { cwd: home });
         } else {
           throw new Error(`Set ${key} to onboard ${provider}, then run setup again.`);
