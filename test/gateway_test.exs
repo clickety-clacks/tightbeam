@@ -568,6 +568,15 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:tune_session_loaded, sid, model, cwd, mcp_servers, guidance})
       {:reply, Keyword.get(opts, :load_result, {:ok, model}), state}
     end
+
+    def handle_call(
+          {:new_candidate_session, model, _cwd, _mcp, _guidance},
+          _from,
+          {parent, _opts} = state
+        ) do
+      send(parent, {:tune_session_created, model})
+      {:reply, {:ok, "replacement-session"}, state}
+    end
   end
 
   defmodule FastTuneAdapterStub do
@@ -8812,6 +8821,127 @@ defmodule Tightbeam.GatewayTest do
     assert %Model{family: "claude-sonnet-4-6"} = Org.get(ctx.db, "k1").model
   end
 
+  test "a spawned Claude session can be tuned before its first prompt", ctx do
+    opts = [resident: true, switch_result: {:error, :fork_requires_prompted_session}]
+    config = claude_tune_fixture(ctx, "spawn-engine", opts)
+
+    assert %{ok: true, requested: %{model: "claude-sonnet-4-6"}, applies: "now"} =
+             tune_claude_fixture(config)
+
+    assert_receive {:tune_session_created, %Model{family: "claude-sonnet-4-6"}}
+    assert_receive {:tune_session_closed, "spawn-engine"}
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "replacement-session"
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+  end
+
+  test "a cold Claude tune after a harness swap saves the selection when the transcript is absent",
+       ctx do
+    Org.set_harness(ctx.db, "k1", "codex", "openai", Model.new("gpt-5.6-sol"))
+    Org.append_pointer(ctx.db, "k1", "other-harness-engine", "created")
+
+    Org.set_harness(
+      ctx.db,
+      "k1",
+      "claude",
+      "anthropic",
+      Model.new("claude-sonnet-4-6", effort: "high")
+    )
+
+    missing = %{"code" => -32002, "message" => "Resource not found"}
+    diagnostic = Tightbeam.ErrorDiagnostic.from_reason(missing, operation: "session/load")
+    reason = Tightbeam.ErrorDiagnostic.diagnosed(missing, diagnostic)
+
+    config =
+      claude_tune_fixture(ctx, "post-swap-engine", resident: false, load_result: {:error, reason})
+
+    before = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: true, applies: "next_turn", projection_committed: true} =
+             tune_claude_fixture(config, %{setting: "set_reasoning", reasoningLevel: "medium"})
+
+    assert_receive {:tune_session_loaded, "post-swap-engine",
+                    %Model{family: "claude-sonnet-4-6", effort: "medium"}, _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.effort == "medium"
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
+  test "a cold Claude tune reloads a persisted conversation with the requested model", ctx do
+    config = claude_tune_fixture(ctx, "persisted-engine", resident: false)
+    before = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: true, applies: "now", engine_context: "preserved"} = tune_claude_fixture(config)
+
+    assert_receive {:tune_session_loaded, "persisted-engine", %Model{family: "claude-sonnet-4-6"},
+                    _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
+  for {label, load_error, origin} <- [
+        {"timeout", :timeout, "acp_transport"},
+        {"transport close", :closed, "acp_transport"},
+        {"JSON-RPC error", %{"code" => -32603, "message" => "Internal error"}, "acp_adapter"}
+      ] do
+    test "a Claude tune load #{label} leaves the conversation and stored selection intact", ctx do
+      reason = unquote(Macro.escape(load_error))
+
+      diagnostic =
+        Tightbeam.ErrorDiagnostic.from_reason(reason,
+          operation: "session/load",
+          origin: unquote(origin)
+        )
+
+      failure = Tightbeam.ErrorDiagnostic.diagnosed(reason, diagnostic)
+      sid = "existing-engine"
+
+      config = claude_tune_fixture(ctx, sid, resident: false, load_result: {:error, failure})
+      pointer = Org.current_pointer(ctx.db, "k1")
+      model = Org.get(ctx.db, "k1").model
+
+      assert %{
+               ok: false,
+               code: "model_apply_failed",
+               diagnostic: %{"operation" => "session/load"}
+             } =
+               tune_claude_fixture(config)
+
+      assert_receive {:tune_session_loaded, ^sid, %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp,
+                      _guidance}
+
+      assert Org.current_pointer(ctx.db, "k1") == pointer
+      assert Org.get(ctx.db, "k1").model == model
+      refute_received {:tune_session_created, _}
+      refute_received {:tune_session_closed, _}
+    end
+  end
+
+  defp claude_tune_fixture(ctx, sid, opts) do
+    base_dir = role_test_base(sid)
+    Archetypes.load!(base_dir)
+    host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", sid, "created")
+    start_lane!(ctx.db, "k1")
+    adapter = start_supervised!({TuneAdapterStub, {self(), opts}})
+    start_supervised!({CoordinatorStub, adapter})
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    gateway_config(base_dir, ctx.db, 0)
+  end
+
+  defp tune_claude_fixture(config, params \\ %{setting: "set_model", model: "claude-sonnet-4-6"}) do
+    Gateway.handlers(config)["tune"].(%{
+      origin: "user:flynn",
+      session_key: "k1",
+      params: params
+    })
+  end
+
   test "initial set_model reports the harness selection when it differs from the request", ctx do
     base_dir = role_test_base("initial-set-model-mismatch")
     Archetypes.load!(base_dir)
@@ -9969,7 +10099,7 @@ defmodule Tightbeam.GatewayTest do
   test "unknown model status degrades and tune never composes it as a model ref", ctx do
     base_dir = role_test_base("unknown-model-status")
     Archetypes.load!(base_dir)
-    make_model_unknown(ctx.db, "k1")
+    Tightbeam.GuardGatewayFixture.make_model_unknown(ctx.db, "k1")
 
     status = Gateway.session_status("k1", ctx.db)
 
@@ -17262,34 +17392,6 @@ defmodule Tightbeam.GatewayTest do
         work_item_id: fixture.work_item_id
       }
     })
-  end
-
-  defp make_model_unknown(db, session_key) do
-    {:ok, [[sidecar_trigger]]} =
-      DB.query(
-        db,
-        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
-      )
-
-    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-
-    try do
-      :ok =
-        DB.execute(
-          db,
-          """
-          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
-          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
-          DROP TABLE sessions;
-          ALTER TABLE sessions_with_unknown RENAME TO sessions;
-          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
-          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
-          #{sidecar_trigger};
-          """
-        )
-    after
-      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    end
   end
 
   defp role_test_base(suffix, ready? \\ true) do
