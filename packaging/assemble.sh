@@ -52,6 +52,7 @@ cp -R packaging/release-install "$OUT/release-install"
 sh packaging/write-release-provenance.sh "$OUT/release-provenance.json"
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
+python3 packaging/extract-payload.py --tree "$OUT"
 elixir packaging/payload-manifest.exs generate "$OUT"
 TEMP_ARTIFACT="$ARTIFACT.tmp.$$"
 trap 'rm -f "$TEMP_ARTIFACT"' EXIT HUP INT TERM

@@ -79,15 +79,6 @@ defmodule Tightbeam.HarklightWakes do
     handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
     rev INTEGER NOT NULL CHECK(rev >= 0)
   );
-  CREATE TABLE IF NOT EXISTS harklight_pending_opens (
-    handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
-    rev INTEGER,
-    token TEXT,
-    resumed INTEGER NOT NULL DEFAULT 0,
-    stopped INTEGER NOT NULL DEFAULT 0,
-    expired INTEGER,
-    CHECK ((rev IS NULL) = (token IS NULL))
-  );
   CREATE TABLE IF NOT EXISTS harklight_feed_launches (
     handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
     owner TEXT NOT NULL
@@ -165,6 +156,18 @@ defmodule Tightbeam.HarklightWakes do
     ON harklight_wake_deliveries(sessionKey,handle,eventId);
   """
 
+  @pending_open_ddl """
+  CREATE TABLE IF NOT EXISTS harklight_pending_opens (
+    handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+    rev INTEGER,
+    token TEXT,
+    resumed INTEGER NOT NULL DEFAULT 0,
+    stopped INTEGER NOT NULL DEFAULT 0,
+    expired INTEGER,
+    CHECK ((rev IS NULL) = (token IS NULL))
+  );
+  """
+
   # A conversation with messages from before protocol 2 that has never been
   # opened under it. Its first read is never a snapshot.
   @earlier_unopened_sql """
@@ -182,7 +185,7 @@ defmodule Tightbeam.HarklightWakes do
   # A migration rule, not a stop: such a conversation opens only by explicit
   # retry. Once chosen, its open continues by itself. Set this to "0" to drop
   # the rule.
-  @first_open_held_sql """
+  @pending_first_open_held_sql """
   (#{@earlier_unopened_sql}
    AND NOT EXISTS(SELECT 1 FROM harklight_pending_opens o WHERE o.handle=h.handle))
   """
@@ -192,33 +195,56 @@ defmodule Tightbeam.HarklightWakes do
 
   # Why a conversation is not opened by itself. Other recorded stops and pauses
   # recover.
-  @choice_sql """
+  @pending_choice_sql """
   CASE
     WHEN EXISTS(SELECT 1 FROM harklight_pending_opens o WHERE o.handle=h.handle AND o.stopped=1)
       THEN '#{@pending_stopped}'
-    WHEN #{@first_open_held_sql} THEN '#{@first_open_pending}'
+    WHEN #{@pending_first_open_held_sql} THEN '#{@first_open_pending}'
   END
   """
 
-  @hold_sql """
-  COALESCE(#{@choice_sql}, CASE
-    WHEN (s.handle IS NOT NULL OR p.handle IS NOT NULL) AND (
-      h.lastError LIKE '%reason_code=identity_revoked%'
-      OR h.lastError LIKE '%agent feed closed: revoked%') THEN 'harklight_feed_stopped'
-  END)
-  """
+  defp pending_open_enabled?,
+    do: Application.get_env(:tightbeam, :harklight_pending_open_enabled, false)
+
+  defp first_open_held_sql do
+    if pending_open_enabled?(), do: @pending_first_open_held_sql, else: @earlier_unopened_sql
+  end
+
+  defp choice_sql do
+    if pending_open_enabled?() do
+      @pending_choice_sql
+    else
+      "CASE WHEN #{@earlier_unopened_sql} THEN '#{@first_open_pending}' END"
+    end
+  end
+
+  defp hold_sql do
+    """
+    COALESCE(#{choice_sql()}, CASE
+      WHEN (s.handle IS NOT NULL OR p.handle IS NOT NULL) AND (
+        h.lastError LIKE '%reason_code=identity_revoked%'
+        OR h.lastError LIKE '%agent feed closed: revoked%') THEN 'harklight_feed_stopped'
+    END)
+    """
+  end
 
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
+         :ok <- ensure_pending_open_schema(db),
          :ok <- Outage.ensure_schema(db),
          :ok <- HarklightFailures.ensure_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
          :ok <- Tightbeam.HarklightReceipts.ensure_schema(db),
-         :ok <- Tightbeam.HarklightBriefings.ensure_schema(db) do
+         :ok <- Tightbeam.HarklightBriefings.ensure_schema(db),
+         :ok <- Tightbeam.HarklightBounces.ensure_schema(db) do
       backfill_pending_supersedes(db)
     end
+  end
+
+  defp ensure_pending_open_schema(db) do
+    if pending_open_enabled?(), do: DB.execute(db, @pending_open_ddl), else: :ok
   end
 
   def start_link(opts) do
@@ -1034,7 +1060,7 @@ defmodule Tightbeam.HarklightWakes do
            """
            SELECT h.handle,h.sessionKey,h.state,COALESCE(p.diagnostic,h.lastError)
            FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
-           WHERE h.state IN ('active','unavailable') AND (#{@choice_sql}) IS NULL
+           WHERE h.state IN ('active','unavailable') AND (#{choice_sql()}) IS NULL
            ORDER BY h.createdAt,h.handle
            """
          ) do
@@ -1463,7 +1489,7 @@ defmodule Tightbeam.HarklightWakes do
            DB.query(
              state.db,
              """
-             SELECT h.handle,#{@hold_sql} AS hold,
+             SELECT h.handle,#{hold_sql()} AS hold,
                s.handle IS NOT NULL OR p.handle IS NOT NULL
              FROM harklight_wake_handles h
              LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
@@ -1866,7 +1892,9 @@ defmodule Tightbeam.HarklightWakes do
                     unopened_in_txn(txn, handle, status, at)
 
                   true ->
-                    if cursor_expired?(status), do: want_pending_open_in_txn(txn, handle)
+                    if pending_open_enabled?() and cursor_expired?(status),
+                      do: want_pending_open_in_txn(txn, handle)
+
                     Outage.start_in_txn(txn, handle, failure_details(status), at)
                 end
 
@@ -2021,7 +2049,7 @@ defmodule Tightbeam.HarklightWakes do
   def first_open_pending(db, handle) do
     case DB.query(
            db,
-           "SELECT h.state,#{@choice_sql} FROM harklight_wake_handles h WHERE h.handle=?1",
+           "SELECT h.state,#{choice_sql()} FROM harklight_wake_handles h WHERE h.handle=?1",
            [handle]
          ) do
       {:ok, [[state, code]]} when is_binary(code) -> {:error, code, choice_reason(code, state)}
@@ -2034,7 +2062,7 @@ defmodule Tightbeam.HarklightWakes do
     do:
       Txn.q(
         txn,
-        "SELECT 1 FROM harklight_wake_handles h WHERE h.handle=?1 AND #{@first_open_held_sql}",
+        "SELECT 1 FROM harklight_wake_handles h WHERE h.handle=?1 AND #{first_open_held_sql()}",
         [handle]
       ) != []
 
@@ -2551,7 +2579,7 @@ defmodule Tightbeam.HarklightWakes do
            state.db,
            """
            SELECT COALESCE(h.currentReceiverSessionKey,h.sessionKey),h.host,h.state,
-             #{@hold_sql}
+             #{hold_sql()}
            FROM harklight_wake_handles h
            LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
            LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
@@ -2601,7 +2629,7 @@ defmodule Tightbeam.HarklightWakes do
   def handle_call({:feed_start, handle}, from, state) do
     result =
       if valid_worker?(state, handle, from) do
-        case DB.transaction(state.db, &feed_start_in_txn(&1, handle)) do
+        case feed_start(state.db, handle) do
           {:ok, start} -> {:ok, state.db, start}
           _ -> {:error, "capture_unavailable"}
         end
@@ -2613,7 +2641,7 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   def handle_call({:pending_open, handle, step}, from, state) do
-    if valid_worker?(state, handle, from) do
+    if pending_open_enabled?() and valid_worker?(state, handle, from) do
       case DB.transaction(state.db, &pending_open_in_txn(&1, handle, step)) do
         {:ok, :stopped} ->
           state = cancel_outage_timer(state, handle)
@@ -2631,8 +2659,12 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   def handle_call({:feed_capture, handle, rev, frames, mode}, from, state) do
-    if valid_worker?(state, handle, from) do
-      case capture_feed_result(state.db, handle, rev, frames, mode) do
+    if valid_worker?(state, handle, from) and
+         (mode in [:baseline, :live] or pending_open_enabled?()) do
+      result = capture_feed_result(state.db, handle, rev, frames, mode)
+      if match?({:ok, _}, result), do: Tightbeam.HarklightBounces.captured(frames)
+
+      case result do
         {:ok, true} -> {:reply, :ok, confirm_feed_recovery(state, handle)}
         {:ok, false} -> {:reply, :ok, state}
         error -> {:reply, error, state}
@@ -2768,6 +2800,18 @@ defmodule Tightbeam.HarklightWakes do
       {:reply, :ok, state}
     else
       {:reply, :ok, state}
+    end
+  end
+
+  defp feed_start(db, handle) do
+    if pending_open_enabled?() do
+      DB.transaction(db, &feed_start_in_txn(&1, handle))
+    else
+      case DB.query(db, "SELECT rev FROM harklight_feed_checkpoints WHERE handle=?1", [handle]) do
+        {:ok, [[rev]]} -> {:ok, {:after, rev, :agent_recovers}}
+        {:ok, []} -> {:ok, :snapshot}
+        error -> error
+      end
     end
   end
 
@@ -2909,8 +2953,12 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp arm_recoveries(%{recovery_timer: nil} = state) do
-    timer = Process.send_after(self(), :announce_recoveries, state.recovery_gather_delay)
-    %{state | recovery_timer: timer}
+    if Outage.grouped_notices_enabled?() do
+      timer = Process.send_after(self(), :announce_recoveries, state.recovery_gather_delay)
+      %{state | recovery_timer: timer}
+    else
+      state
+    end
   end
 
   defp arm_recoveries(state), do: state
@@ -3275,7 +3323,7 @@ defmodule Tightbeam.HarklightWakes do
     case DB.query(
            state.db,
            """
-           SELECT sessionKey,host,vendorSessionId,state,#{@hold_sql},
+           SELECT sessionKey,host,vendorSessionId,state,#{hold_sql()},
              s.handle IS NOT NULL OR p.handle IS NOT NULL
            FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
            LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
@@ -3922,8 +3970,10 @@ defmodule Tightbeam.HarklightWakes do
 
   # The position expired. A feed told to exit then must not print a snapshot,
   # which skips chat on closed items, so one is not applied.
-  defp apply_listener_frame(_manager, _handle, %{"kind" => "cursor_expired"}, _feed),
-    do: {:error, "cursor_expired"}
+  defp apply_listener_frame(_manager, _handle, %{"kind" => "cursor_expired"}, %{
+         stops_on_expiry: true
+       }),
+       do: {:error, "cursor_expired"}
 
   defp apply_listener_frame(_manager, _handle, %{"kind" => "baseline"}, %{
          stops_on_expiry: true
@@ -4291,7 +4341,7 @@ defmodule Tightbeam.HarklightWakes do
 
            # A feed that answers ends an open that was only wanted: its position
            # is good, or the Agent recovered it.
-           if mode in [:baseline, :live],
+           if pending_open_enabled?() and mode in [:baseline, :live],
              do:
                Txn.q(
                  txn,
@@ -4302,6 +4352,8 @@ defmodule Tightbeam.HarklightWakes do
            if mode != :live or rev > previous do
              # A pending open keeps the Server's order: chat before its answer.
              ordered = if mode == :baseline, do: Enum.sort_by(frames, & &1["rev"]), else: frames
+
+             :ok = Tightbeam.HarklightBounces.capture_frames_in_txn(txn, handle, ordered)
 
              Enum.each(ordered, fn frame ->
                case capture_change_in_txn(txn, handle, frame) do

@@ -3,6 +3,14 @@ defmodule Tightbeam.Retention do
   Performs the one-time cleanup of the historical rail_sweep flood.
 
   All other lifecycle history, including newer rail_sweep events, is retained.
+
+  The walk is paced so other writers keep the database: after each batch it
+  waits `pace_factor` times as long as that batch took (at least `min_yield_ms`,
+  at most a minute), and batches are small.
+
+  The cleanup is off unless the `:rail_sweep_cleanup` application setting is
+  `true` (or `enabled: true` is passed). When off, the process starts but never
+  runs a batch, so it neither reads nor writes the database.
   """
   use GenServer
 
@@ -10,9 +18,11 @@ defmodule Tightbeam.Retention do
   alias Tightbeam.DB.Txn
   require Logger
 
-  @batch 2_000
+  @batch 200
   @boot_delay 30_000
   @yield_ms 100
+  @pace_factor 4
+  @max_pause_ms 60_000
   @retry_ms 3_600_000
   @first_ts DateTime.to_unix(~U[2026-09-19 00:00:00Z], :millisecond)
   @after_last_ts DateTime.to_unix(~U[2026-10-15 00:00:00Z], :millisecond)
@@ -23,21 +33,40 @@ defmodule Tightbeam.Retention do
 
   @impl true
   def init(opts) do
-    Process.send_after(self(), :trim, @boot_delay)
-    {:ok, %{db: Keyword.get(opts, :db, DB), cursor: 0, complete: false}}
+    enabled =
+      Keyword.get(opts, :enabled, Application.get_env(:tightbeam, :rail_sweep_cleanup, false))
+
+    if enabled, do: Process.send_after(self(), :trim, @boot_delay)
+
+    {:ok,
+     %{
+       db: Keyword.get(opts, :db, DB),
+       enabled: enabled,
+       cursor: 0,
+       complete: false,
+       batch: Keyword.get(opts, :batch, @batch),
+       pace_factor: Keyword.get(opts, :pace_factor, @pace_factor),
+       min_yield_ms: Keyword.get(opts, :min_yield_ms, @yield_ms),
+       last_pause_ms: nil
+     }}
   end
 
   @impl true
+  def handle_info(:trim, %{enabled: false} = state), do: {:noreply, state}
   def handle_info(:trim, %{complete: true} = state), do: {:noreply, state}
 
   def handle_info(:trim, state) do
-    case trim_batch(state.db, state.cursor) do
+    started = System.monotonic_time(:millisecond)
+
+    case trim_batch(state.db, state.cursor, state.batch) do
       {:ok, :complete} ->
         {:noreply, %{state | cursor: 0, complete: true}}
 
       {:ok, cursor} ->
-        Process.send_after(self(), :trim, @yield_ms)
-        {:noreply, %{state | cursor: cursor}}
+        elapsed = System.monotonic_time(:millisecond) - started
+        pause = pause_ms(elapsed, state.pace_factor, state.min_yield_ms)
+        Process.send_after(self(), :trim, pause)
+        {:noreply, %{state | cursor: cursor, last_pause_ms: pause}}
 
       {:error, %DB.Overloaded{}} ->
         Logger.debug("database overloaded; historical cleanup deferred")
@@ -51,9 +80,14 @@ defmodule Tightbeam.Retention do
     end
   end
 
+  @doc false
+  # The wait after a batch that held the writer for `elapsed` ms.
+  def pause_ms(elapsed, pace_factor, min_yield_ms),
+    do: elapsed |> Kernel.*(pace_factor) |> max(min_yield_ms) |> min(@max_pause_ms)
+
   # Each transaction checks the durable marker before deleting. A crash between
   # batches resumes from the start; completion and the marker are atomic.
-  defp trim_batch(db, cursor) do
+  defp trim_batch(db, cursor, batch) do
     DB.transaction(db, fn txn ->
       if Txn.q(txn, "SELECT 1 FROM rail_sweep_cleanup WHERE id = 0") != [] do
         :complete
@@ -62,7 +96,7 @@ defmodule Tightbeam.Retention do
           Txn.q(
             txn,
             "SELECT id FROM lifecycle_events WHERE id > ?1 ORDER BY id LIMIT ?2",
-            [cursor, @batch]
+            [cursor, batch]
           )
 
         case List.last(rows) do

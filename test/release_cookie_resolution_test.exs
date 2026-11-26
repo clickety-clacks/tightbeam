@@ -1,17 +1,6 @@
 defmodule Tightbeam.ReleaseCookieResolutionTest do
-  # F2 (R4) proven against the REAL mix-generated release launcher — not a model.
-  #
-  # The generated launcher resolves the Erlang distribution cookie
-  # (`RELEASE_COOKIE="${RELEASE_COOKIE:-"$(cat releases/COOKIE)"}"`) and EXPORTS
-  # it, so `<launcher> eval` reading the exported RELEASE_COOKIE observes the
-  # EFFECTIVE cookie the debug verbs (rpc/remote) would use — without a peer
-  # node. Together with the committed shim stripping RELEASE_COOKIE on the
-  # rpc/remote path (isolated_lifecycle_isolation_test.exs), this proves the end
-  # state R4 requires: rpc/remote use this install's BAKED cookie, and an
-  # inherited/ambient RELEASE_COOKIE cannot override it.
-  #
-  # Builds the real release ONCE in setup_all (~10s). Kept in the default gate on
-  # purpose: a proof against reality has to actually run to count.
+  # Exercise the actual generated launcher without reading credential files or
+  # starting a distributed node.
   use Tightbeam.TestCase, async: false
 
   @moduletag :release_build
@@ -31,35 +20,34 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     assert status == 0, "mix release failed:\n#{out}"
 
     launcher = Path.join(release_dir, "bin/tightbeam_gateway")
-    baked = release_dir |> Path.join("releases/COOKIE") |> File.read!() |> String.trim()
-    assert baked != "", "the built release has no baked releases/COOKIE"
+    assert {:error, :enoent} = File.lstat(Path.join(release_dir, "releases/COOKIE"))
 
     on_exit(fn -> File.rm_rf!(release_dir) end)
-
-    %{launcher: launcher, baked: baked}
+    %{launcher: launcher}
   end
 
-  # The cookie the REAL launcher resolves and exports, for the given child env.
-  defp resolved_cookie(launcher, env) do
-    expr = ~s{IO.puts("TBCOOKIE=" <> (System.get_env("RELEASE_COOKIE") || "nil"))}
+  test "the generated launcher uses a disconnected VM even with a conflicting distribution environment",
+       %{launcher: launcher} do
+    expr =
+      ~s{unless Node.alive?() or System.get_env("RELEASE_COOKIE"), do: IO.puts("local release eval")}
 
     {out, status} =
-      System.cmd(launcher, ["eval", expr], env: env, stderr_to_stdout: true)
+      System.cmd(launcher, ["eval", expr],
+        env: [{"RELEASE_DISTRIBUTION", "sname"}, {"RELEASE_COOKIE", "synthetic-unused"}],
+        stderr_to_stdout: true
+      )
 
     assert status == 0, out
-    [cookie] = Regex.run(~r/^TBCOOKIE=(.*)$/m, out, capture: :all_but_first)
-    cookie
+    assert String.trim(out) == "local release eval"
   end
 
-  test "the real launcher uses the baked releases/COOKIE when RELEASE_COOKIE is unset (the shim-scrubbed state)",
-       %{launcher: launcher, baked: baked} do
-    assert resolved_cookie(launcher, [{"RELEASE_COOKIE", nil}]) == baked
-  end
-
-  test "the real launcher prefers an inherited RELEASE_COOKIE — which is exactly why the shim must strip it",
-       %{launcher: launcher, baked: baked} do
-    resolved = resolved_cookie(launcher, [{"RELEASE_COOKIE", "synthetic-foreign-cookie"}])
-    assert resolved == "synthetic-foreign-cookie"
-    refute resolved == baked
+  test "the generated launcher refuses distributed commands before execution", %{
+    launcher: launcher
+  } do
+    for verb <- ~w(rpc remote stop restart pid) do
+      {out, status} = System.cmd(launcher, [verb], stderr_to_stdout: true)
+      assert status == 64, out
+      assert out =~ "Distributed commands are unavailable"
+    end
   end
 end

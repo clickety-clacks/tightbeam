@@ -42,7 +42,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities fyi rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus runningModel capabilities fyi rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
@@ -62,7 +62,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "decision requests" =>
       ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context),
     "sessions" =>
-      ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
+      ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides runningModel),
     "devices" => ~w(claimedName platform model),
     "artifacts" =>
       ~w(description createdBySession createdByProcess parentSession contentSha256 recordedMessageId home),
@@ -2307,6 +2307,50 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert item in JSON.decode!(collection.resp_body)["items"]
   end
 
+  test "REST serves the stored running model and reading it loads no agent", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "running-model-session",
+        display_name: "Running model",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("sonnet")
+      })
+
+    path = "/api/sessions/#{session.session_key}"
+    assert JSON.decode!(get(ctx, path).resp_body)["item"]["runningModel"] == nil
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: true})
+
+    assert :changed =
+             Org.set_running_model(ctx.db, session.session_key, %{id: "opus", label: "Opus"})
+
+    expected = %{"id" => "opus", "label" => "Opus", "harness" => "claude"}
+    detail = get(ctx, path)
+    assert detail.status == 200, detail.resp_body
+    assert JSON.decode!(detail.resp_body)["item"]["runningModel"] == expected
+
+    # The Firehose row is the REST row.
+    assert_receive {:firehose_notice,
+                    %{"class" => "session.updated", "payload" => %{"sessionKey" => key} = row}}
+                   when key == "running-model-session"
+
+    assert row == JSON.decode!(detail.resp_body)["item"]
+
+    collection = JSON.decode!(get(ctx, "/api/sessions").resp_body)["items"]
+
+    assert Enum.find(collection, &(&1["sessionKey"] == session.session_key))["runningModel"] ==
+             expected
+
+    # The value is stored. No adapter coordinator runs in this fixture, so a read
+    # that tried to load an agent to learn the model could not have succeeded.
+    assert Process.whereis(Tightbeam.AdapterCoordinator) == nil
+  end
+
   test "artifact archive and release notices equal the current ordered REST detail", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-rest-#{System.unique_integer([:positive])}")
@@ -3905,6 +3949,102 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     empty = get(ctx, "/api/work-items?ownerUserId=absent-owner")
     assert empty.status == 200
     assert JSON.decode!(empty.resp_body)["items"] == []
+  end
+
+  test "work item reads with a recorded landing succeed on detail, list page and change notice",
+       ctx do
+    commit = String.duplicate("a", 40)
+    head = String.duplicate("b", 40)
+
+    neighbour =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Landing neighbour"}
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES (?1, ?2, 'completion', ?3, ?4, ?5)",
+               [
+                 "att_landing_projection",
+                 ctx.assignment.id,
+                 ctx.assignment.holderKey,
+                 JSON.encode!([%{"repo" => "Example/Repo", "commit" => commit}]),
+                 1
+               ]
+             )
+
+    hub = Hub
+
+    :ok =
+      Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    input = %{
+      kind: "landing.observed-merge",
+      scope: "Example/Repo#12",
+      origin: "process:landing-watch",
+      payload: %{"branch" => "main", "commit" => commit, "headCommit" => head},
+      idempotency_key: "landing-record:Example/Repo#12:merged:#{commit}"
+    }
+
+    call = %{
+      verb: "condition",
+      principal: {:user, "flynn"},
+      rest_principal: %{kind: "user", id: "flynn", is_admin: false},
+      params: %{kind: input.kind, scope: input.scope},
+      firehose_in_txn: true,
+      firehose_hub: hub
+    }
+
+    assert {%{kind: "landing.observed-merge"}, true} =
+             Tightbeam.ConditionFacts.file_idempotent_with_effect(
+               ctx.db,
+               :landing_projection_scheduler,
+               input,
+               call
+             )
+
+    detail = get(ctx, "/api/work-items/" <> ctx.work_item.id)
+    assert detail.status == 200
+    item = JSON.decode!(detail.resp_body)["item"]
+
+    assert [
+             %{
+               "repository" => "Example/Repo",
+               "branch" => "main",
+               "commit" => ^commit,
+               "headCommit" => ^head,
+               "pullRequest" => 12,
+               "observedAt" => observed_at
+             }
+           ] = item["landings"]
+
+    assert is_integer(observed_at)
+
+    list = get(ctx, "/api/work-items?state=open")
+    assert list.status == 200
+    items = JSON.decode!(list.resp_body)["items"]
+    assert item in items
+    assert %{"landings" => []} = Enum.find(items, &(&1["id"] == neighbour.id))
+
+    notices =
+      for _ <- 1..20, reduce: [] do
+        acc ->
+          receive do
+            {:firehose, notice} -> [notice | acc]
+            other -> [other | acc]
+          after
+            50 -> acc
+          end
+      end
+
+    assert Enum.any?(notices, fn notice ->
+             inspect(notice) =~ "work_item.updated" and inspect(notice) =~ "Example/Repo"
+           end)
   end
 
   test "B2 missing priority sidecar preserves configured and fallback defaults across reads and notices",

@@ -321,17 +321,25 @@ defmodule Tightbeam.HarklightReceipts do
     end)
   end
 
-  defp recover_receipt(runner, argv, op, journal) when is_binary(journal) and journal != "" do
-    case run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op) do
+  defp recover_receipt(runner, argv, op, journal),
+    do: recover_operation(runner, argv, op, journal, ["receipt"])
+
+  # Replay a saved operation by its key and journal; only when the journal
+  # proves it never started, run it. `operations` names the Agent operation the
+  # frames may report an internal error for. Shared with other saved writes.
+  @doc false
+  def recover_operation(runner, argv, op, journal, operations)
+      when is_binary(journal) and journal != "" do
+    case run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op, operations) do
       {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
-        run_operation(runner, argv ++ ["--op-id", op], op)
+        run_operation(runner, argv ++ ["--op-id", op], op, operations)
 
       result ->
         result
     end
   end
 
-  defp recover_receipt(_runner, _argv, _op, _journal), do: {:error, :pending}
+  def recover_operation(_runner, _argv, _op, _journal, _operations), do: {:error, :pending}
 
   defp bind_journal(_db, _runner, _op, id) when is_binary(id), do: {:ok, id}
 
@@ -424,10 +432,10 @@ defmodule Tightbeam.HarklightReceipts do
     end
   end
 
-  defp run_operation(runner, argv, op) do
+  defp run_operation(runner, argv, op, operations) do
     case run(runner, argv) do
       {frames, status} = result ->
-        HarklightFailures.write_error(frames, status, op, ["receipt"]) || result
+        HarklightFailures.write_error(frames, status, op, operations) || result
 
       error ->
         error

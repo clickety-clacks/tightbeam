@@ -226,9 +226,7 @@ defmodule Tightbeam.Gateway do
     # LATER process can carry the same command line (a second gateway started the
     # same way), and only the start time tells this process apart from such a
     # successor.
-    # R1/R4: also record `node` — the instance's ACTUAL booted RELEASE_NODE — so
-    # the debug verbs `rpc`/`remote` resolve the node FROM the descriptor (custom
-    # `TIGHTBEAM_NODE` instances included), never from an ambient/inherited node.
+    # Keep the node field for descriptor readers, including developer nodes.
     # `cliToken` is preserved (read above); `port`/`node`/`ownedPid`/
     # `ownedCommand`/`ownedStart` are overwritten every boot.
     owned_pid = System.pid()
@@ -362,7 +360,9 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.ListenerLifecycle, []},
          {Tightbeam.Wakes,
           db: db,
-          holder_prod: true,
+          # Off by default: each check reads every open assignment's holder
+          # wakes on the database writer, at every turn end.
+          holder_prod: false,
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
@@ -378,6 +378,7 @@ defmodule Tightbeam.Gateway do
           identity_staleness_interval_ms: @identity_staleness_interval_ms,
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightReceipts, db: db},
+         {Tightbeam.HarklightBounces, db: db, runner: Map.get(config, :harklight_bounce_runner)},
          {Tightbeam.HarklightWakes,
           db: db,
           send_runner: Map.get(config, :harklight_send_runner),
@@ -387,6 +388,7 @@ defmodule Tightbeam.Gateway do
          ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
+         {Tightbeam.RunningModel, db: db, name: Tightbeam.RunningModel},
          {Tightbeam.AdapterCoordinator,
           adapter_sup: Tightbeam.AdapterSupervisor,
           adapter_context: adapter_context,
@@ -505,32 +507,58 @@ defmodule Tightbeam.Gateway do
     fn provider ->
       scope = "#{machine}:#{provider}"
 
-      case DB.transaction_then(
-             db,
-             fn txn ->
-               ConditionFacts.file_in_txn(txn, %{
-                 kind: "credential-present",
-                 scope: scope,
-                 origin: "process:tightbeam"
-               })
-             end,
-             fn txn, fact ->
-               Tightbeam.Wakes.row_commit_in_txn(txn, [])
-               {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-             end,
-             fallback: fn fact -> {fact, []} end,
-             retry_deliveries: true
-           ) do
-        {:ok, {%{fact_id: fact_id}, deliveries}} ->
-          Enum.each(deliveries, &complete_delivery(db, &1))
-          Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
+      contained(scope, fn ->
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 ConditionFacts.file_in_txn(txn, %{
+                   kind: "credential-present",
+                   scope: scope,
+                   origin: "process:tightbeam"
+                 })
+               end,
+               fn txn, fact ->
+                 Tightbeam.Wakes.row_commit_in_txn(txn, [])
+                 {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
+               end,
+               fallback: fn fact -> {fact, []} end,
+               retry_deliveries: true
+             ) do
+          {:ok, {%{fact_id: fact_id}, deliveries}} ->
+            # A matching wait yields {:condition_batch_ready, _}; only
+            # complete_deliveries/2 leaves those to the scheduler, which the
+            # nudge then wakes.
+            contained(scope, fn ->
+              ConditionFacts.complete_deliveries(db, deliveries)
+              Tightbeam.Wakes.nudge_matching(Tightbeam.WakeScheduler, fact_id)
+            end)
 
-        other ->
-          Logger.error("credential-present fact for #{scope} not filed: #{inspect(other)}")
-      end
+            Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
+
+          other ->
+            Logger.error("credential-present fact for #{scope} not filed: #{inspect(other)}")
+        end
+      end)
 
       :ok
     end
+  end
+
+  # The fact is best-effort and must never raise into the sign-in commit.
+  defp contained(scope, fun) do
+    fun.()
+  rescue
+    error ->
+      Logger.error(
+        "credential-present fact for #{scope} crashed and was contained: " <>
+          Exception.format(:error, error, __STACKTRACE__)
+      )
+  catch
+    kind, reason ->
+      Logger.error(
+        "credential-present fact for #{scope} failed and was contained: " <>
+          inspect({kind, reason})
+      )
   end
 
   defp start_credential_child(config, db, machine, previous_host, host) do
@@ -5071,7 +5099,8 @@ defmodule Tightbeam.Gateway do
   defp placement_adapter_key(session),
     do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
-  defp adapter_key(%{harness: harness} = session) do
+  @doc false
+  def adapter_key(%{harness: harness} = session) do
     case Harness.parse!(harness).id() do
       :pi -> Placement.pi_session_adapter_key(session.session_key, session.host)
       id -> {id, "shared", session.host}

@@ -62,6 +62,7 @@ defmodule Tightbeam.Acp.Adapter do
     :on_guidance,
     :on_guidance_verified,
     :on_subagent_event,
+    :on_running_model,
     :launch_identity_status,
     stderr_offset: 0,
     chunks: %{},
@@ -244,6 +245,14 @@ defmodule Tightbeam.Acp.Adapter do
   @doc "Queue a close request without blocking the caller behind an in-progress boot."
   @spec request_close(adapter()) :: :ok
   def request_close(adapter), do: GenServer.cast(adapter, :close)
+
+  @doc """
+  Ask the adapter to report the model of every session it holds again, through its
+  `:on_running_model` hook. A restarted writer uses this to relearn what live
+  adapters already know; a cast, so nothing waits on the adapter.
+  """
+  @spec resend_running_models(adapter()) :: :ok
+  def resend_running_models(adapter), do: GenServer.cast(adapter, :resend_running_models)
 
   # An adapter that cannot BOOT dies in handle_continue, so the turn's first
   # call exits carrying only the death reason — that is how an actionable spawn
@@ -558,6 +567,7 @@ defmodule Tightbeam.Acp.Adapter do
       on_guidance: Keyword.get(opts, :on_guidance),
       on_guidance_verified: Keyword.get(opts, :on_guidance_verified),
       on_subagent_event: Keyword.get(opts, :on_subagent_event),
+      on_running_model: Keyword.get(opts, :on_running_model),
       launch_identity_status: launch_identity_status
     }
 
@@ -977,20 +987,8 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp session_call({:current_model_label, sid}, _from, state) do
-    label =
-      with %Model{} = model <- Map.get(state.models, sid),
-           options when is_list(options) <- Map.get(state.config_options, sid),
-           %{} = config <- model_config_option(%{"configOptions" => options}),
-           %{"name" => name} <- selected_model_option(config, Model.to_ref(model)),
-           true <- is_binary(name) do
-        name
-      else
-        _ -> nil
-      end
-
-    {:reply, label, state}
-  end
+  defp session_call({:current_model_label, sid}, _from, state),
+    do: {:reply, model_label(state, sid), state}
 
   defp session_call({:context_usage, sid, max_age_ms}, _from, state) do
     result =
@@ -1244,7 +1242,17 @@ defmodule Tightbeam.Acp.Adapter do
                 end
 
               _unknown ->
-                {:reply, {:ok, :unknown}, state}
+                # No selection to apply, so the harness keeps what it resumed with.
+                # Only its answer says what that is: remember a readable one for
+                # the readback (the stored selection and what is applied stay as
+                # they were), and nothing when the answer names no model.
+                case model_ref_from_config(result, state.preset.effort_config) do
+                  {:ok, reported} ->
+                    {:reply, {:ok, :unknown}, remember_model(state, sid, reported)}
+
+                  :error ->
+                    {:reply, {:ok, :unknown}, state}
+                end
             end
           else
             {:error, reason} ->
@@ -1376,6 +1384,11 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_cast(:close, state) do
     if state.conn, do: Conn.close(state.conn)
     {:stop, :normal, state}
+  end
+
+  def handle_cast(:resend_running_models, state) do
+    for {sid, _model} <- state.models, do: emit_running_model(state, sid)
+    {:noreply, state}
   end
 
   defp start_prompt(state, sid, text, opts, from) do
@@ -1860,6 +1873,87 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # The model a session runs is adapter memory (`models`, plus `config_options`
+  # for its label) that many paths change: create, load, set, a harness-initiated
+  # config_option_update, a refused model, unload. Instead of instrumenting each,
+  # the three callbacks report the difference when they return. The hook only
+  # sends a message; it never calls back into this process.
+  defoverridable handle_call: 3, handle_cast: 2, handle_info: 2
+
+  @impl true
+  def handle_call(message, from, state),
+    do: message |> super(from, state) |> report_running_model(state)
+
+  @impl true
+  def handle_cast(message, state), do: message |> super(state) |> report_running_model(state)
+
+  @impl true
+  def handle_info(message, state), do: message |> super(state) |> report_running_model(state)
+
+  defp report_running_model(result, %__MODULE__{} = before) do
+    with %__MODULE__{on_running_model: hook} = current when is_function(hook, 2) <-
+           callback_state(result),
+         true <-
+           before.models != current.models or before.config_options != current.config_options do
+      before.models
+      |> Map.keys()
+      |> Kernel.++(Map.keys(current.models))
+      |> Enum.uniq()
+      |> Enum.each(fn sid ->
+        if running_model_report(current, sid) != running_model_report(before, sid),
+          do: emit_running_model(current, sid)
+      end)
+    end
+
+    result
+  end
+
+  defp report_running_model(result, _before), do: result
+
+  defp emit_running_model(%{on_running_model: hook} = state, sid) when is_function(hook, 2) do
+    hook.(sid, running_model_report(state, sid))
+  rescue
+    error -> Logger.warning("running-model report failed: #{Exception.message(error)}")
+  end
+
+  defp emit_running_model(_state, _sid), do: :ok
+
+  defp callback_state({:reply, _reply, state}), do: state
+  defp callback_state({:reply, _reply, state, _extra}), do: state
+  defp callback_state({:noreply, state}), do: state
+  defp callback_state({:noreply, state, _extra}), do: state
+  defp callback_state({:stop, _reason, state}), do: state
+  defp callback_state({:stop, _reason, _reply, state}), do: state
+  defp callback_state(_other), do: nil
+
+  defp running_model_report(state, sid) do
+    case Map.get(state.models, sid) do
+      %Model{family: family} = model -> %{id: family, label: readable_label(state, sid, model)}
+      _ -> nil
+    end
+  end
+
+  # A label that only repeats the raw model id says nothing a reader lacks.
+  defp readable_label(state, sid, %Model{family: family} = model) do
+    case model_label(state, sid) do
+      label when label in [family, nil] -> nil
+      label -> if label == Model.to_ref(model), do: nil, else: label
+    end
+  end
+
+  defp model_label(state, sid) do
+    with %Model{} = model <- Map.get(state.models, sid),
+         options when is_list(options) <- Map.get(state.config_options, sid),
+         %{} = config <- model_config_option(%{"configOptions" => options}),
+         %{"name" => name} <- selected_model_option(config, Model.to_ref(model)),
+         true <- is_binary(name) do
+      name
+    else
+      _ -> nil
+    end
+  end
+
   # ACP's public `messageId` is the boundary authority when present. If it is
   # absent, preserve the legacy anonymous-group accumulator and assign each new
   # group a generated public id at its first chunk; do not infer boundaries from

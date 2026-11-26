@@ -23,6 +23,7 @@ defmodule Tightbeam.StateResources do
          sessions.provider, sessions.model, sessions.thinkingLevel, sessions.modelContext,
          sessions.host, sessions.clearedThroughSeq, sessions.state, sessions.createdAt,
          sessions.updatedAt, sessions.mechanicalStatus, sessions.updatedAt,
+         sessions.runningModelId, sessions.runningModelLabel, sessions.runningModelHarness,
          #{Tightbeam.Org.topology_parent_sql("sessions")},
          (SELECT fyi FROM record_fyis
           WHERE recordKind = 'session' AND recordId = sessions.sessionKey)
@@ -273,7 +274,7 @@ defmodule Tightbeam.StateResources do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities fyi rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus runningModel capabilities fyi rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
@@ -368,7 +369,7 @@ defmodule Tightbeam.StateResources do
       integers: ~w(orderIndex clearedThroughSeq createdAt updatedAt rowVersion),
       booleans: ~w(isBuiltIn adopted),
       nullable:
-        ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides)
+        ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides runningModel)
     },
     "roles" => %{
       strings: ~w(name boundSessionKey ownerUserId),
@@ -487,6 +488,7 @@ defmodule Tightbeam.StateResources do
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
     {"sessions", "capabilities"} => :session_capabilities,
+    {"sessions", "runningModel"} => :session_running_model,
     {"read markers", "marker"} => :read_marker,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
     {"transcript messages", "recordEventIds"} => {:array, :string, :sort},
@@ -1218,6 +1220,9 @@ defmodule Tightbeam.StateResources do
          updated_at,
          mechanical_status,
          row_version,
+         running_model_id,
+         running_model_label,
+         running_model_harness,
          topology_parent,
          fyi
        ]) do
@@ -1249,6 +1254,9 @@ defmodule Tightbeam.StateResources do
       updated_at: updated_at,
       mechanical_status: mechanical_status,
       row_version: row_version,
+      running_model:
+        running_model_id &&
+          %{id: running_model_id, label: running_model_label, harness: running_model_harness},
       fyi: record_fyi(fyi)
     }
   end
@@ -2178,7 +2186,9 @@ defmodule Tightbeam.StateResources do
   def session(row) do
     reject_public_shape_drift!(row, "sessions")
 
-    row = row |> session_wire_overrides() |> session_model_selection()
+    row =
+      row |> session_wire_overrides() |> session_model_selection() |> session_wire_running_model()
+
     harness_registry = registered_harness_names()
     set_harness = set_harness_capability(row, harness_registry)
 
@@ -2212,6 +2222,7 @@ defmodule Tightbeam.StateResources do
         "createdAt" => session_wire_value!(row, :created_at, "createdAt"),
         "updatedAt" => session_wire_value!(row, :updated_at, "updatedAt"),
         "mechanicalStatus" => session_wire_value!(row, :mechanical_status, "mechanicalStatus"),
+        "runningModel" => session_wire_value!(row, :running_model, "runningModel"),
         "capabilities" => %{"setHarness" => set_harness},
         # Rows read from the sessions table carry their stored FYI lines.
         "fyi" => value(row, :fyi) || [],
@@ -2805,6 +2816,14 @@ defmodule Tightbeam.StateResources do
     )
   end
 
+  defp validate_wire_value!(value, :session_running_model, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"id" => :string, "label" => {:nullable, :string}, "harness" => :string},
+      label
+    )
+  end
+
   defp validate_wire_value!(value, :session_capabilities, label) do
     validate_closed_wire_object!(value, %{"setHarness" => :harness_capability}, label)
   end
@@ -2886,6 +2905,21 @@ defmodule Tightbeam.StateResources do
 
   defp validate_wire_value!(value, :commit_ref, label) do
     validate_closed_wire_object!(value, %{"repo" => :string, "commit" => :string}, label)
+  end
+
+  defp validate_wire_value!(value, :landing, label) do
+    validate_closed_wire_object!(
+      value,
+      %{
+        "repository" => :string,
+        "branch" => :string,
+        "commit" => :string,
+        "headCommit" => :string,
+        "pullRequest" => :positive_integer,
+        "observedAt" => :integer
+      },
+      label
+    )
   end
 
   defp validate_wire_value!(value, :submitter, label) do
@@ -3088,6 +3122,10 @@ defmodule Tightbeam.StateResources do
   defp validate_item_invariants!(_resource, _item), do: :ok
 
   defp encode_item_field("sessions", "overrides", nil), do: "null"
+  defp encode_item_field("sessions", "runningModel", nil), do: "null"
+
+  defp encode_item_field("sessions", "runningModel", value),
+    do: encode_closed_object!(value, ~w(id label harness), "sessions.runningModel")
 
   defp encode_item_field("sessions", "capabilities", value) do
     capability = Map.fetch!(value, "setHarness")
@@ -3685,6 +3723,24 @@ defmodule Tightbeam.StateResources do
 
       _scalar_or_nil ->
         row
+    end
+  end
+
+  # The stored running model arrives as an atom-keyed map from the session row and
+  # as a string-keyed map when a public item is projected again; both become the
+  # one closed wire object.
+  defp session_wire_running_model(row) do
+    case value(row, :running_model) do
+      %{} = model ->
+        wire =
+          Map.new(~w(id label harness), fn field ->
+            {field, Map.get(model, field) || Map.get(model, String.to_existing_atom(field))}
+          end)
+
+        Map.put(row, :running_model, wire)
+
+      _none ->
+        Map.put(row, :running_model, nil)
     end
   end
 

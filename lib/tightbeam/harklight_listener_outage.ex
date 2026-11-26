@@ -16,10 +16,6 @@ defmodule Tightbeam.HarklightListenerOutage do
              diagnostic TEXT,
              checkpoint INTEGER NOT NULL DEFAULT -1
            );
-           CREATE TABLE IF NOT EXISTS harklight_outage_recoveries (
-             handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
-             episode TEXT NOT NULL
-           );
            """),
          {:ok, columns} <- DB.query(db, "PRAGMA table_info(harklight_listener_outages)") do
       if Enum.any?(columns, fn [_, name | _] -> name == "checkpoint" end),
@@ -30,7 +26,26 @@ defmodule Tightbeam.HarklightListenerOutage do
             "ALTER TABLE harklight_listener_outages ADD COLUMN checkpoint INTEGER NOT NULL DEFAULT -1"
           )
     end
+    |> ensure_recovery_schema(db)
   end
+
+  def grouped_notices_enabled?,
+    do: Application.get_env(:tightbeam, :harklight_grouped_outage_notices_enabled, false)
+
+  defp ensure_recovery_schema(:ok, db) do
+    if grouped_notices_enabled?() do
+      DB.execute(db, """
+      CREATE TABLE IF NOT EXISTS harklight_outage_recoveries (
+        handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+        episode TEXT NOT NULL
+      );
+      """)
+    else
+      :ok
+    end
+  end
+
+  defp ensure_recovery_schema(error, _db), do: error
 
   def start_in_txn(txn, handle, {error, operation, diagnostic}, now) do
     case Txn.q(
@@ -93,7 +108,12 @@ defmodule Tightbeam.HarklightListenerOutage do
 
         [[_session, state, _, _, _, nil, _started]] when state != "complete" ->
           if recipient = recipient(txn, handle) do
-            notify_receiver(txn, recipient, due_together(txn, handle, recipient, now, delay), now)
+            handles =
+              if grouped_notices_enabled?(),
+                do: due_together(txn, handle, recipient, now, delay),
+                else: [handle]
+
+            notify_receiver(txn, recipient, handles, now)
           end
 
           :notified
@@ -175,6 +195,12 @@ defmodule Tightbeam.HarklightListenerOutage do
   # Tells each receiver once about its reported conversations that are back. One
   # that has gone out again is told when that outage ends, reported or not.
   def announce_recoveries(db, now) do
+    if grouped_notices_enabled?(),
+      do: announce_grouped_recoveries(db, now),
+      else: {:ok, :unchanged}
+  end
+
+  defp announce_grouped_recoveries(db, now) do
     DB.transaction(db, fn txn ->
       rows =
         Txn.q(
@@ -254,11 +280,24 @@ defmodule Tightbeam.HarklightListenerOutage do
            [handle]
          ) do
       [[episode, notice]] when resumed? and is_binary(notice) ->
-        Txn.q(
-          txn,
-          "INSERT OR REPLACE INTO harklight_outage_recoveries(handle,episode) VALUES(?1,?2)",
-          [handle, episode]
-        )
+        if grouped_notices_enabled?() do
+          Txn.q(
+            txn,
+            "INSERT OR REPLACE INTO harklight_outage_recoveries(handle,episode) VALUES(?1,?2)",
+            [handle, episode]
+          )
+        else
+          if recipient = recipient(txn, handle) do
+            schedule(txn, %{
+              wake_id: "w_harklight_listening_" <> episode,
+              session_key: recipient,
+              origin: "process:tightbeam",
+              class: "fyi",
+              due_at: now,
+              prompt: "Tightbeam is receiving Harklight updates again for conversation #{handle}."
+            })
+          end
+        end
 
       _ ->
         :ok
