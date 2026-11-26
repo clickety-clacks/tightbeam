@@ -153,9 +153,9 @@ defmodule Tightbeam.CronWake do
         due_at: due_at,
         schedule: schedule,
         origin: origin,
-        creator_session_key: creator,
-        wait_reason: reason
+        creator_session_key: creator
       }
+      |> then(fn row -> if Tightbeam.WaitLinks.enabled?(), do: Map.put(row, :wait_reason, reason), else: row end)
     end)
   end
 

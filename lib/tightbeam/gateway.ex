@@ -8718,7 +8718,7 @@ defmodule Tightbeam.Gateway do
       is_binary(p[:cron]) or is_binary(p[:condition_kind]) or is_map(p[:predicate]) or
         p[:after_turn] == true or due_at > System.system_time(:millisecond)
 
-    if waiting? and is_nil(wake[:wait_reason]) do
+    if Tightbeam.WaitLinks.enabled?() and waiting? and is_nil(wake[:wait_reason]) do
       warning = %{
         code: "missing_wait_reason",
         message:
@@ -9060,7 +9060,7 @@ defmodule Tightbeam.Gateway do
     omitted? = is_nil(reason) or (is_binary(reason) and String.trim(reason) == "")
 
     with :ok <-
-           if(wait? or not omitted?,
+           if(wait? or (Tightbeam.WaitLinks.enabled?() and not omitted?),
              do: Tightbeam.WaitReason.validate(reason, "--wait-reason"),
              else: :ok
            ) do
@@ -9081,7 +9081,7 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
-        wait_reason: if(omitted?, do: nil, else: reason),
+        wait_reason: if(not omitted? and (wait? or Tightbeam.WaitLinks.enabled?()), do: reason, else: nil),
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.

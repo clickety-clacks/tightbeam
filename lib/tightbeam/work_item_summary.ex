@@ -40,10 +40,12 @@ defmodule Tightbeam.WorkItemSummary do
         attestCounts: summary.attest_counts,
         verdictCounts: summary.verdict_counts,
         effectiveCommitRefs: summary.effective_commit_refs,
-        landings: summary.landings,
-        waiting: summary.waiting,
-        running: summary.running
+        landings: summary.landings
       })
+      |> then(fn item ->
+        if Tightbeam.WaitLinks.enabled?(),
+          do: Map.merge(item, %{waiting: summary.waiting, running: summary.running}), else: item
+      end)
     end)
   end
 

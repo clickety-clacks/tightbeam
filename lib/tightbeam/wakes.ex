@@ -5746,7 +5746,7 @@ defmodule Tightbeam.Wakes do
       ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", " <> Tightbeam.WaitLinks.excluded_sql("wakes")
+      ", " <> if(Tightbeam.WaitLinks.enabled?(), do: Tightbeam.WaitLinks.excluded_sql("wakes"), else: "0")
   end
 
   defp wake_with_delivery_projection(row) do

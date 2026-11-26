@@ -1,6 +1,16 @@
 defmodule Tightbeam.HolderProdTest do
   use Tightbeam.TestCase, async: false
 
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+    on_exit(fn ->
+      if is_nil(previous), do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+    :ok
+  end
+
   alias Tightbeam.{
     Assignments,
     ConnRegistry,
@@ -345,6 +355,22 @@ defmodule Tightbeam.HolderProdTest do
       assert StateResources.wake(StateResources.query_wake(ctx.db, wake_id))["waitReason"] ==
                reason
     end
+  end
+
+  test "disabled optional reasons preserve legacy scheduling and mandatory holder reasons", ctx do
+    Application.delete_env(:tightbeam, :wait_links_enabled)
+    for trigger <- [%{after_ms: @quiet}, %{cron: "0 * * * *"}, %{}] do
+      for reason <- [nil, "Optional explanation", "two\nlines"] do
+        result = gateway_wake(ctx.db, "other", Map.put(trigger, :wait_reason, reason))
+        assert %{wake_id: id} = result
+        refute Enum.any?(result[:warnings] || [], &(&1.code == "missing_wait_reason"))
+        assert Wakes.get(ctx.db, id).wait_reason == nil
+        wire = StateResources.wake(StateResources.query_wake(ctx.db, id))
+        refute Map.has_key?(wire, "waitOn")
+        refute Map.has_key?(wire, "waitReason")
+      end
+    end
+    assert %{code: "missing_reason"} = gateway_wake(ctx.db, "holder", %{condition_kind: "fixture-ready", after_ms: @quiet})
   end
 
   test "supplied reasons survive timed other-agent and cron wakes without new absence refusals",

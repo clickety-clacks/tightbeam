@@ -887,7 +887,7 @@ defmodule Tightbeam.Escalation do
           %{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)}
           |> then(fn context ->
             if Map.get(ctx, :source_unavailable),
-              do: Map.put(context, :sourceUnavailable, true),
+              do: if(Tightbeam.WaitLinks.enabled?(), do: Map.put(context, :sourceUnavailable, true), else: context),
               else: context
           end)
           |> JSON.encode!()

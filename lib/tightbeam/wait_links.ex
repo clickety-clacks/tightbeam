@@ -3,6 +3,8 @@ defmodule Tightbeam.WaitLinks do
   alias Tightbeam.{DB, Escalation, StateResources, StateVisibility, Wakes}
   alias Tightbeam.DB.Txn
 
+  def enabled?, do: Application.get_env(:tightbeam, :wait_links_enabled, false) == true
+
   @doc "The same recorded target references used by wake reads and events."
   def wake_targets(%{wait_link_excluded: true}), do: []
   # Retry wake IDs name transport attempts, not new wait declarations.
@@ -59,6 +61,10 @@ defmodule Tightbeam.WaitLinks do
   def project_wake(_txn, nil, _principal), do: nil
 
   def project_wake(txn, row, principal) do
+    if enabled?(), do: project_wake_enabled(txn, row, principal), else: row
+  end
+
+  defp project_wake_enabled(txn, row, principal) do
     Map.put(row, "waitOn", Enum.map(wake_targets(row), &visible_ref(txn, &1, principal)))
   end
 
@@ -135,6 +141,10 @@ defmodule Tightbeam.WaitLinks do
 
   @doc "Small work-item indicators; reads only records explicitly linked to each item."
   def summaries(db, ids) do
+    if enabled?(), do: summaries_enabled(db, ids), else: Map.new(ids, &{&1, %{}})
+  end
+
+  defp summaries_enabled(db, ids) do
     sql = """
     WITH items AS MATERIALIZED (SELECT value id FROM json_each(?1)),
     item_assignments AS MATERIALIZED (
@@ -223,13 +233,17 @@ defmodule Tightbeam.WaitLinks do
 
   @doc false
   def publish_wake_change_in_txn(txn, wake) do
-    if wake_targets(wake) != [] and declared_wait?(txn, wake),
+    if enabled?() and wake_targets(wake) != [] and declared_wait?(txn, wake),
       do: publish_source_change_in_txn(txn, wake.work_item_id, wake.assignment_id),
       else: :ok
   end
 
   @doc false
   def publish_source_change_in_txn(txn, work_item_id, assignment_id) do
+    if enabled?(), do: publish_source_change_in_txn_enabled(txn, work_item_id, assignment_id), else: :ok
+  end
+
+  defp publish_source_change_in_txn_enabled(txn, work_item_id, assignment_id) do
     ids =
       if is_binary(assignment_id) do
         Enum.map(
@@ -258,6 +272,10 @@ defmodule Tightbeam.WaitLinks do
 
   @doc false
   def with_wait_metadata(wake, txn) do
+    if enabled?(), do: with_wait_metadata_enabled(wake, txn), else: wake
+  end
+
+  defp with_wait_metadata_enabled(wake, txn) do
     wake = with_schedule(wake, txn)
 
     if Map.has_key?(wake, :wait_link_excluded) or wake_targets(wake) == [] or
@@ -276,6 +294,10 @@ defmodule Tightbeam.WaitLinks do
   defp with_schedule(wake, _txn), do: wake
 
   def request(query, kind, id) do
+    if enabled?(), do: request_enabled(query, kind, id), else: {:error, 409, "feature_disabled", "Wait-link reads are disabled; enable wait_links_enabled to use this endpoint."}
+  end
+
+  defp request_enabled(query, kind, id) do
     query =
       Map.new(query, fn
         {key, [value]} -> {key, value}
@@ -297,6 +319,11 @@ defmodule Tightbeam.WaitLinks do
   end
 
   def page(db, kind, id, principal, request) do
+    if enabled?(), do: page_enabled(db, kind, id, principal, request),
+      else: {:error, :feature_disabled}
+  end
+
+  defp page_enabled(db, kind, id, principal, request) do
     DB.read_transaction!(db, fn txn ->
       txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
 

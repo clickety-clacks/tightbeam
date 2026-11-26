@@ -1,6 +1,16 @@
 defmodule Tightbeam.RestCoreDetailRoutesTest do
   use Tightbeam.TestCase, async: false
 
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+    on_exit(fn ->
+      if is_nil(previous), do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+    :ok
+  end
+
   import Plug.Conn
   import Plug.Test
 

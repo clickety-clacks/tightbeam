@@ -1,5 +1,15 @@
 defmodule Tightbeam.WaitLinksTest do
   use Tightbeam.TestCase, async: false
+
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+    on_exit(fn ->
+      if is_nil(previous), do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+    :ok
+  end
   import Plug.Conn
   import Plug.Test
 
@@ -227,6 +237,17 @@ defmodule Tightbeam.WaitLinksTest do
         session_key: target,
         params: Map.put(params, :prompt, "Continue work")
       })
+
+  test "disabled wait links refuse reads and do not publish or query summaries", %{db: db} do
+    Application.delete_env(:tightbeam, :wait_links_enabled)
+    refute WaitLinks.enabled?()
+    assert {:error, 409, "feature_disabled", _} = WaitLinks.request(%{}, "work-item", "missing")
+    assert {:error, :feature_disabled} = WaitLinks.page(db, "work-item", "missing", %{}, %{})
+    assert %{"missing" => %{}} = WaitLinks.summaries(:unused_database, ["missing"])
+    assert :ok = WaitLinks.publish_source_change_in_txn(:unused_transaction, "missing", "missing")
+    row = %{wake_id: "fixture", due_at: 100, created_at: 1}
+    assert ^row = WaitLinks.project_wake(:unused_transaction, row, %{})
+  end
 
   test "pending after-turn is active; recognized fact awaiting delivery is not", ctx do
     {:ok, _} = Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "test")

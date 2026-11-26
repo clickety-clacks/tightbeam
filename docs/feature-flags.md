@@ -18,3 +18,7 @@ This register is not an inventory of every existing configuration option.
 | `work_item_waits_enabled` (`TIGHTBEAM_WORK_ITEM_WAITS_ENABLED=true`) | Records explicit item waits and quiets only their routing/slate reminders. | `false` | Work-item coordination | Remove after explicit rollout approval and release-soak acceptance. |
 
 The item-wait table is additive upgrade schema and is created even while the flag is off. Disabled commands refuse without writing rows; reads omit the wait field and reminder logic does not consult item waits. Enabling the flag requires an operator configuration change.
+
+| `wait_links_enabled` (`TIGHTBEAM_WAIT_LINKS_ENABLED=true`) | Optional wait reasons, missing-reason notices, bounded wait-chain reads and live waiting indicators. | `false` | Gateway reads | Remove after explicit rollout approval and release-soak acceptance. |
+
+Wait-link indexes are additive upgrade schema and remain installed while off. Existing required reasons for holder waits and separately enabled item waits remain supported. The flag controls only the new optional reason paths, read endpoints and live summary publication.
