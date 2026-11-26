@@ -78,4 +78,4 @@ if brew fetch --force "$formula" >"$scratch/brew-mismatch.log" 2>&1; then
   exit 1
 fi
 cat "$scratch/brew-mismatch.log"
-grep -Ei 'SHA256 mismatch|checksum mismatch' "$scratch/brew-mismatch.log"
+grep -Ei 'SHA256 mismatch|checksum mismatch|reports different checksum' "$scratch/brew-mismatch.log"
