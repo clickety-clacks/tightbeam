@@ -4067,9 +4067,6 @@ defmodule Tightbeam.Wire.Router do
         not is_list(attachments) or not Enum.all?(attachments, &rest_post_attachment?/1) ->
         {:error, 400, "invalid_message", nil}
 
-      byte_size(content) > 64 * 1024 ->
-        {:error, 400, "payload_too_large", nil}
-
       true ->
         post_params = %{
           client_message_id: id,
