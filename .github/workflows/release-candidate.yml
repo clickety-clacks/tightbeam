@@ -441,6 +441,13 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
+      - name: Dry-run the install channel payloads
+        if: needs.metadata.outputs.candidate_branch == 'main'
+        run: |
+          release_tag=$(jq -er .tag candidate-stage/release-provenance.json)
+          node packaging/prepare-install-channels.mjs "$release_tag" candidate-stage/SHA256SUMS "$RUNNER_TEMP/install-channels"
+          npm pack --dry-run "$RUNNER_TEMP/install-channels/npm"
+
       # Neither candidate artifact exists unless metadata, both test jobs, and both package jobs passed.
       - uses: actions/upload-artifact@v4
         with:
