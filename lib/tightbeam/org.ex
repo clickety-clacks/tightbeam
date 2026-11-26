@@ -1314,6 +1314,8 @@ defmodule Tightbeam.Org do
   # SN9: a pending notice to the retiring session is readdressed whatever its
   # targetGate. Effort timers keep the earlier gated selection and handling.
   defp readdress_retirement_notices_in_txn!(txn, session_key) do
+    people_exclusions = if Tightbeam.PeopleMessages.enabled?(), do: people_wake_exclusions(), else: ""
+
     Txn.q(
       txn,
       """
@@ -1323,8 +1325,7 @@ defmodule Tightbeam.Org do
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
-        AND NOT EXISTS (SELECT 1 FROM people_events e WHERE e.wakeId=w.wakeId AND w.conditionKind IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM people_operations o WHERE o.wakeId=w.wakeId)
+        #{people_exclusions}
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_entries e WHERE e.wakeId=w.wakeId
         )
@@ -1344,6 +1345,13 @@ defmodule Tightbeam.Org do
       [session_key]
     )
     |> Enum.each(fn row -> readdress_retired_notice_in_txn!(txn, session_key, row) end)
+  end
+
+  defp people_wake_exclusions do
+    """
+    AND NOT EXISTS (SELECT 1 FROM people_events e WHERE e.wakeId=w.wakeId AND w.conditionKind IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM people_operations o WHERE o.wakeId=w.wakeId)
+    """
   end
 
   defp readdress_retired_notice_in_txn!(

@@ -8,6 +8,13 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
   end
 
+  case System.get_env("TIGHTBEAM_PEOPLE_MESSAGING") do
+    nil -> :ok
+    "true" -> config :tightbeam, :people_messaging_enabled, true
+    "false" -> config :tightbeam, :people_messaging_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_PEOPLE_MESSAGING must be true or false"
+  end
+
   if relay = System.get_env("TIGHTBEAM_PEOPLE_MESSAGE_RELAY_SESSION") do
     config :tightbeam, :people_message_relay_session, relay
   end

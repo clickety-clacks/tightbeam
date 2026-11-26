@@ -1037,8 +1037,13 @@ defmodule Tightbeam.Wakes do
          txn,
          %{condition_kind: "escalation-ruled", wake_id: id},
          prompt
-       ),
-       do: Tightbeam.PeopleMessages.append_ruling_context_in_txn(txn, id, prompt)
+       ) do
+    if Tightbeam.PeopleMessages.enabled?() do
+      Tightbeam.PeopleMessages.append_ruling_context_in_txn(txn, id, prompt)
+    else
+      prompt
+    end
+  end
 
   defp append_people_ruling_context(_txn, _wake, prompt), do: prompt
 

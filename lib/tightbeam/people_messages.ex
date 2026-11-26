@@ -9,6 +9,8 @@ defmodule Tightbeam.PeopleMessages do
   @availability_refusals ~w(no_recipients decider_unreachable)
   @event_kinds ~w(chat answer seen reminder_not_seen reminder_not_acted joined left unreachable closed)
 
+  def enabled?, do: Application.get_env(:tightbeam, :people_messaging_enabled, false) == true
+
   def ensure_schema(db) do
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
@@ -64,7 +66,15 @@ defmodule Tightbeam.PeopleMessages do
     :ok
   end
 
-  def dispatch(
+  def dispatch(db, call, relay) do
+    if enabled?() do
+      dispatch_enabled(db, call, relay)
+    else
+      error("people_messaging_not_enabled", "people messaging is not enabled")
+    end
+  end
+
+  defp dispatch_enabled(
         db,
         %{
           verb: "people-" <> command,
@@ -117,7 +127,7 @@ defmodule Tightbeam.PeopleMessages do
     end
   end
 
-  def dispatch(_db, _call, _relay), do: error("forbidden", "authenticated session required")
+  defp dispatch_enabled(_db, _call, _relay), do: error("forbidden", "authenticated session required")
 
   defp mutate(txn, kind, session, params, relay) do
     key = params["key"]
@@ -814,6 +824,10 @@ defmodule Tightbeam.PeopleMessages do
   end
 
   def retire_in_txn(txn, session) do
+    if enabled?(), do: retire_enabled_in_txn(txn, session), else: :ok
+  end
+
+  defp retire_enabled_in_txn(txn, session) do
     rows = Txn.q(txn, "SELECT id FROM people_conversations WHERE holder=?1", [session])
 
     if rows != [] do

@@ -4657,6 +4657,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp error_status("forbidden"), do: 403
+  defp error_status("people_messaging_not_enabled"), do: 403
 
   defp error_status(code)
        when code in ["not_holder", "not_authorized", "process_denied", "principal_required"],

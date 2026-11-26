@@ -219,7 +219,9 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
-  setup do
+  setup tags do
+    if tags[:people_messaging], do: Application.put_env(:tightbeam, :people_messaging_enabled, true)
+
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -985,6 +987,29 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  test "people messaging defaults off before storage and refuses both agent and relay verbs", ctx do
+    session = create_session(ctx.db, "people-disabled", ctx.device.user_id)
+    Application.put_env(:tightbeam, :people_message_relay_session, session.session_key)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT name FROM sqlite_master WHERE name GLOB 'people_*'")
+
+    verbs =
+      ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup)
+
+    for verb <- verbs do
+      response = dispatch_cli(ctx, session.cli_token, %{verb: verb})
+      assert response.status == 403
+
+      assert %{"error" => %{"code" => "people_messaging_not_enabled"}} =
+               JSON.decode!(response.resp_body)
+    end
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT name FROM sqlite_master WHERE name GLOB 'people_*'")
+  end
+
+  @tag people_messaging: true
   test "people messaging uses the authenticated session and preserves relay acknowledgments",
        ctx do
     sender = create_session(ctx.db, "people-sender", ctx.device.user_id)

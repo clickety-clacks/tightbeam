@@ -10,6 +10,8 @@ defmodule Tightbeam.PeopleMessagesTest do
   @parent "agent:people:parent"
 
   setup tags do
+    Application.put_env(:tightbeam, :people_messaging_enabled, true)
+
     db = :people_messages_test_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
