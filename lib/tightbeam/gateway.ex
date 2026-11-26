@@ -278,11 +278,12 @@ defmodule Tightbeam.Gateway do
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
-    adapter_opts = fn key, context ->
+    adapter_opts = fn {harness, _, host} = key, context ->
       config = Map.merge(adapter_config, Map.new(context))
 
       with {:ok, opts} <- Placement.adapter_opts(config, key) do
-        prepare_adapter_cli(key, opts, config)
+        run = config[:sh_out] || &Tightbeam.Harness.Support.system_cmd_out/1
+        Harness.check_launch(Harness.module!(harness), opts, host, run)
       end
     end
 
@@ -4701,13 +4702,6 @@ defmodule Tightbeam.Gateway do
       {:error, error} -> raise error
     end
   end
-
-  defp prepare_adapter_cli({:claude, _, host}, opts, config) do
-    run = config[:sh_out] || &Tightbeam.Harness.Support.system_cmd_out/1
-    Tightbeam.Harness.ClaudeCli.prepare_launch(opts, host, run)
-  end
-
-  defp prepare_adapter_cli(_key, opts, _config), do: {:ok, opts}
 
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)

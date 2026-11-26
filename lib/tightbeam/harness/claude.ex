@@ -49,6 +49,10 @@ defmodule Tightbeam.Harness.Claude do
   def install_package, do: "@agentclientprotocol/claude-agent-acp"
 
   @impl true
+  def check_launch(opts, host, run),
+    do: Tightbeam.Harness.ClaudeCli.prepare_launch(opts, host, run)
+
+  @impl true
   def cli_binary, do: "claude"
 
   @impl true
