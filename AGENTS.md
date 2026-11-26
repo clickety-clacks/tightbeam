@@ -12,6 +12,20 @@ Keep large features behind default-off flags so unfinished work can merge withou
 changing default behavior. Document each flag, its owner and removal condition in
 [the feature-flag register](docs/feature-flags.md).
 
+### Release pauses
+
+During a release pause, merge to `main` only if the work is behind a feature flag
+and the release owner explicitly allows the merge. Work a flag cannot switch
+off, such as new stored records, schema changes, or install-time upgrade steps,
+waits until the release is cut. After the cut, land feature work behind flags
+that default off wherever possible.
+
+When lifting or re-imposing a pause, the release owner tells every owner with
+pending merges and confirms each received the update. A previous reopening
+does not carry over to a re-imposed pause.
+
+### Cutting a release
+
 Before building a candidate, pass all three gates in
 [the release train](docs/RELEASE_TRAIN.md): every change in earlier releases is
 on `main` or accounted for as an equivalent or an intentional removal ruled by
