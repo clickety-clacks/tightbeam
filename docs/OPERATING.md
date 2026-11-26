@@ -10,20 +10,30 @@ to an agent and check that it replies.
 
 ## Remove an installation
 
-Stop and disable the Tightbeam gateway and Chat services before removing
-their files. On Linux, use systemd in the user scope for quick mode or the
-system scope for full mode. On macOS, unload the LaunchAgents for quick mode
-or the LaunchDaemons for full mode. Remove the service definitions you
-unloaded and ask systemd to reload its configuration on Linux.
+Stop and disable the gateway and Chat before removing their files. Use the
+scope for each service in the table, then remove the corresponding service
+definitions. On Linux, reload systemd in the scopes you changed.
 
-After the services have stopped, remove the Tightbeam package with the
-package manager you used. For an npx installation, remove the installed
-release files under `~/.local/share/tightbeam-install`. Check that neither service is still
+| Platform | Gateway | Chat |
+| --- | --- | --- |
+| Linux | `tightbeam.service` under `~/.config/systemd/user` in quick mode or `/etc/systemd/system` in full mode | `tightbeam-chat.service` under `~/.config/systemd/user` |
+| macOS | `com.tightbeam.gateway.plist` under `~/Library/LaunchAgents` in quick mode or `/Library/LaunchDaemons` in full mode | `com.tightbeam.chat.plist` under `~/Library/LaunchAgents` |
+
+Remove the setup-created `~/.local/bin/tightbeam` symlink. The gateway
+release files are under `~/.local/share/tightbeam` in quick mode and
+`/opt/tightbeam` in full mode. Chat's program files are under
+`~/.local/share/tightbeam-chat`. Remove the release files belonging to the
+installation you're removing.
+
+If you installed with Homebrew, uninstall the formula to remove its copy.
+For an npx install, remove its downloaded release files under
+`~/.local/share/tightbeam-install`. Check that neither service is still
 running or listening on its configured port.
 
 Keep your base directory if you want to retain your installation's identity,
-credentials, sessions, and work records. Removing the program files and
-service definitions preserves that data.
+credentials, sessions, and work records. It defaults to `~/.tightbeam`.
+Check your configured base directory before removing any program files so
+you can preserve your data.
 
 ## Shared Harklight origin listener
 
