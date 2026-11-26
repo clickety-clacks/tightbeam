@@ -106,7 +106,11 @@ snapshot > "$RUNNER_TEMP/after"
 diff -u "$RUNNER_TEMP/before" "$RUNNER_TEMP/after"
 echo 'Decline filesystem and service diff: empty'
 if [ "$SETUP_SCENARIO" = full-onboarding ]; then
-  timeout 150 "$build/bin/tightbeam" setup --mode full --yes | tee "$RUNNER_TEMP/first-turn.log"
+  node "$RUNNER_TEMP/setup-browser-evidence.mjs" > "$RUNNER_TEMP/browser-evidence.log" 2>&1 &
+  browser_driver=$!
+  timeout 180 "$build/bin/tightbeam" setup --mode full --yes | tee "$RUNNER_TEMP/first-turn.log"
+  wait "$browser_driver"
+  cat "$RUNNER_TEMP/browser-evidence.log"
   grep -F 'Open Tightbeam Chat (Main):' "$RUNNER_TEMP/first-turn.log"
   grep -F 'Open Tightbeam Chat (project exec):' "$RUNNER_TEMP/first-turn.log"
   curl --silent --fail http://127.0.0.1:9222/json/list | node -e '

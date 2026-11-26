@@ -11,19 +11,37 @@ const provider = http.createServer(async (request, response) => {
   let raw = '';
   for await (const chunk of request) raw += chunk;
   const payload = JSON.parse(raw);
+  const messages = payload.messages;
+  const last = messages.at(-1);
+  const latest = JSON.stringify(last);
   const welcome = raw.match(/installer[.]first-run-project-ready[.][a-f0-9]{64}/)?.[0];
-  const shouldCreate = process.env.SETUP_PROJECT_TOOL && welcome && payload.messages.at(-1)?.role === 'user';
+  let text = REPLY;
+  let command;
+  if (process.env.SETUP_PROJECT_TOOL && welcome) {
+    if (last.role === 'tool' && latest.includes('factId')) {
+      text = 'Your project is ready in a separate tab.';
+    } else if (last.role === 'tool' && latest.includes('sessionKey')) {
+      const key = JSON.parse(last.content.match(/\{[\s\S]*\}/)[0]).sessionKey;
+      if (!/^[a-zA-Z0-9:._-]+$/.test(key)) throw new Error('Unexpected project session key');
+      command = `tightbeam condition --kind ${welcome} --scope '${key}'`;
+    } else if (latest.includes('Please create my fixture project')) {
+      command = 'tightbeam spawn --display "Fixture project" --name exec:fixture --archetype default --harness pi --model local/compat-fixture --effort off --key fixture-project';
+    } else if (latest.includes('Skip Enzo for now')) {
+      text = 'Would you like to set up a project?';
+    } else if (raw.includes('Recommend Uncle Enzo as the kungfu to start with')) {
+      text = 'I recommend Uncle Enzo as your first kungfu. Would you like me to install it?';
+    }
+  }
   const envelope = { id: 'fixture', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: MODEL };
   const send = body => response.write(`data: ${JSON.stringify({ ...envelope, ...body })}\n\n`);
   response.writeHead(200, { 'content-type': 'text/event-stream' });
-  if (shouldCreate) {
-    const command = `project=$(tightbeam spawn --display "Setup fixture project" --name project:fixture --archetype default --harness pi --model local/compat-fixture --effort off --key fixture-project | jq -er .sessionKey) && tightbeam condition --kind ${welcome} --scope "$project"`;
+  if (command) {
     send({ choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'setup_fixture_tool',
       type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command }) } }] }, finish_reason: null }] });
     send({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
     return response.end('data: [DONE]\n\n');
   }
-  send({ choices: [{ index: 0, delta: { role: 'assistant', content: REPLY }, finish_reason: null }] });
+  send({ choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }] });
   send({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
   return response.end('data: [DONE]\n\n');

@@ -25,6 +25,7 @@ jobs:
           cp scripts/setup-install-evidence.sh "$RUNNER_TEMP/"
           cp scripts/setup-model-evidence.mjs "$RUNNER_TEMP/"
           cp scripts/setup-turn-evidence.mjs "$RUNNER_TEMP/"
+          cp scripts/setup-browser-evidence.mjs "$RUNNER_TEMP/"
           git checkout --detach "$(cat scripts/setup-evidence-sha.txt)"
       - uses: erlef/setup-beam@v1
         with:
@@ -43,4 +44,6 @@ jobs:
         if: always()
         with:
           name: setup-install-${{ matrix.os }}-${{ matrix.scenario }}
-          path: ${{ runner.temp }}/setup-install.log
+          path: |
+            ${{ runner.temp }}/setup-install.log
+            ${{ runner.temp }}/browser-evidence.log
