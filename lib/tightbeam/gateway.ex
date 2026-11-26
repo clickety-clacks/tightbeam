@@ -421,7 +421,7 @@ defmodule Tightbeam.Gateway do
            plug: {Tightbeam.Wire.Router, router_deps},
            port: config.port
          ),
-         {Tightbeam.ExecutionMapTurnVersions, db}
+         Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
        ])
     |> Enum.reject(&is_nil/1)
   end

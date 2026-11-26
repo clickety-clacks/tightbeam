@@ -115,6 +115,16 @@ defmodule Tightbeam.ExecutionMapTurnVersions do
     ready == 1
   end
 
+  def enabled_child(db) do
+    if enabled?(), do: {__MODULE__, db}
+  end
+
+  def indexed_read?(txn), do: enabled?() and ready?(txn)
+
+  defp enabled? do
+    Application.get_env(:tightbeam, :execution_map_turn_backfill_enabled, false) == true
+  end
+
   def child_spec(db) do
     Supervisor.child_spec({Task, fn -> backfill(db) end},
       id: __MODULE__,

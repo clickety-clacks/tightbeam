@@ -1099,7 +1099,7 @@ defmodule Tightbeam.ExecutionMap do
   # Work-item and assignment visibility can change after a turn ends. Keep
   # admission on the read side, using the same original links as the turn.
   defp rest_turn_dependency(txn, principal, item_ids, assignment_ids) do
-    if Tightbeam.ExecutionMapTurnVersions.ready?(txn) do
+    if Tightbeam.ExecutionMapTurnVersions.indexed_read?(txn) do
       indexed_turn_dependency(txn, principal, item_ids, assignment_ids)
     else
       unindexed_turn_dependency(txn, principal, item_ids, assignment_ids)

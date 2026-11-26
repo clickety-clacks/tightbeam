@@ -102,6 +102,48 @@ defmodule Tightbeam.ExecutionMapTurnVersionsTest do
     assert [["wi_old", 1]] == groups(db)
   end
 
+  test "boot flag defaults off and only enables indexed reads after backfill" do
+    key = :execution_map_turn_backfill_enabled
+    previous = Application.fetch_env(:tightbeam, key)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:tightbeam, key, value)
+        :error -> Application.delete_env(:tightbeam, key)
+      end
+    end)
+
+    Application.delete_env(:tightbeam, key)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Ledger.ensure_schema(db)
+
+    assert {:ok, _} =
+             DB.query(db, """
+             INSERT INTO turns (sessionKey, messageId, origin, prompt, jobRef, createdAt)
+             VALUES ('source', 'historical-turn', 'process:test', '', 'wi_old', 1)
+             """)
+
+    assert :ok = ExecutionMapTurnVersions.ensure_schema(db)
+    assert ExecutionMapTurnVersions.enabled_child(db) == nil
+    assert {:ok, false} = DB.read_transaction(db, &ExecutionMapTurnVersions.indexed_read?/1)
+    assert groups(db) == []
+
+    Application.put_env(:tightbeam, key, true)
+    assert {:ok, false} = DB.read_transaction(db, &ExecutionMapTurnVersions.indexed_read?/1)
+
+    {ExecutionMapTurnVersions, ^db} = child = ExecutionMapTurnVersions.enabled_child(db)
+    worker = start_supervised!(child)
+    monitor = Process.monitor(worker)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, reason}, 5_000
+    assert reason in [:normal, :noproc]
+    assert groups(db) == [["wi_old", 1]]
+    assert {:ok, true} = DB.read_transaction(db, &ExecutionMapTurnVersions.indexed_read?/1)
+
+    Application.put_env(:tightbeam, key, false)
+    assert ExecutionMapTurnVersions.enabled_child(db) == nil
+    assert {:ok, false} = DB.read_transaction(db, &ExecutionMapTurnVersions.indexed_read?/1)
+  end
+
   defmodule FailingDB do
     use GenServer
 
