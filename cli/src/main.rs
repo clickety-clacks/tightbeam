@@ -41,16 +41,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    if args.first().is_some_and(|arg| arg == "setup") {
-        match setup::run(&args[1..]) {
-            Ok(status) => std::process::exit(status),
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-        }
-    }
-
     if args.first().is_some_and(|arg| arg == "harklight-child") {
         match harklight_child::run(&args[1..]) {
             Ok(status) => std::process::exit(status),
@@ -222,6 +212,16 @@ fn main() {
     {
         println!("{}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
+    }
+
+    if args.first().is_some_and(|arg| arg == "setup") {
+        match setup::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     match args::parse(args) {

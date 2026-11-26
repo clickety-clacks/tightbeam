@@ -465,15 +465,18 @@ async function setup() {
     const readSysctl = (key) => command('sysctl', ['-n', key]).stdout?.trim();
     const checkNamespaces = !mac && providers.some(({ provider }) => provider === 'openai');
     const sandboxUnavailable = checkNamespaces && (!bwrap || !canBubblewrap());
-    const namespaceFix = mode === 'full' && sandboxUnavailable && Boolean(bwrap);
+    const needsAppArmor = sandboxUnavailable && bwrap &&
+      readSysctl('kernel.apparmor_restrict_unprivileged_userns') === '1';
+    const usernsLimit = sandboxUnavailable && bwrap && [
+      'kernel.unprivileged_userns_clone', 'user.max_user_namespaces',
+    ].find((key) => readSysctl(key) === '0');
+    const namespaceFix = mode === 'full' && Boolean(needsAppArmor || usernsLimit);
     const readiness = !receipt?.ready || versionChanged;
     const codexDisabled = sandboxUnavailable && !namespaceFix;
     const writeGateway = !fs.existsSync(gateway.file) || upgrade || receipt?.advertised !== advertised ||
       versionChanged || receipt?.codexDisabled !== codexDisabled || namespaceFix;
-    const appArmor = namespaceFix && readSysctl('kernel.apparmor_restrict_unprivileged_userns') === '1';
-    const sysctlKey = namespaceFix && [
-      'kernel.unprivileged_userns_clone', 'user.max_user_namespaces',
-    ].find((key) => readSysctl(key) === '0');
+    const appArmor = namespaceFix && needsAppArmor;
+    const sysctlKey = namespaceFix && usernsLimit;
     const lingering = !mac && command('loginctl', ['show-user', account.username, '--property=Linger', '--value']).stdout?.trim() === 'yes';
     const enableLinger = !mac && !lingering && !receipt?.lingerUnavailable;
     const endsAtLogout = mac || !lingering;
@@ -495,8 +498,11 @@ async function setup() {
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
     if (sandboxUnavailable && !appArmor && !sysctlKey) {
       const installBubblewrap = !bwrap ? ' An administrator also needs to install bubblewrap.' : '';
+      let fix = 'tightbeam setup --mode full';
+      if (needsAppArmor && fs.existsSync('/etc/apparmor.d/bwrap')) fix = 'sudo apparmor_parser -r /etc/apparmor.d/bwrap';
+      else if (usernsLimit) fix = `sudo sysctl -w ${usernsLimit}=${usernsLimit === 'user.max_user_namespaces' ? 15000 : 1}`;
       notes.push(mode === 'quick'
-        ? `Codex agents cannot run commands until an administrator repairs the sandbox.${installBubblewrap} To apply the system fixes, run tightbeam setup --mode full from an administrator account.`
+        ? `Codex agents cannot run commands until an administrator repairs the sandbox.${installBubblewrap} Have an administrator run ${fix}.`
         : `Disable Codex on this machine because its sandbox is unavailable.${installBubblewrap} Claude and Pi can run if configured.`);
     }
     add(upgrade, `Replace the user gateway service with a system service while keeping all data in ${base}.`);
@@ -549,11 +555,12 @@ async function setup() {
       try {
         if (appArmor) {
           const profile = '/etc/apparmor.d/bwrap';
-          if (fs.existsSync(profile)) throw new Error(`The existing ${profile} needs attention before the Codex sandbox can start.`);
-          const source = path.join(scratch, 'bwrap');
-          fs.writeFileSync(source, `abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap ${JSON.stringify(bwrap)} flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n`);
-          run('sudo', ['apparmor_parser', '-Q', source]);
-          run('sudo', ['install', '-m', '0644', source, profile]);
+          if (!fs.existsSync(profile)) {
+            const source = path.join(scratch, 'bwrap');
+            fs.writeFileSync(source, `abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap ${JSON.stringify(bwrap)} flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n`);
+            run('sudo', ['apparmor_parser', '-Q', source]);
+            run('sudo', ['install', '-m', '0644', source, profile]);
+          }
           run('sudo', ['apparmor_parser', '-r', profile]);
         } else if (sysctlKey) {
           const value = sysctlKey === 'user.max_user_namespaces' ? '15000' : '1';
