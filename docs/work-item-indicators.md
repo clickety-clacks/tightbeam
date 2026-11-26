@@ -1,5 +1,10 @@
 # Work-item indicators for a page
 
+This read is behind the default-off `work_item_indicators_enabled` flag
+(environment `TIGHTBEAM_WORK_ITEM_INDICATORS_ENABLED=true`; see the
+[feature-flag register](feature-flags.md)). While off, the route answers exactly
+like an unknown route.
+
 `GET /api/work-item-indicators` returns the small facts a page of work items
 shows, in one bounded read. It uses the existing state bearer credential and
 `asUser`, and shows exactly what the same caller's item, assignment, wake, turn

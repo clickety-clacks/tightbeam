@@ -15,6 +15,13 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
   end
 
+  case System.get_env("TIGHTBEAM_WORK_ITEM_INDICATORS_ENABLED") do
+    nil -> :ok
+    "true" -> config :tightbeam, :work_item_indicators_enabled, true
+    "false" -> config :tightbeam, :work_item_indicators_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_WORK_ITEM_INDICATORS_ENABLED must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end

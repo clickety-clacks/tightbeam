@@ -37,7 +37,8 @@ defmodule Tightbeam.WorkItemIndicatorsTest do
       cli_token: "tbc_indicators",
       firehose_hub: Hub,
       model_catalog: %{},
-      session_status: fn _ -> nil end
+      session_status: fn _ -> nil end,
+      work_item_indicators_enabled: true
     ]
 
     %{
@@ -159,6 +160,37 @@ defmodule Tightbeam.WorkItemIndicatorsTest do
     assert Map.keys(item) -- Map.keys(detail(ctx)) == ["held", "runningCards"]
     Application.put_env(:tightbeam, :wait_links_enabled, true)
     assert %{"questions" => %{"count" => 1}, "waiting" => %{}} = one(ctx)
+  end
+
+  test "the default-off flag answers exactly like an unknown route", ctx do
+    assert Application.get_env(:tightbeam, :work_item_indicators_enabled) == false
+    query = "workItemIds=#{ctx.item.id}"
+
+    for off <- [
+          Keyword.delete(ctx.opts, :work_item_indicators_enabled),
+          Keyword.put(ctx.opts, :work_item_indicators_enabled, false)
+        ] do
+      call = fn path, bearer ->
+        conn(:get, path)
+        |> put_req_header("authorization", "Bearer " <> bearer)
+        |> Router.call(Router.init(off))
+      end
+
+      flagged = call.("/api/work-item-indicators?" <> query, ctx.token)
+      unknown = call.("/api/no-such-route?" <> query, ctx.token)
+      assert {flagged.status, flagged.resp_body} == {unknown.status, unknown.resp_body}
+      assert flagged.status == 404
+
+      assert {call.("/api/work-item-indicators", "wrong").status,
+              call.("/api/work-item-indicators", "wrong").resp_body} ==
+               {call.("/api/no-such-route", "wrong").status,
+                call.("/api/no-such-route", "wrong").resp_body}
+
+      assert Plug.Conn.get_resp_header(flagged, "content-type") ==
+               Plug.Conn.get_resp_header(unknown, "content-type")
+    end
+
+    assert get(ctx, query).status == 200
   end
 
   test "items and cards resolve in one read; unknown ids do not fail the page", ctx do

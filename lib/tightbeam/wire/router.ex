@@ -985,6 +985,21 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/work-item-indicators" do
+    if work_item_indicators_enabled?(conn),
+      do: work_item_indicators(conn),
+      else: error(conn, 404, "not_found")
+  end
+
+  # Default-off feature flag; see docs/feature-flags.md.
+  defp work_item_indicators_enabled?(conn) do
+    Map.get(
+      deps(conn),
+      :work_item_indicators_enabled,
+      Application.get_env(:tightbeam, :work_item_indicators_enabled, false)
+    )
+  end
+
+  defp work_item_indicators(conn) do
     with {:ok, auth} <- state_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- state_principal(auth, query, conn),
