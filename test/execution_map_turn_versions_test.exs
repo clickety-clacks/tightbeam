@@ -22,7 +22,7 @@ defmodule Tightbeam.ExecutionMapTurnVersionsTest do
     assert :ok = ExecutionMapTurnVersions.ensure_schema(db)
     refute ready?(db)
     assert :more = ExecutionMapTurnVersions.backfill_batch(db)
-    assert [["wi_old", 4096]] == groups(db)
+    assert [["wi_old", 1024]] == groups(db)
 
     assert {:ok, _} = DB.query(db, "UPDATE turns SET jobRef='wi_moved' WHERE seq IN (1, 4999)")
     assert {:ok, _} = DB.query(db, "DELETE FROM turns WHERE seq IN (2, 5000)")
@@ -33,7 +33,7 @@ defmodule Tightbeam.ExecutionMapTurnVersionsTest do
              VALUES ('source', 'new-turn', 'process:test', '', 'wi_new', 5001)
              """)
 
-    assert [["wi_moved", 1], ["wi_new", 1], ["wi_old", 4094]] == groups(db)
+    assert [["wi_moved", 1], ["wi_new", 1], ["wi_old", 1022]] == groups(db)
 
     assert :ok = ExecutionMapTurnVersions.ensure_schema(db)
     refute ready?(db)
@@ -98,6 +98,42 @@ defmodule Tightbeam.ExecutionMapTurnVersionsTest do
     assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 5_000
     assert Process.alive?(supervisor)
     assert [] == Supervisor.which_children(supervisor)
+    assert ready?(db)
+    assert [["wi_old", 1]] == groups(db)
+  end
+
+  defmodule FailingDB do
+    use GenServer
+
+    def start_link(state), do: GenServer.start_link(__MODULE__, state)
+    def init(state), do: {:ok, state}
+
+    def handle_call({:transaction, _}, _from, {db, remaining}) when remaining > 0 do
+      {:reply, {:error, %Tightbeam.DB.Error{message: "database is busy"}}, {db, remaining - 1}}
+    end
+
+    def handle_call(request, _from, {db, _} = state) do
+      {:reply, GenServer.call(db, request), state}
+    end
+  end
+
+  test "a non-overload transaction error retries and warns only once per kind" do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Ledger.ensure_schema(db)
+
+    assert {:ok, _} =
+             DB.query(db, """
+             INSERT INTO turns (sessionKey, messageId, origin, prompt, jobRef, createdAt)
+             VALUES ('source', 'historical-turn', 'process:test', '', 'wi_old', 1)
+             """)
+
+    assert :ok = ExecutionMapTurnVersions.ensure_schema(db)
+    proxy = start_supervised!({FailingDB, {db, 2}})
+
+    {result, log} = with_log(fn -> ExecutionMapTurnVersions.backfill(proxy) end)
+    assert result == :ok
+    assert length(Regex.scan(~r/execution-map turn backfill batch failed/, log)) == 1
+    assert log =~ "Tightbeam.DB.Error"
     assert ready?(db)
     assert [["wi_old", 1]] == groups(db)
   end

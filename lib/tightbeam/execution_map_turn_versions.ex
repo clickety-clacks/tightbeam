@@ -1,13 +1,15 @@
 defmodule Tightbeam.ExecutionMapTurnVersions do
   @moduledoc false
 
+  require Logger
+
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
   # A source group has a single visibility outcome. Fingerprint its revision
   # rather than reading every turn in the group for every execution-map page.
   # Keep empty groups so reusing a source group cannot reuse a prior revision.
-  @batch_size 4_096
+  @batch_size 1_024
 
   @ddl """
   CREATE TABLE execution_map_turn_versions (
@@ -120,27 +122,54 @@ defmodule Tightbeam.ExecutionMapTurnVersions do
     )
   end
 
-  def backfill(db), do: backfill(db, 250)
+  def backfill(db), do: backfill(db, 250, MapSet.new())
 
-  defp backfill(db, delay_ms) do
-    case DB.background_pass(fn -> backfill_batch(db) end, :overloaded) do
+  defp backfill(db, delay_ms, warned) do
+    case run_batch(db) do
       :more ->
-        backfill(db)
+        backfill(db, 250, warned)
 
       :done ->
         :ok
 
       :overloaded ->
-        Process.sleep(delay_ms)
-        backfill(db, min(delay_ms * 2, 5_000))
+        retry(db, delay_ms, warned)
+
+      {:error, kind} ->
+        unless MapSet.member?(warned, kind) do
+          Logger.warning("execution-map turn backfill batch failed; retrying (#{inspect(kind)})")
+        end
+
+        retry(db, delay_ms, MapSet.put(warned, kind))
     end
   end
+
+  defp retry(db, delay_ms, warned) do
+    Process.sleep(delay_ms)
+    backfill(db, min(delay_ms * 2, 5_000), warned)
+  end
+
+  defp run_batch(db) do
+    case DB.background_pass(fn -> backfill_batch(db) end, :overloaded) do
+      {:error, reason} -> {:error, error_kind(reason)}
+      status -> status
+    end
+  rescue
+    error -> {:error, error.__struct__}
+  catch
+    :exit, reason -> {:error, {:exit, error_kind(reason)}}
+  end
+
+  defp error_kind(%{__struct__: kind}), do: kind
+  defp error_kind({kind, _}) when is_atom(kind), do: kind
+  defp error_kind(kind) when is_atom(kind), do: kind
+  defp error_kind(_reason), do: :unknown
 
   @doc false
   def backfill_batch(db) do
     case DB.transaction(db, &backfill_batch_in_txn/1) do
       {:ok, status} -> status
-      {:error, error} -> raise error
+      {:error, _} = error -> error
     end
   end
 
