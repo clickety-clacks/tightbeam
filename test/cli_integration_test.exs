@@ -1,5 +1,19 @@
 defmodule Tightbeam.CliIntegrationTest do
   use Tightbeam.TestCase, async: false
+
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.Model
 
   @moduletag :cli_integration
@@ -849,7 +863,10 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    other_target = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+    [warning, json] = String.split(output, "\n", parts: 2)
+    reply = JSON.decode!(json)
+    assert [%{"code" => "missing_wait_reason", "message" => ^warning}] = reply["warnings"]
+    other_target = Wakes.get(ctx.db, reply["wakeId"])
     assert other_target.assignment_id == assignment
     assert other_target.obligation_ref == nil
 
@@ -1029,7 +1046,10 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{assignment_id: ^assignment, after_ms: 3_600_000}
                     }}
 
-    timed_id = JSON.decode!(timed_output)["wakeId"]
+    [warning, json] = String.split(timed_output, "\n", parts: 2)
+    reply = JSON.decode!(json)
+    assert [%{"code" => "missing_wait_reason", "message" => ^warning}] = reply["warnings"]
+    timed_id = reply["wakeId"]
     assert Wakes.get(ctx.db, timed_id).assignment_id == assignment
 
     fact_wake =

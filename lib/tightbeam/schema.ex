@@ -2089,6 +2089,7 @@ defmodule Tightbeam.Schema do
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = Tightbeam.ConditionFacts.ensure_filing_index(db)
+    :ok = Tightbeam.ConditionFacts.ensure_landing_indexes(db)
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)
@@ -2149,6 +2150,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
     :ok = upgrade_session_custody_v1(db)
+    :ok = ensure_wait_links_indexes(db)
     :ok = upgrade_attest_lifecycle_actor(db)
     :ok = upgrade_holder_role_v1(db)
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
@@ -3874,7 +3876,9 @@ defmodule Tightbeam.Schema do
     indexes = [
       {"wakes_rest_created_order",
        "CREATE INDEX IF NOT EXISTS wakes_rest_created_order " <>
-         "ON wakes(createdAt, wakeId)"}
+         "ON wakes(createdAt, wakeId)"},
+      {"wakes_wait_links_item",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_links_item ON wakes(work_item_id,createdAt,wakeId)"}
     ]
 
     case DB.migration_transaction(db, :rest_wake_collection_indexes, [], [], fn txn ->
@@ -3887,6 +3891,37 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "REST wake collection index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp ensure_wait_links_indexes(db) do
+    indexes = [
+      {"wakes_wait_pending_item",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_pending_item ON wakes(work_item_id,createdAt,wakeId) WHERE state='pending'"},
+      {"wakes_wait_pending_assignment",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_pending_assignment ON wakes(assignmentId,createdAt,wakeId) WHERE state='pending'"},
+      {"wakes_wait_pending_session",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_pending_session ON wakes(sessionKey,createdAt,wakeId) WHERE state='pending'"},
+      {"cannot_proceed_wait_assignment",
+       "CREATE INDEX IF NOT EXISTS cannot_proceed_wait_assignment ON assignment_cannot_proceed(assignmentId,createdAt,id)"},
+      {"decision_requests_wait_item",
+       "CREATE INDEX IF NOT EXISTS decision_requests_wait_item ON decision_requests(CASE WHEN json_valid(context) THEN json_extract(context,'$.workItemId') END)"},
+      {"decision_requests_wait_raiser",
+       "CREATE INDEX IF NOT EXISTS decision_requests_wait_raiser ON decision_requests(COALESCE(currentRaiserSessionKey,raiserSessionKey),raisedAt,id)"},
+      {"turns_wait_item", "CREATE INDEX IF NOT EXISTS turns_wait_item ON turns(jobRef,status)"},
+      {"turns_wait_assignment",
+       "CREATE INDEX IF NOT EXISTS turns_wait_assignment ON turns(assignmentId,status)"}
+    ]
+
+    case DB.migration_transaction(db, :wait_links_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {_name, sql} -> :ok = Txn.exec(txn, sql) end)
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError, message: "Wait link index migration failed: #{Exception.message(error)}"
     end
   end
 

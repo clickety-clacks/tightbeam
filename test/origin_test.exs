@@ -1,5 +1,5 @@
 defmodule Tightbeam.OriginTest do
-  use ExUnit.Case, async: true
+  use Tightbeam.TestCase, async: false
 
   import ExUnit.CaptureLog
 
@@ -34,11 +34,15 @@ defmodule Tightbeam.OriginTest do
   end
 
   test "an origin outside the class set classifies substrate and warns once" do
-    log = capture_log(fn -> assert Origin.started_by("operator:flynn") == "substrate" end)
+    key = {Origin, :warned_unclassified}
+    previous = :persistent_term.get(key, false)
+    :persistent_term.put(key, false)
+    on_exit(fn -> :persistent_term.put(key, previous) end)
 
-    # The warning is per-node, so this file may or may not be the one that
-    # spends it. What is total is the classification: never nil, never a raise.
-    assert log == "" or log =~ "outside the closed class set"
+    log = capture_log(fn -> assert Origin.started_by("operator:flynn") == "substrate" end)
+    assert log =~ "outside the closed class set"
+    repeated = capture_log(fn -> assert Origin.started_by("operator:flynn") == "substrate" end)
+    refute repeated =~ "outside the closed class set"
 
     for bad <- ["", "user:", nil, 7], do: assert(Origin.started_by(bad) == "substrate")
   end

@@ -1,6 +1,19 @@
 defmodule Tightbeam.HolderProdTest do
   use Tightbeam.TestCase, async: false
 
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.{
     Assignments,
     ConnRegistry,
@@ -168,6 +181,15 @@ defmodule Tightbeam.HolderProdTest do
   end
 
   setup do
+    previous_item_wait_flag = Application.get_env(:tightbeam, :work_item_waits_enabled)
+    Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous_item_wait_flag),
+        do: Application.delete_env(:tightbeam, :work_item_waits_enabled),
+        else: Application.put_env(:tightbeam, :work_item_waits_enabled, previous_item_wait_flag)
+    end)
+
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
     sql!(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('fixture-owner',0,1)")
@@ -254,6 +276,43 @@ defmodule Tightbeam.HolderProdTest do
     assert %{state: "fired", delivered_turn_seq: ^seq} = Wakes.get(ctx.db, wake_id)
   end
 
+  test "an item-only wait does not quiet the same session's assignment prods", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+
+    item =
+      handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        principal: {:session, "holder"},
+        origin: "session:holder",
+        params: %{title: "Separate item waiting on an event"}
+      })
+
+    handlers["work-item-update"].(%{
+      verb: "work-item-update",
+      principal: {:session, "holder"},
+      origin: "session:holder",
+      params: %{work_item_id: item.id, delivery_owner_session_key: "holder"}
+    })
+
+    assert %{wait: %{active: true}} =
+             handlers["work-item-wait"].(%{
+               verb: "work-item-wait",
+               principal: {:session, "holder"},
+               origin: "session:holder",
+               params: %{
+                 work_item_id: item.id,
+                 condition_kind: "upstream-ready",
+                 condition_scope: "dependency",
+                 after_ms: 12 * @quiet,
+                 wait_reason: "Waiting on a different item"
+               }
+             })
+
+    assert deadline(ctx.db) == ctx.opened + @quiet
+    sweep(ctx.db, ctx.opened + @quiet)
+    assert [[_, "holder", "pending"]] = notices(ctx.db)
+  end
+
   for wait <- [:timed, :fact, :predicate, :after_turn] do
     test "a holder's own #{wait} wait suppresses the prod", ctx do
       at = ctx.opened + @quiet
@@ -300,6 +359,89 @@ defmodule Tightbeam.HolderProdTest do
 
       assert StateResources.wake(StateResources.query_wake(ctx.db, wake_id))["waitReason"] ==
                reason
+    end
+  end
+
+  test "disabled optional reasons preserve legacy scheduling and mandatory holder reasons", ctx do
+    Application.delete_env(:tightbeam, :wait_links_enabled)
+
+    for trigger <- [%{after_ms: @quiet}, %{cron: "0 * * * *"}, %{}] do
+      for reason <- [nil, "Optional explanation", "two\nlines"] do
+        result = gateway_wake(ctx.db, "other", Map.put(trigger, :wait_reason, reason))
+        assert %{wake_id: id} = result
+        refute Enum.any?(result[:warnings] || [], &(&1.code == "missing_wait_reason"))
+        assert Wakes.get(ctx.db, id).wait_reason == nil
+        wire = StateResources.wake(StateResources.query_wake(ctx.db, id))
+        refute Map.has_key?(wire, "waitOn")
+        refute Map.has_key?(wire, "waitReason")
+      end
+    end
+
+    assert %{code: "missing_reason"} =
+             gateway_wake(ctx.db, "holder", %{condition_kind: "fixture-ready", after_ms: @quiet})
+  end
+
+  test "supplied reasons survive timed other-agent and cron wakes without new absence refusals",
+       ctx do
+    for trigger <- [%{after_ms: @quiet}, %{cron: "0 * * * *"}, %{}] do
+      assert %{wake_id: legacy} = gateway_wake(ctx.db, "other", trigger)
+      assert Wakes.get(ctx.db, legacy).wait_reason == nil
+      reason = "Waiting for the next scheduled check"
+
+      assert %{wake_id: id, wait_reason: ^reason} =
+               gateway_wake(ctx.db, "other", Map.put(trigger, :wait_reason, reason))
+
+      assert Wakes.get(ctx.db, id).wait_reason == reason
+      assert StateResources.wake(StateResources.query_wake(ctx.db, id))["waitReason"] == reason
+
+      assert %{code: "invalid_wait_reason"} =
+               gateway_wake(ctx.db, "other", Map.put(trigger, :wait_reason, "two\nlines"))
+
+      assert %{code: "wait_reason_too_long"} =
+               gateway_wake(
+                 ctx.db,
+                 "other",
+                 Map.put(trigger, :wait_reason, String.duplicate("a", 141))
+               )
+    end
+  end
+
+  test "missing reason notices apply only to new agent waits", ctx do
+    for trigger <- [%{after_ms: @quiet}, %{cron: "0 * * * *"}] do
+      assert %{warnings: [%{code: "missing_wait_reason", message: message}]} =
+               gateway_wake(ctx.db, "other", trigger)
+
+      assert message =~ "140 characters"
+      assert message =~ "--wait-reason"
+    end
+
+    refute Map.has_key?(gateway_wake(ctx.db, "other", %{}), :warnings)
+
+    refute Map.has_key?(
+             gateway_wake(ctx.db, "other", %{
+               after_ms: @quiet,
+               wait_reason: "Follow up after processing"
+             }),
+             :warnings
+           )
+
+    params = %{after_ms: @quiet, idempotency_key: "legacy-timed-wake"}
+    assert %{wake_id: wake_id, warnings: [_]} = gateway_wake(ctx.db, "other", params)
+    assert %{wake_id: ^wake_id} = replay = gateway_wake(ctx.db, "other", params)
+    refute Map.has_key?(replay, :warnings)
+
+    for principal <- [{:process, "tightbeam"}, {:user, "owner"}] do
+      result =
+        Gateway.handlers(%{db: ctx.db})["wake"].(%{
+          verb: "wake",
+          origin: "process:tightbeam",
+          principal: principal,
+          session_key: "other",
+          params: %{prompt: "Follow through", after_ms: @quiet}
+        })
+
+      assert %{wake_id: _} = result
+      refute Map.has_key?(result, :warnings)
     end
   end
 

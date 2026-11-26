@@ -1,5 +1,19 @@
 defmodule Tightbeam.RailScriptTest do
   use Tightbeam.TestCase, async: false
+
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.Model
 
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
@@ -997,6 +1011,12 @@ defmodule Tightbeam.RailScriptTest do
 
     assert question =~ "denied script_error"
     assert question =~ "script_exit_class unreported"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT json_extract(context,'$.sourceUnavailable') FROM decision_requests"
+             )
   end
 
   # BLOCKING review finding. Recovery used to be ordered by the ACTOR's delayed mutation

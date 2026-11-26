@@ -262,7 +262,7 @@ defmodule Tightbeam.StateResources do
 
   @item_field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings waiting running rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "attests" =>
@@ -316,7 +316,7 @@ defmodule Tightbeam.StateResources do
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
       integers: ~w(createdInTurnSeq createdAt priority rowVersion),
-      booleans: ~w(isBug createdContextKnown started),
+      booleans: ~w(isBug createdContextKnown started running),
       nullable:
         ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
@@ -474,6 +474,8 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"wakes", "waitOn"} => :json,
+    {"work items", "waiting"} => :json,
     {"work items", "holders"} => {:array, :string, :sort},
     {"work items", "attestCounts"} => :json,
     {"work items", "verdictCounts"} => :json,
@@ -563,6 +565,7 @@ defmodule Tightbeam.StateResources do
 
   def query_work_item(db, selection, call) do
     {id, filters} = if is_map(selection), do: {nil, selection}, else: {selection, %{}}
+    id_filter = if is_binary(id), do: "wi.id = ?1", else: "(?1 IS NULL OR wi.id = ?1)"
     {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
@@ -584,7 +587,7 @@ defmodule Tightbeam.StateResources do
           FROM work_items AS wi
           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
           LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
-          WHERE (?1 IS NULL OR wi.id = ?1) AND (
+          WHERE #{id_filter} AND (
             ?2 = 1 OR
             (?3 = 'user' AND wi.ownerUserId = ?4) OR
             ?3 = 'session'
@@ -750,6 +753,9 @@ defmodule Tightbeam.StateResources do
 
   def query_wake(db, %{key: id, principal: principal}) do
     detail_selection(db, "wakes", principal, &wake_projection_in_txn(&1, id))
+    |> then(fn row ->
+      with_read_transaction(db, &Tightbeam.WaitLinks.project_wake(&1, row, principal))
+    end)
   end
 
   def query_wake(db, id) do
@@ -784,7 +790,11 @@ defmodule Tightbeam.StateResources do
         page
         | rows:
             Enum.map(page.rows, fn [_created_at, wake_id] ->
-              Wakes.delivery_projection_in_txn(txn, wake_id)
+              Tightbeam.WaitLinks.project_wake(
+                txn,
+                Wakes.delivery_projection_in_txn(txn, wake_id),
+                principal
+              )
             end)
       }
     end)
@@ -2142,7 +2152,15 @@ defmodule Tightbeam.StateResources do
         do: Map.put_new(row, :delivery_status, nil),
         else: row
 
-    row |> public() |> closed_projection("wakes")
+    row
+    |> public()
+    |> then(fn item ->
+      if Tightbeam.WaitLinks.enabled?(),
+        do:
+          Map.put(item, "waitOn", Map.get(row, "waitOn") || Tightbeam.WaitLinks.wake_targets(row)),
+        else: item
+    end)
+    |> closed_projection("wakes")
   end
 
   def production(row), do: row |> public() |> correlate("eventId", "seq")
@@ -2604,7 +2622,7 @@ defmodule Tightbeam.StateResources do
   def encode_item(resource, item, catalog)
       when is_binary(resource) and is_map(item) and is_map(catalog) do
     resource = Map.get(@item_resource_aliases, resource, resource)
-    fields = Map.fetch!(@item_field_order, resource)
+    fields = item_fields(resource)
     fields = conditional_fields!(resource, fields, item)
     exact_item_keys!(resource, item, fields)
     validate_item_values!(resource, item, fields)
@@ -2623,8 +2641,8 @@ defmodule Tightbeam.StateResources do
     resource = Map.get(@item_resource_aliases, resource, resource)
 
     case Map.fetch(@item_field_order, resource) do
-      {:ok, fields} ->
-        fields = conditional_fields!(resource, fields, item)
+      {:ok, _fields} ->
+        fields = conditional_fields!(resource, item_fields(resource), item)
         Enum.sort(Map.keys(item)) == Enum.sort(fields)
 
       :error ->
@@ -2643,6 +2661,14 @@ defmodule Tightbeam.StateResources do
     do: Enum.any?(items, &item_has_secret_fields?/1)
 
   def item_has_secret_fields?(_value), do: false
+
+  defp item_fields(resource) do
+    fields = Map.fetch!(@item_field_order, resource)
+
+    if resource == "work items" and not Tightbeam.WaitLinks.enabled?(),
+      do: fields -- ["waiting", "running"],
+      else: fields
+  end
 
   defp conditional_fields!("decision requests", fields, %{"kind" => "agent"}) do
     List.insert_at(fields, Enum.find_index(fields, &(&1 == "rowVersion")), "returnedBy")
@@ -2708,7 +2734,10 @@ defmodule Tightbeam.StateResources do
   end
 
   defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
-    do: fields ++ ["waitReason"]
+    do: fields ++ ["waitReason"] ++ if(Tightbeam.WaitLinks.enabled?(), do: ["waitOn"], else: [])
+
+  defp conditional_fields!("wakes", fields, _item),
+    do: fields ++ if(Tightbeam.WaitLinks.enabled?(), do: ["waitOn"], else: [])
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 
@@ -3574,7 +3603,7 @@ defmodule Tightbeam.StateResources do
   end
 
   defp closed_projection(row, resource) do
-    fields = conditional_fields!(resource, Map.fetch!(@item_field_order, resource), row)
+    fields = conditional_fields!(resource, item_fields(resource), row)
     item = Map.take(row, fields)
     exact_item_keys!(resource, item, fields)
     item
@@ -3792,7 +3821,7 @@ defmodule Tightbeam.StateResources do
   defp normalize_session_wire_value(value), do: value
 
   defp exact!(resource, item) do
-    expected = Map.fetch!(@item_field_order, resource)
+    expected = item_fields(resource)
     expected = conditional_fields!(resource, expected, item)
 
     if Enum.sort(Map.keys(item)) == Enum.sort(expected) do
@@ -3806,7 +3835,7 @@ defmodule Tightbeam.StateResources do
     keys = Map.keys(row)
 
     if keys != [] and Enum.all?(keys, &is_binary/1) do
-      expected = Map.fetch!(@item_field_order, resource)
+      expected = item_fields(resource)
 
       expected =
         if resource == "wakes", do: conditional_fields!(resource, expected, row), else: expected

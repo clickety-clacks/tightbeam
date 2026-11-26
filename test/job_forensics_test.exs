@@ -7,6 +7,20 @@ defmodule Tightbeam.JobForensicsTest do
   a domain write, never something a caller authored.
   """
   use Tightbeam.TestCase, async: false
+
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.Model
 
   alias Tightbeam.{
@@ -186,14 +200,23 @@ defmodule Tightbeam.JobForensicsTest do
     assert %{workItem: %{state: "closed"}} = dispose(db, "work-item-close", "wi_disp")
     assert length(CausalEvents.for_job(db, "wi_disp", [])) == 3
 
-    # The work-item row keeps its shape — this table ADDS history, it does not
-    # migrate the item.
+    # History does not alter stored item fields; detail includes the declared
+    # waiting/running projections.
+    assert fetch_item(db, "wi_disp").workItem.waiting == %{
+             agent: false,
+             time: false,
+             event: false,
+             userIds: []
+           }
+
+    assert fetch_item(db, "wi_disp").workItem.running == false
+
     assert_keys(
       fetch_item(db, "wi_disp").workItem,
       ~w(body bodyUpdatedAt bodyUpdatedBySession bodyUpdatedByUser createdAt
          createdBySession createdByUser deliveryOwnerSessionKey failReason id isBug ownerUserId priority
          mementos rowVersion specRefName specRefSha256 state title started holders attestCounts
-         verdictCounts effectiveCommitRefs landings)a
+         verdictCounts effectiveCommitRefs landings waiting running)a
     )
   end
 

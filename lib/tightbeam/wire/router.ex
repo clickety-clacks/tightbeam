@@ -79,7 +79,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-read harklight-ack harklight-reply harklight-result harklight-progress harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-briefings-catchup harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests check-attest revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-read harklight-ack harklight-reply harklight-result harklight-progress harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-briefings-catchup harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests check-attest revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-wait work-item-wait-withdraw work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "assess_attachments",
@@ -619,6 +619,22 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :assignments))
   end
 
+  get "/api/assignments/:assignment_id/wait-links" do
+    wait_links_page(conn, "assignment", assignment_id)
+  end
+
+  get "/api/work-items/:id/wait-links" do
+    wait_links_page(conn, "work-item", id)
+  end
+
+  get "/api/sessions/:session_key/wait-links" do
+    wait_links_page(conn, "session", session_key)
+  end
+
+  get "/api/decision-requests/:id/wait-links" do
+    wait_links_page(conn, "decision", id)
+  end
+
   get "/api/assignments/:assignment_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
@@ -1069,6 +1085,19 @@ defmodule Tightbeam.Wire.Router do
 
   match _ do
     error(conn, 404, "not_found")
+  end
+
+  defp wait_links_page(conn, kind, id) do
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- Tightbeam.WaitLinks.request(query, kind, id),
+         {:ok, page} <- Tightbeam.WaitLinks.page(db(conn), kind, id, principal, request) do
+      d1_send(conn, 200, JSON.encode!(page))
+    else
+      {:error, :not_found} -> state_not_found(conn, "wait links")
+      {:error, status, code, message} -> state_error(conn, "wait links", status, code, message)
+    end
   end
 
   defp core_detail(conn, spec, raw_key) do
@@ -4943,6 +4972,9 @@ defmodule Tightbeam.Wire.Router do
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
+    "work-item-wait" =>
+      ~w(work_item_id assignment_id decision_request_id condition_kind condition_scope after_ms wait_reason)a,
+    "work-item-wait-withdraw" => ~w(work_item_id)a,
     "work-item-handoff" =>
       ~w(work_item_id title delivery_owner_session_key brief owner_user_id spec_ref_name spec_ref_sha256 is_bug priority)a,
     "work-item-icebox" => ~w(reason work_item_id)a,

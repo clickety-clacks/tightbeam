@@ -1,5 +1,19 @@
 defmodule Tightbeam.CronWakeTest do
   use Tightbeam.TestCase, async: false
+
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.{CronWake, DB, Gateway, Schema, Wakes}
 
   defmodule OverloadedDB do
@@ -61,6 +75,25 @@ defmodule Tightbeam.CronWakeTest do
   defp local_ms(date, time) do
     [utc | _] = :calendar.local_time_to_universal_time_dst({date, time})
     (:calendar.datetime_to_gregorian_seconds(utc) - 62_167_219_200) * 1000
+  end
+
+  test "cron roots and each occurrence retain the supplied why", %{db: db} do
+    reason = "Waiting for the scheduled check"
+    wake = schedule(db, %{wait_reason: reason})
+
+    assert Enum.find(CronWake.list_active(db), &(&1.wake_id == wake.wake_id)).wait_reason ==
+             reason
+
+    CronWake.fire_due(db, wake.due_at)
+
+    assert {:ok, [[id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE consumer='prompt' AND prompt='check progress'"
+             )
+
+    assert Wakes.get(db, id).wait_reason == reason
+    assert Wakes.get(db, wake.wake_id).wait_reason == reason
   end
 
   test "R1.1 five-field cron supports half-hour, hourly, lists, ranges and steps" do

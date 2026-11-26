@@ -174,6 +174,7 @@ defmodule Tightbeam.RowReactions.Plan do
         end
       end)
 
+    plans = Enum.map(plans, &item_wait_plan(&1, event, facts))
     plans = select_terminal_handoff(plans, event)
     unique!(Enum.map(plans, & &1.identity))
 
@@ -359,11 +360,56 @@ defmodule Tightbeam.RowReactions.Plan do
 
   defp scope_records_belong?(_owned_archetypes, _facts), do: false
 
-  defp context(rail, event, facts),
-    do:
-      Enum.reduce(rail.bindings, %{"event" => event, "facts" => facts}, fn binding, context ->
-        Map.put(context, binding["name"], Expression.evaluate(binding["value"], context))
-      end)
+  # A wait is elected by the work-item command, independently of the installed
+  # rail revision. The durable source remains wait_ended; only these two notice
+  # families reuse their existing initial-bracket expressions for resumption.
+  defp context(rail, event, facts) do
+    evaluated_event = item_wait_resume_event(rail, event, facts)
+
+    Enum.reduce(rail.bindings, %{"event" => evaluated_event, "facts" => facts}, fn binding,
+                                                                                   context ->
+      Map.put(context, binding["name"], Expression.evaluate(binding["value"], context))
+    end)
+  end
+
+  defp item_wait_resume_event(
+         rail,
+         %{"kind" => "work_item_observation", "operation" => "wait_ended"} = event,
+         facts
+       ) do
+    case {rail.family, facts["has_assignments"], facts["open_assignment_count"]} do
+      {"r04-work-item", false, 0} -> Map.put(event, "operation", "created")
+      {"r05-work-item", true, 0} -> Map.put(event, "operation", "assignment_closed")
+      _ -> event
+    end
+  end
+
+  defp item_wait_resume_event(_rail, event, _facts), do: event
+
+  defp item_wait_plan(
+         %{kind: "notice", family: family} = plan,
+         %{"kind" => "work_item_observation"} = event,
+         facts
+       )
+       when family in ["r04-work-item", "r05-work-item"] do
+    cond do
+      facts["work_item_wait_active"] == true ->
+        Map.put(plan, :selected, false)
+
+      plan.selected and family == "r05-work-item" and event["operation"] == "wait_ended" ->
+        # The resolution wake already asks the owner to act. Resume the ordinary
+        # reminder at its triage horizon, retaining a later custom initial due.
+        interval =
+          plan.context["interval"] || facts["configured_triage_deadline_ms"] || 86_400_000
+
+        put_in(plan, [:value, "due_at"], max(plan.value["due_at"], event["at"] + interval))
+
+      true ->
+        plan
+    end
+  end
+
+  defp item_wait_plan(plan, _event, _facts), do: plan
 
   defp text!(value) when is_binary(value) and value != "", do: value
   defp text!(_), do: raise(ArgumentError, "reaction name must be nonempty text")

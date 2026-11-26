@@ -1,5 +1,19 @@
 defmodule Tightbeam.FirehoseOrgEscalationTest do
   use Tightbeam.TestCase, async: false
+
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.{DB, Escalation, Model, Org, Schema}
   alias Tightbeam.DB.Txn
 
@@ -268,7 +282,12 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
-    assert notice["refs"] == %{"decisionRequestId" => request.id}
+
+    assert notice["refs"] == %{
+             "decisionRequestId" => request.id,
+             "workItemId" => assignment.workItemId
+           }
+
     assert notice["payload"] == Tightbeam.StateResources.decision_request(request)
 
     Hub.delivered(hub, self())

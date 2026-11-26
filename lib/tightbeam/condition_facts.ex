@@ -99,6 +99,18 @@ defmodule Tightbeam.ConditionFacts do
   def ensure_filing_index(db), do: DB.execute(db, @filing_index)
 
   @doc false
+  def ensure_landing_indexes(db) do
+    DB.execute(db, """
+    CREATE INDEX IF NOT EXISTS condition_facts_landing_commit
+      ON condition_facts(json_extract(payload,'$.commit'),ts,id)
+      WHERE kind='landing.observed-merge';
+    CREATE INDEX IF NOT EXISTS condition_facts_landing_head
+      ON condition_facts(json_extract(payload,'$.headCommit'),ts,id)
+      WHERE kind='landing.observed-merge';
+    """)
+  end
+
+  @doc false
   def wake_hint(kind, scope) when is_binary(kind) do
     scope_arg = if is_binary(scope), do: " --when-scope #{shell_quote(scope)}", else: ""
 
@@ -916,14 +928,17 @@ defmodule Tightbeam.ConditionFacts do
           source,
           """
           SELECT id, ts, scope, payload
-          FROM condition_facts
-          WHERE kind = ?1 AND payload IS NOT NULL AND (
-            json_extract(payload, '$.commit') IN (SELECT value FROM json_each(?2)) OR
-            json_extract(payload, '$.headCommit') IN (SELECT value FROM json_each(?2))
-          )
+          FROM condition_facts INDEXED BY condition_facts_landing_commit
+          WHERE kind = 'landing.observed-merge' AND payload IS NOT NULL
+            AND json_extract(payload, '$.commit') IN (SELECT value FROM json_each(?1))
+          UNION
+          SELECT id, ts, scope, payload
+          FROM condition_facts INDEXED BY condition_facts_landing_head
+          WHERE kind = 'landing.observed-merge' AND payload IS NOT NULL
+            AND json_extract(payload, '$.headCommit') IN (SELECT value FROM json_each(?1))
           ORDER BY ts, id
           """,
-          ["landing.observed-merge", JSON.encode!(commits)]
+          [JSON.encode!(commits)]
         )
 
       rows

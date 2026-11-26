@@ -1,6 +1,19 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   alias Tightbeam.{
     ConnRegistry,
     DB,
@@ -192,6 +205,24 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert Wakes.get(db, wake_id).work_item_id == item.id
     assert %{"class" => "verb.accepted"} = receive_notice()
     assert %{"class" => "work_item.created"} = receive_notice()
+
+    assert Tightbeam.WaitLinks.summaries(db, [item.id])[item.id].waiting == %{
+             agent: false,
+             time: false,
+             event: false,
+             userIds: []
+           }
+
+    principal = %{kind: "user", id: "flynn", is_admin: true}
+
+    for kind <- ["work-item", "session"], ended <- ["true", "false"] do
+      id = if kind == "work-item", do: item.id, else: Wakes.get(db, wake_id).session_key
+      {:ok, request} = Tightbeam.WaitLinks.request(%{"includeEnded" => ended}, kind, id)
+      {:ok, page} = Tightbeam.WaitLinks.page(db, kind, id, principal, request)
+      refute Enum.any?(page.items, &(&1[:id] == "wake:" <> wake_id))
+    end
+
+    assert StateResources.wake(StateResources.query_wake(db, wake_id))["waitOn"] == []
 
     declared = Gateway.handler_effects(%{db: db})["work-item-create"]
     observed = ["wake.scheduled", "work_item.created"]
@@ -1320,7 +1351,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{status: "open"} = request} = Dispatch.dispatch(db, handlers, ask)
-    assert observed_state_classes() == ["decision_request.opened"]
+    assert observed_state_classes() == ["work_item.updated", "decision_request.opened"]
     assert Gateway.handler_effects(%{db: db})["operator-ask"] == ["decision_request.opened"]
 
     assert {:ok, %{id: replay_id}} = Dispatch.dispatch(db, handlers, ask)
@@ -1384,7 +1415,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{status: "open"} = withdraw_request} =
              Dispatch.dispatch(db, handlers, ask_withdraw)
 
-    assert observed_state_classes() == ["decision_request.opened"]
+    assert observed_state_classes() == ["work_item.updated", "decision_request.opened"]
 
     withdraw = %{
       verb: "operator-withdraw",
@@ -1398,7 +1429,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{status: "withdrawn"}} = Dispatch.dispatch(db, handlers, withdraw)
     # The future deadline reminder is retracted with the request (0.1.16's
     # filing design sends no opening notice). Its cancellation is observable.
-    assert observed_state_classes() == ["wake.canceled", "decision_request.withdrawn"]
+    assert observed_state_classes() == [
+             "wake.canceled",
+             "work_item.updated",
+             "decision_request.withdrawn"
+           ]
 
     assert Gateway.handler_effects(%{db: db})["operator-withdraw"] == [
              "decision_request.withdrawn"

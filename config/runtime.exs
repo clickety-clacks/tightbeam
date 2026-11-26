@@ -59,6 +59,20 @@ if config_env() != :test do
     config :tightbeam, :wake_tick_ms, String.to_integer(value)
   end
 
+  case System.get_env("TIGHTBEAM_WAIT_LINKS_ENABLED") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :wait_links_enabled, true
+    _ -> raise ArgumentError, "TIGHTBEAM_WAIT_LINKS_ENABLED must be true or false"
+  end
+
+  case System.get_env("TIGHTBEAM_WORK_ITEM_WAITS_ENABLED") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :work_item_waits_enabled, true
+    _ -> raise ArgumentError, "TIGHTBEAM_WORK_ITEM_WAITS_ENABLED must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_HOLDER_PROD_HOURLY_CAP") do
     case Integer.parse(value) do
       {cap, ""} when cap > 0 -> config :tightbeam, :holder_prod_hourly_cap, cap
