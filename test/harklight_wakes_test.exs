@@ -73,7 +73,19 @@ defmodule Tightbeam.HarklightWakesTest do
   @payload ~s({"request":{"protocol":2,"session_handle":"7d737f62-bbd7-4c51-978d-f6ff5b4d8146","message":{"sender_id":"sender","message_id":"request"}},"files":[]})
   @result ~s({"kind":"sent","session":"7d737f62-bbd7-4c51-978d-f6ff5b4d8146","sender_id":"sender","request":"request"})
 
-  setup do
+  setup tags do
+    flag = :harklight_pending_open_enabled
+    previous = Application.fetch_env(:tightbeam, flag)
+
+    unless tags[:pending_open_disabled], do: Application.put_env(:tightbeam, flag, true)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:tightbeam, flag, value)
+        :error -> Application.delete_env(:tightbeam, flag)
+      end
+    end)
+
     db = :"harklight_wakes_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
@@ -851,6 +863,64 @@ defmodule Tightbeam.HarklightWakesTest do
       [[3]],
       "--after 3"
     }
+  end
+
+  @tag :pending_open_disabled
+  test "default first open uses a snapshot without probing or creating pending state", %{db: db} do
+    agent = fake_legacy_open_agent!()
+    start_supervised!({HarklightWakes, db: db})
+    assert_snapshot_open!(db, agent)
+  end
+
+  @tag :pending_open_disabled
+  test "default first-open hold still requires explicit retry for an older conversation", %{
+    db: db
+  } do
+    migrated_from_01!(db)
+
+    assert {:error, "harklight_first_open_pending", _} =
+             HarklightWakes.first_open_pending(db, @handle)
+
+    agent = fake_legacy_open_agent!()
+    start_supervised!({HarklightWakes, db: db})
+    assert %{counts: %{listening: 0}} = HarklightWakes.retry_command(db, %{params: %{all: true}})
+    refute File.exists?(agent <> ".calls")
+
+    assert %{counts: %{listening: 1}} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    assert_snapshot_open!(db, agent)
+  end
+
+  defp fake_legacy_open_agent! do
+    fake_harklight_agent!(
+      """
+      printf '%s\n' "$*" >> "$0.calls"
+      case "$*" in
+        *--snapshot)
+          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+          printf '%s\n' '{"kind":"caught_up","rev":3}'
+          exec sleep 30
+          ;;
+        *) exit 2 ;;
+      esac
+      """,
+      "0.2.5",
+      log_version: true
+    )
+
+    System.find_executable("harklight-agent")
+  end
+
+  defp assert_snapshot_open!(db, agent) do
+    assert eventually(fn ->
+             DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[3]]}
+           end)
+
+    assert File.read!(agent <> ".calls") == "listen --follow --session #{@handle} --snapshot\n"
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE name='harklight_pending_opens'")
   end
 
   test "startup preserves historical wakes and an explicit retry opens what is still waiting",
@@ -11281,16 +11351,18 @@ defmodule Tightbeam.HarklightWakesTest do
     }
   end
 
-  defp fake_harklight_agent!(body, version \\ "0.2.3") do
+  defp fake_harklight_agent!(body, version \\ "0.2.3", opts \\ []) do
     directory =
       Path.join(System.tmp_dir!(), "harklight-agent-test-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(directory)
     executable = Path.join(directory, "harklight-agent")
 
+    version_log = if opts[:log_version], do: ~S(printf '%s\n' "$*" >> "$0.calls"; ), else: ""
+
     File.write!(
       executable,
-      "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'harklight-agent #{version}'; exit 0; fi\n" <>
+      "#!/bin/sh\nif [ \"$1\" = --version ]; then #{version_log}echo 'harklight-agent #{version}'; exit 0; fi\n" <>
         older_agent_refusals(version) <> body
     )
 
