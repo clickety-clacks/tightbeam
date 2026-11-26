@@ -2160,6 +2160,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_compactor_model_rate_limit_source(db)
     :ok = Tightbeam.Escalation.ensure_coordinator_operator_schema(db)
     :ok = Tightbeam.CoordinatorHoldDecisions.ensure_schema(db)
+    :ok = Tightbeam.ExecutionMapTurnVersions.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok

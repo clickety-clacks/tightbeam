@@ -442,6 +442,42 @@ defmodule Tightbeam.ExecutionMapTest do
     assert telemetry.turns.last_ended_at == 3_300_000
   end
 
+  test "cursor pages reproduce the legacy flat roster across tied creation timestamps", ctx do
+    session!(ctx.db, "s_paged", "sample-user")
+    item!(ctx.db, "wi_page_a", created_at: at(1))
+    item!(ctx.db, "wi_page_b", created_at: at(1))
+    item!(ctx.db, "wi_page_c", created_at: at(2))
+    assignment!(ctx.db, "asg_page_b", work_item_id: "wi_page_b", holder: "s_paged")
+
+    turn!(ctx.db, 73, "s_paged",
+      job_ref: "wi_page_a",
+      assignment_id: "asg_page_b",
+      model: "model",
+      harness: "harness",
+      ended_at: at(3)
+    )
+
+    turn!(ctx.db, 74, "s_paged",
+      job_ref: "wi_page_b",
+      assignment_id: "asg_page_b",
+      status: "running"
+    )
+
+    legacy = roster(ctx)
+    assert ids(legacy) == ["wi_page_a", "wi_page_b", "wi_page_c"]
+    assert node(legacy, "wi_page_a").turns == %{total: 1, last_ended_at: at(3)}
+    assert node(legacy, "wi_page_b").turns == %{total: 2, last_ended_at: at(3)}
+    assert node(legacy, "wi_page_b").active.running_turn
+    assert node(legacy, "wi_page_c").turns == %{total: 0, last_ended_at: nil}
+
+    first = roster(ctx, %{limit: 1})
+    second = roster(ctx, %{limit: 1, after: first.page.next_cursor})
+    final = roster(ctx, %{limit: 1, after: second.page.next_cursor})
+
+    assert first.items ++ second.items ++ final.items == legacy.items
+    assert final.page.next_cursor == nil
+  end
+
   ## Proof 8 — terminal fields, against production writers
 
   test "proof 8: finished_at tracks the CURRENT terminal state and closing_attests exclude revoked",
@@ -835,6 +871,32 @@ defmodule Tightbeam.ExecutionMapTest do
     ok = post_dispatch(opts, %{verb: "execution-map", asUser: "sample-user", params: %{}})
     assert ok.status == 200
     assert [%{"id" => "wi_routed"}] = JSON.decode!(ok.resp_body)["result"]["items"]
+
+    item!(ctx.db, "wi_routed_second")
+
+    first =
+      post_dispatch(opts, %{verb: "execution-map", asUser: "sample-user", params: %{limit: 1}})
+
+    assert first.status == 200
+
+    assert %{
+             "items" => [%{"id" => "wi_routed"}],
+             "page" => %{"nextCursor" => cursor}
+           } = JSON.decode!(first.resp_body)["result"]
+
+    second =
+      post_dispatch(opts, %{
+        verb: "execution-map",
+        asUser: "sample-user",
+        params: %{limit: 1, after: cursor}
+      })
+
+    assert second.status == 200
+
+    assert %{
+             "items" => [%{"id" => "wi_routed_second"}],
+             "page" => %{"nextCursor" => nil}
+           } = JSON.decode!(second.resp_body)["result"]
 
     for verb <- ["execution-map", "execution-map-select"] do
       params =

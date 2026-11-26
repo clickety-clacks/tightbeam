@@ -57,8 +57,9 @@ defmodule Tightbeam.ExecutionMap do
   @doc "The canonical D2 flat ExecutionMap collection query."
   def list_execution_map(db, call) do
     with_rest_world(db, call, fn world ->
-      appearing = execution_map_appearing(world, call.filters)
+      {world, appearing} = execution_map_appearing(world, call.filters)
       page = execution_map_page(appearing, call.boundary, call.limit)
+      world = load_turn_summaries(world, page.items)
 
       %{
         items: Enum.map(page.items, &rest_node(world, &1)),
@@ -72,7 +73,9 @@ defmodule Tightbeam.ExecutionMap do
   @doc "The canonical D2 ExecutionMap forest query."
   def query_execution_map_tree(db, call) do
     with_rest_world(db, call, fn world ->
-      execution_map_forest(world, execution_map_appearing(world, call.filters))
+      {world, items} = execution_map_appearing(world, call.filters)
+
+      execution_map_forest(world, items)
       |> Map.put(:dependency_version, world.dependency_version)
       |> Map.put(:attribution_cutoff, world.cutoff)
     end)
@@ -86,10 +89,9 @@ defmodule Tightbeam.ExecutionMap do
           descendants = descendants(world, item.id)
           scoped = Enum.filter(world.items, &MapSet.member?(descendants, &1.id))
 
-          execution_map_forest(
-            world,
-            execution_map_appearing(%{world | items: scoped}, call.filters)
-          )
+          {world, items} = execution_map_appearing(%{world | items: scoped}, call.filters)
+
+          execution_map_forest(world, items)
           |> Map.put(:dependency_version, world.dependency_version)
           |> Map.put(:attribution_cutoff, world.cutoff)
 
@@ -119,10 +121,11 @@ defmodule Tightbeam.ExecutionMap do
             |> Enum.filter(
               &StateVisibility.execution_map_node_visible?(world.txn, &1.id, call.principal)
             )
-            |> Enum.map(&rest_node(world, &1))
+
+          world = load_turn_summaries(world, selected_items)
 
           %{
-            items: selected_items,
+            items: Enum.map(selected_items, &rest_node(world, &1)),
             no_item: Enum.sort(no_item),
             dependency_version: world.dependency_version,
             attribution_cutoff: world.cutoff
@@ -164,21 +167,70 @@ defmodule Tightbeam.ExecutionMap do
   """
   @spec roster(DB.server(), map()) :: map()
   def roster(db, call) do
-    case validate_roster_filters(call.params) do
-      :ok -> roster_validated(db, call)
-      error -> error
+    with :ok <- validate_roster_filters(call.params),
+         {:ok, page} <- roster_page_params(call.params) do
+      roster_validated(db, call, page)
     end
   end
 
-  defp roster_validated(db, call) do
+  defp roster_validated(db, call, page_params) do
     world = world(db, call)
-    appearing = appearing(world, call.params)
+    {world, appearing} = appearing(world, call.params)
 
     if truthy?(call.params[:tree]) do
-      forest(world, appearing)
+      world |> load_turn_summaries(appearing) |> forest(appearing)
     else
-      Map.put(envelope(world), :items, Enum.map(appearing, &node(world, &1)))
+      {items, page} = roster_page(appearing, page_params)
+      world = load_turn_summaries(world, items)
+      response = Map.put(envelope(world), :items, Enum.map(items, &node(world, &1)))
+      if page, do: Map.put(response, :page, page), else: response
     end
+  end
+
+  defp roster_page_params(%{limit: limit} = params)
+       when is_integer(limit) and limit in 1..500 do
+    if truthy?(params[:tree]) do
+      invalid("--limit is supported only for the flat execution map")
+    else
+      case params[:after] do
+        nil ->
+          {:ok, {:earliest, limit}}
+
+        cursor when is_binary(cursor) ->
+          with [timestamp, "wi_" <> suffix = id] when suffix != "" <-
+                 String.split(cursor, ":", parts: 2),
+               {created_at, ""} <- Integer.parse(timestamp) do
+            {:ok, {{:after, [created_at, id]}, limit}}
+          else
+            _ -> invalid("--after must be an execution-map page cursor")
+          end
+
+        _ ->
+          invalid("--after must be an execution-map page cursor")
+      end
+    end
+  end
+
+  defp roster_page_params(params) do
+    cond do
+      Map.has_key?(params, :limit) -> invalid("--limit must be an integer from 1 to 500")
+      Map.has_key?(params, :after) -> invalid("--after requires --limit")
+      true -> {:ok, nil}
+    end
+  end
+
+  defp roster_page(items, nil), do: {items, nil}
+
+  defp roster_page(items, {boundary, limit}) do
+    page = execution_map_page(items, boundary, limit)
+
+    next_cursor =
+      if page.has_more_after do
+        item = List.last(page.items)
+        "#{item.created_at}:#{item.id}"
+      end
+
+    {page.items, %{next_cursor: next_cursor}}
   end
 
   @doc """
@@ -229,7 +281,10 @@ defmodule Tightbeam.ExecutionMap do
     end
   end
 
-  defp forest_of(world, params), do: forest(world, appearing(world, params))
+  defp forest_of(world, params) do
+    {world, items} = appearing(world, params)
+    world |> load_turn_summaries(items) |> forest(items)
+  end
 
   # Children-of relation over the retained (post-cycle-drop) linked edges. A
   # cycle among the descendants terminates because the dropped edge is already
@@ -270,10 +325,11 @@ defmodule Tightbeam.ExecutionMap do
             selected =
               world.items
               |> Enum.filter(&MapSet.member?(MapSet.new(items), &1.id))
-              |> Enum.map(&node(world, &1))
+
+            world = load_turn_summaries(world, selected)
 
             envelope(world)
-            |> Map.put(:items, selected)
+            |> Map.put(:items, Enum.map(selected, &node(world, &1)))
             |> Map.put(:no_item, Enum.sort(no_item))
         end
     end
@@ -386,14 +442,23 @@ defmodule Tightbeam.ExecutionMap do
   ## Roster filters — they select which authorized nodes APPEAR, nothing else
 
   defp appearing(world, params) do
-    Enum.filter(world.items, fn item ->
-      origin_match?(item, params[:origin]) and
-        owner_match?(item, params[:owner]) and
-        state_match?(item, params[:state]) and
-        spec_match?(item, params[:spec], params[:spec_sha]) and
-        session_match?(item, params[:session]) and
-        quiet_match?(world, item, params[:quiet_over])
-    end)
+    candidates =
+      Enum.filter(world.items, fn item ->
+        origin_match?(item, params[:origin]) and
+          owner_match?(item, params[:owner]) and
+          state_match?(item, params[:state]) and
+          spec_match?(item, params[:spec], params[:spec_sha]) and
+          session_match?(item, params[:session])
+      end)
+
+    case params[:quiet_over] do
+      nil ->
+        {world, candidates}
+
+      bound ->
+        world = load_turn_summaries(world, candidates)
+        {world, Enum.filter(candidates, &quiet_match?(world, &1, bound))}
+    end
   end
 
   defp origin_match?(item, "user"), do: principal(item) == "user"
@@ -441,7 +506,7 @@ defmodule Tightbeam.ExecutionMap do
 
   defp node(world, item) do
     set = Map.get(world.by_item, item.id, [])
-    union = turn_union(world, item.id, set)
+    turns = turn_summary(world, item.id)
     holders = current_holders(world, set)
     pre_cutoff? = item.created_at < world.cutoff
 
@@ -482,9 +547,9 @@ defmodule Tightbeam.ExecutionMap do
       turns:
         if(pre_cutoff?,
           do: %{total: nil, last_ended_at: nil},
-          else: %{total: length(union), last_ended_at: last_ended_at(union)}
+          else: Map.take(turns, [:total, :last_ended_at])
         ),
-      minds: unless(pre_cutoff?, do: minds(union)),
+      minds: unless(pre_cutoff?, do: turns.minds),
       fan_out: unless(pre_cutoff?, do: fan_out(world, set)),
       # THE ONE RESIDUAL OVERCLAIM in this response, and a considered limit
       # rather than an oversight: `running_turn` stays BOOLEAN for a pre-cutoff
@@ -495,10 +560,10 @@ defmodule Tightbeam.ExecutionMap do
       # the worse failure. `pending_session_wake` carries no such caveat: it is
       # session-keyed through durable assignment columns.
       active: %{
-        running_turn: Enum.any?(union, &(&1.status == "running")),
+        running_turn: turns.running,
         pending_session_wake: pending_session_wake?(world, holders)
       },
-      since_progress_ms: world.now - anchor(world, item, set, union)
+      since_progress_ms: world.now - anchor(world, item, set, turns.last_ended_at)
     }
   end
 
@@ -590,29 +655,15 @@ defmodule Tightbeam.ExecutionMap do
     Enum.reduce(set, 0, &(&2 + Map.get(world.open_requests, &1, 0)))
   end
 
-  ## The turn union — either attribution arm alone undercounts
+  @empty_turn_summary %{total: 0, last_ended_at: nil, running: false, minds: []}
 
-  # A bracket nag may carry only `jobRef`; a review turn may carry only
-  # `assignmentId`. `seq` is the primary key, so uniq_by/2 deduping a turn that
-  # carries BOTH keys is exact.
-  defp turn_union(world, item_id, set) do
-    (Map.get(world.turns_by_job_ref, item_id, []) ++
-       Enum.flat_map(set, &Map.get(world.turns_by_assignment, &1, [])))
-    |> Enum.uniq_by(& &1.seq)
+  defp turn_summary(%{turn_summaries: summaries}, id) do
+    summary = Map.get(summaries, id, @empty_turn_summary)
+    %{summary | minds: sort_minds(Enum.reverse(summary.minds))}
   end
 
-  defp last_ended_at(union) do
-    union |> Enum.map(& &1.ended_at) |> Enum.reject(&is_nil/1) |> Enum.max(fn -> nil end)
-  end
-
-  # The mind is stamped when a queued turn is CLAIMED, so an unclaimed turn has
-  # no mind: a fully-null pair is the absence of a stamp, not a mind.
-  defp minds(union) do
-    union
-    |> Enum.map(&%{model: &1.model, context: &1.context, effort: &1.effort, harness: &1.harness})
-    |> Enum.reject(&(is_nil(&1.model) and is_nil(&1.harness)))
-    |> Enum.uniq()
-    |> Enum.sort_by(&{&1.model || "", &1.context || "", &1.effort || "", &1.harness || ""})
+  defp sort_minds(minds) do
+    Enum.sort_by(minds, &{&1.model || "", &1.context || "", &1.effort || "", &1.harness || ""})
   end
 
   defp fan_out(world, set) do
@@ -647,9 +698,7 @@ defmodule Tightbeam.ExecutionMap do
   # item's clock can never claim quiet time from before attribution was
   # knowable. Pre-epoch attests are not discarded — filing one resets the clock,
   # subject to the same floor.
-  defp anchor(world, item, set, union) do
-    ended = union |> Enum.map(& &1.ended_at) |> Enum.reject(&is_nil/1)
-
+  defp anchor(world, item, set, last_ended_at) do
     attested =
       Enum.flat_map(set, fn id ->
         Enum.map(Map.get(world.attests_by_assignment, id, []), & &1.ts)
@@ -657,7 +706,10 @@ defmodule Tightbeam.ExecutionMap do
 
     disposed = world.dispositions |> Map.get(item.id, []) |> Enum.map(& &1.at)
 
-    Enum.max([max(item.created_at, world.cutoff) | ended ++ attested ++ disposed])
+    Enum.max([
+      max(item.created_at, world.cutoff),
+      last_ended_at || item.created_at | attested ++ disposed
+    ])
   end
 
   @doc false
@@ -856,11 +908,11 @@ defmodule Tightbeam.ExecutionMap do
     visible_assignment_ids =
       by_item |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
 
-    turns =
-      rest_visible_turns(txn, principal)
-      |> Enum.filter(&turn_has_visible_link?(&1, resolved, items_by_id))
+    turns_by_seq = rest_creation_turns(txn, principal, items)
 
-    turns_by_seq = Map.new(turns, &{&1.seq, &1})
+    {turn_dependency, turn_sessions} =
+      rest_turn_dependency(txn, principal, Map.keys(items_by_id), visible_assignment_ids)
+
     linked = retain_acyclic(items, candidate_edges(items, items_by_id, turns_by_seq, resolved))
     attests = rest_allowed_attests(txn, principal, visible_assignment_ids)
 
@@ -875,7 +927,7 @@ defmodule Tightbeam.ExecutionMap do
 
     {disposition_rows, dispositions} = rest_allowed_dispositions(txn, items_by_id)
 
-    visibility_rows = rest_visibility_rows(txn, principal, turns, wakes)
+    visibility_rows = rest_visibility_rows(txn, principal, turn_sessions, wakes)
 
     dependency_entries =
       rest_dependency_entries(
@@ -883,7 +935,6 @@ defmodule Tightbeam.ExecutionMap do
         assignments_by_id,
         visible_assignment_ids,
         attests,
-        turns,
         wakes,
         requests,
         markers,
@@ -902,8 +953,7 @@ defmodule Tightbeam.ExecutionMap do
       assignments_by_id: assignments_by_id,
       resolved: resolved,
       by_item: by_item,
-      turns_by_job_ref: index_turns(turns, & &1.job_ref),
-      turns_by_assignment: index_turns(turns, & &1.assignment_id),
+      turn_summaries: %{},
       linked: linked,
       parents: parents(items, linked),
       attests_by_assignment: Enum.group_by(attests, & &1.assignment_id),
@@ -916,7 +966,7 @@ defmodule Tightbeam.ExecutionMap do
       pending_wake_sessions: pending_wake_sessions,
       pending_wake_classes_by_session: pending_wake_classes_by_session,
       dispositions: dispositions,
-      dependency_version: dependency_version(dependency_entries)
+      dependency_version: dependency_version(dependency_entries, turn_dependency)
     }
   end
 
@@ -1004,73 +1054,139 @@ defmodule Tightbeam.ExecutionMap do
     }
   end
 
-  defp rest_visible_turns(txn, principal) do
-    {kind, id, is_admin} = detail_principal(principal)
-
-    Txn.q(
-      txn,
-      """
-      SELECT t.seq, t.assignmentId, t.jobRef, t.sessionKey, t.status,
-             t.model, t.modelContext, t.thinkingLevel, t.harness, t.endedAt,
-             MAX(COALESCE(t.endedAt, 0), COALESCE(t.startedAt, 0), t.createdAt, t.seq)
-      FROM turns AS t
-      JOIN sessions AS s ON s.sessionKey = t.sessionKey
-      WHERE (?1 = 1 OR
-             ?2 = 'session' OR
-             (?2 = 'user' AND s.ownerUserId = ?3))
-        AND (
-          EXISTS (
-            SELECT 1 FROM work_items AS wi
-            WHERE wi.id = t.jobRef AND (
-              ?1 = 1 OR
-              (?2 = 'user' AND wi.ownerUserId = ?3) OR
-              ?2 = 'session'
-            )
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM assignments AS a
-            LEFT JOIN work_items AS wi ON wi.id = a.workItemId
-            WHERE a.id = t.assignmentId AND (
-              ?1 = 1 OR
-              ?2 = 'session' OR
-              (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3))
-            )
-          )
-        )
-      ORDER BY t.seq
-      """,
-      [if(is_admin, do: 1, else: 0), kind, id]
+  @rest_turn_visibility """
+  (?3 = 1 OR
+       ?4 = 'session' OR
+       (?4 = 'user' AND s.ownerUserId = ?5))
+  AND (
+    EXISTS (
+      SELECT 1 FROM work_items AS wi
+      WHERE wi.id = t.jobRef AND (
+        ?3 = 1 OR
+        (?4 = 'user' AND wi.ownerUserId = ?5) OR
+        ?4 = 'session'
+      )
     )
-    |> Enum.map(&rest_turn_query_row/1)
+    OR EXISTS (
+      SELECT 1
+      FROM assignments AS a
+      LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+      WHERE a.id = t.assignmentId AND (
+        ?3 = 1 OR
+        ?4 = 'session' OR
+        (?4 = 'user' AND (wi.ownerUserId = ?5 OR a.openedByUser = ?5))
+      )
+    )
+  )
+  """
+
+  defp rest_creation_turns(txn, principal, items) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT t.seq, t.assignmentId, t.jobRef
+        FROM turns AS t
+        JOIN sessions AS s ON s.sessionKey = t.sessionKey
+        WHERE t.seq IN (SELECT value FROM json_each(?1)) AND (#{@rest_turn_visibility})
+        """,
+        [JSON.encode!(creation_sequences(items)), nil | turn_principal_params(principal)]
+      )
+
+    creation_turn_index(rows)
   end
 
-  defp rest_turn_query_row([
-         seq,
-         assignment_id,
-         job_ref,
-         session_key,
-         status,
-         model,
-         model_context,
-         thinking_level,
-         harness,
-         ended_at,
-         row_version
-       ]) do
-    %{
-      seq: seq,
-      assignment_id: assignment_id,
-      job_ref: job_ref,
-      session_key: session_key,
-      status: status,
-      model: model,
-      context: model_context,
-      effort: thinking_level,
-      harness: harness,
-      ended_at: ended_at,
-      row_version: row_version
-    }
+  # Work-item and assignment visibility can change after a turn ends. Keep
+  # admission on the read side, using the same original links as the turn.
+  defp rest_turn_dependency(txn, principal, item_ids, assignment_ids) do
+    if Tightbeam.ExecutionMapTurnVersions.indexed_read?(txn) do
+      indexed_turn_dependency(txn, principal, item_ids, assignment_ids)
+    else
+      unindexed_turn_dependency(txn, principal, item_ids, assignment_ids)
+    end
+  end
+
+  defp indexed_turn_dependency(txn, principal, item_ids, assignment_ids) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        WITH visible_links AS (
+          SELECT t.jobRef, t.assignmentId, t.sessionKey, t.revision
+          FROM json_each(?1) AS item
+          CROSS JOIN execution_map_turn_versions AS t ON t.jobRef = item.value
+          WHERE t.turnCount > 0
+          UNION ALL
+          SELECT t.jobRef, t.assignmentId, t.sessionKey, t.revision
+          FROM json_each(?2) AS member
+          CROSS JOIN execution_map_turn_versions AS t ON t.assignmentId = member.value
+          WHERE t.turnCount > 0 AND t.jobRef NOT IN (SELECT value FROM json_each(?1))
+        )
+        SELECT t.jobRef, t.assignmentId, t.sessionKey, t.revision
+        FROM visible_links AS t
+        JOIN sessions AS s ON s.sessionKey = t.sessionKey
+        WHERE #{@rest_turn_visibility}
+        ORDER BY t.jobRef, t.assignmentId, t.sessionKey
+        """,
+        [JSON.encode!(item_ids), JSON.encode!(assignment_ids) | turn_principal_params(principal)]
+      )
+
+    {rows, MapSet.new(rows, fn [_item, _assignment, session, _revision] -> session end)}
+  end
+
+  # Until the backfill commits its final cursor, read the same visible turn
+  # dependencies directly. Keep the read snapshot and bound the rows returned
+  # to the BEAM per query. Partial projection revisions never enter the token.
+  defp unindexed_turn_dependency(txn, principal, item_ids, assignment_ids) do
+    params = [0, nil | turn_principal_params(principal)]
+    links = {MapSet.new(item_ids), MapSet.new(assignment_ids)}
+
+    {hash, sessions} =
+      hash_turn_dependencies(txn, params, links, :crypto.hash_init(:sha256), MapSet.new())
+
+    {Base.encode16(:crypto.hash_final(hash), case: :lower), sessions}
+  end
+
+  defp hash_turn_dependencies(txn, params, {item_ids, assignment_ids} = links, hash, sessions) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT t.seq, t.jobRef, t.assignmentId, t.sessionKey,
+               MAX(COALESCE(t.endedAt, 0), COALESCE(t.startedAt, 0), t.createdAt, t.seq)
+        FROM turns AS t NOT INDEXED
+        JOIN sessions AS s ON s.sessionKey = t.sessionKey
+        WHERE t.seq > ?1 AND (#{@rest_turn_visibility})
+        ORDER BY t.seq
+        LIMIT 2048
+        """,
+        params
+      )
+
+    case rows do
+      [] ->
+        {hash, sessions}
+
+      rows ->
+        {entries, sessions} =
+          Enum.reduce(rows, {[], sessions}, fn [seq, item, assignment, key, version],
+                                               {entries, sessions} ->
+            if MapSet.member?(item_ids, item) or MapSet.member?(assignment_ids, assignment) do
+              {[[JSON.encode!([seq, key, version]), "\n"] | entries], MapSet.put(sessions, key)}
+            else
+              {entries, sessions}
+            end
+          end)
+
+        [last_seq | _] = List.last(rows)
+        hash = :crypto.hash_update(hash, Enum.reverse(entries))
+        hash_turn_dependencies(txn, List.replace_at(params, 0, last_seq), links, hash, sessions)
+    end
+  end
+
+  defp turn_principal_params(principal) do
+    {kind, id, is_admin} = detail_principal(principal)
+    [if(is_admin, do: 1, else: 0), kind, id]
   end
 
   defp turn_has_visible_link?(turn, resolved, items_by_id) do
@@ -1280,7 +1396,7 @@ defmodule Tightbeam.ExecutionMap do
     {rows, Enum.group_by(rows, & &1.job_ref)}
   end
 
-  defp rest_visibility_rows(txn, principal, turns, wakes) do
+  defp rest_visibility_rows(txn, principal, turn_sessions, wakes) do
     principal_session =
       if principal.kind == "session", do: StateResources.query_session(txn, principal.id)
 
@@ -1299,7 +1415,7 @@ defmodule Tightbeam.ExecutionMap do
     referenced_session_keys =
       if principal.kind == "user" and not principal.is_admin do
         MapSet.new(
-          Enum.map(turns, & &1.session_key) ++
+          MapSet.to_list(turn_sessions) ++
             Enum.flat_map(wakes, &[&1.session_key, &1.creator_session_key])
         )
       else
@@ -1333,7 +1449,6 @@ defmodule Tightbeam.ExecutionMap do
          assignments_by_id,
          assignment_ids,
          attests,
-         turns,
          wakes,
          requests,
          markers,
@@ -1347,7 +1462,6 @@ defmodule Tightbeam.ExecutionMap do
           ["assignments", id, Map.fetch!(assignments_by_id, id).row_version]
         end) ++
         Enum.map(attests, &["attests", &1.id, &1.row_version]) ++
-        Enum.map(turns, &["turns", &1.seq, &1.row_version]) ++
         Enum.map(wakes, &["wakes", &1.wake_id, &1.row_version]) ++
         Enum.map(requests, &["decision requests", &1.id, &1.row_version]) ++
         Enum.map(visibility_rows.sessions, &["sessions", &1.session_key, &1.row_version]) ++
@@ -1374,23 +1488,34 @@ defmodule Tightbeam.ExecutionMap do
     entries
   end
 
-  defp dependency_version(entries) do
-    entries
-    |> Enum.sort_by(fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+  defp dependency_version(entries, turn_dependency) do
+    sorted =
+      Enum.sort_by(entries, fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+
+    [sorted, turn_dependency]
     |> JSON.encode!()
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end
 
   defp execution_map_appearing(world, filters) do
-    Enum.filter(world.items, fn item ->
-      execution_map_origin_match?(item, Map.get(filters, "origin")) and
-        execution_map_exact_match?(item.owner_user_id, Map.get(filters, "ownerUserId")) and
-        execution_map_exact_match?(item.state, Map.get(filters, "state")) and
-        execution_map_spec_match?(item, filters) and
-        execution_map_exact_match?(item.created_by_session, Map.get(filters, "sessionKey")) and
-        execution_map_quiet_match?(world, item, Map.get(filters, "quietOverMs"))
-    end)
+    items =
+      Enum.filter(world.items, fn item ->
+        execution_map_origin_match?(item, Map.get(filters, "origin")) and
+          execution_map_exact_match?(item.owner_user_id, Map.get(filters, "ownerUserId")) and
+          execution_map_exact_match?(item.state, Map.get(filters, "state")) and
+          execution_map_spec_match?(item, filters) and
+          execution_map_exact_match?(item.created_by_session, Map.get(filters, "sessionKey"))
+      end)
+
+    case Map.get(filters, "quietOverMs") do
+      nil ->
+        {world, items}
+
+      bound ->
+        world = load_turn_summaries(world, items)
+        {world, Enum.filter(items, &execution_map_quiet_match?(world, &1, bound))}
+    end
   end
 
   defp execution_map_origin_match?(_item, nil), do: true
@@ -1461,6 +1586,7 @@ defmodule Tightbeam.ExecutionMap do
   end
 
   defp execution_map_forest(world, appearing) do
+    world = load_turn_summaries(world, appearing)
     appearing_ids = MapSet.new(appearing, & &1.id)
     nodes = Map.new(appearing, &{&1.id, rest_node(world, &1)})
 
@@ -1884,8 +2010,7 @@ defmodule Tightbeam.ExecutionMap do
     resolved = resolve_all(assignments, assignments_by_id)
     by_item = membership(resolved, items_by_id)
 
-    turns = all_turns(db)
-    turns_by_seq = Map.new(turns, &{&1.seq, &1})
+    turns_by_seq = creation_turns(db, items)
 
     linked = retain_acyclic(items, candidate_edges(items, items_by_id, turns_by_seq, resolved))
 
@@ -1898,8 +2023,8 @@ defmodule Tightbeam.ExecutionMap do
       assignments_by_id: assignments_by_id,
       resolved: resolved,
       by_item: by_item,
-      turns_by_job_ref: index_turns(turns, & &1.job_ref),
-      turns_by_assignment: index_turns(turns, & &1.assignment_id),
+      db: db,
+      turn_summaries: %{},
       linked: linked,
       parents: parents(items, linked),
       attests_by_assignment: attests_by_assignment(db),
@@ -2043,38 +2168,126 @@ defmodule Tightbeam.ExecutionMap do
     |> Map.new(fn {item_id, ids} -> {item_id, Enum.sort(ids)} end)
   end
 
-  defp all_turns(db) do
+  defp creation_turns(db, items) do
     {:ok, rows} =
-      DB.query(db, """
-      SELECT seq, assignmentId, jobRef, status, model, thinkingLevel, modelContext,
-             harness, endedAt
-      FROM turns
-      """)
+      DB.query(
+        db,
+        """
+        SELECT seq, assignmentId, jobRef
+        FROM turns
+        WHERE seq IN (SELECT value FROM json_each(?1))
+        """,
+        [JSON.encode!(creation_sequences(items))]
+      )
 
-    Enum.map(rows, fn [
-                        seq,
-                        assignment_id,
-                        job_ref,
-                        status,
-                        model,
-                        effort,
-                        model_context,
-                        harness,
-                        ended_at
-                      ] ->
-      %{
-        seq: seq,
-        assignment_id: assignment_id,
-        job_ref: job_ref,
-        status: status,
-        model: model,
-        context: model_context,
-        effort: effort,
-        harness: harness,
-        ended_at: ended_at
-      }
+    creation_turn_index(rows)
+  end
+
+  defp creation_sequences(items) do
+    for item <- items,
+        item.context_known,
+        is_integer(item.created_in_turn_seq),
+        uniq: true,
+        do: item.created_in_turn_seq
+  end
+
+  defp creation_turn_index(rows) do
+    Map.new(rows, fn [seq, assignment_id, job_ref] ->
+      {seq, %{assignment_id: assignment_id, job_ref: job_ref}}
     end)
   end
+
+  defp load_turn_summaries(world, items) do
+    {join, predicate, principal_params} = turn_summary_scope(world)
+
+    summaries =
+      items
+      |> Enum.reject(&Map.has_key?(world.turn_summaries, &1.id))
+      |> Enum.chunk_every(256)
+      |> Enum.reduce(world.turn_summaries, fn batch, acc ->
+        ids = Enum.map(batch, & &1.id)
+
+        assignments =
+          for id <- ids, assignment_id <- Map.get(world.by_item, id, []), do: [id, assignment_id]
+
+        rows =
+          query_turn_summaries(
+            world,
+            """
+            WITH attributed AS (
+              SELECT item.value AS item_id, t.status, t.endedAt,
+                     t.model, t.modelContext, t.thinkingLevel, t.harness,
+                     printf('0:%020d', t.seq) AS attribution_order
+              FROM json_each(?1) AS item
+              CROSS JOIN turns AS t ON t.jobRef = item.value
+              #{join}
+              WHERE #{predicate}
+              UNION ALL
+              SELECT json_extract(member.value, '$[0]'), t.status, t.endedAt,
+                     t.model, t.modelContext, t.thinkingLevel, t.harness,
+                     printf('1:%s:%020d', t.assignmentId, t.seq)
+              FROM json_each(?2) AS member
+              CROSS JOIN turns AS t ON t.assignmentId = json_extract(member.value, '$[1]')
+              #{join}
+              WHERE t.jobRef IS NOT json_extract(member.value, '$[0]')
+                AND (#{predicate})
+            )
+            SELECT item_id, COUNT(*), MAX(endedAt), MAX(status IS 'running'),
+                   model, modelContext, thinkingLevel, harness
+            FROM attributed
+            GROUP BY item_id, model, modelContext, thinkingLevel, harness
+            ORDER BY MIN(attribution_order)
+            """,
+            [JSON.encode!(ids), JSON.encode!(assignments) | principal_params]
+          )
+
+        acc = Enum.reduce(ids, acc, &Map.put(&2, &1, @empty_turn_summary))
+        Enum.reduce(rows, acc, &merge_turn_summary/2)
+      end)
+
+    %{world | turn_summaries: summaries}
+  end
+
+  defp turn_summary_scope(%{principal: principal}) do
+    {"JOIN sessions AS s ON s.sessionKey = t.sessionKey", @rest_turn_visibility,
+     turn_principal_params(principal)}
+  end
+
+  defp turn_summary_scope(_world), do: {"", "1", []}
+
+  defp query_turn_summaries(%{txn: txn}, sql, params), do: Txn.q(txn, sql, params)
+
+  defp query_turn_summaries(%{db: db}, sql, params) do
+    {:ok, rows} = DB.query(db, sql, params)
+    rows
+  end
+
+  # A turn with both links to the same item contributes once. If the two links
+  # resolve to different items, it contributes once to each of those items.
+  defp merge_turn_summary(
+         [id, count, ended_at, running, model, context, effort, harness],
+         summaries
+       ) do
+    summary = Map.get(summaries, id, @empty_turn_summary)
+
+    minds =
+      if is_nil(model) and is_nil(harness) do
+        summary.minds
+      else
+        [%{model: model, context: context, effort: effort, harness: harness} | summary.minds]
+      end
+
+    Map.put(summaries, id, %{
+      total: summary.total + count,
+      last_ended_at: latest_turn_end(summary.last_ended_at, ended_at),
+      running: summary.running or running == 1,
+      minds: minds
+    })
+  end
+
+  defp latest_turn_end(nil, right), do: right
+  defp latest_turn_end(left, nil), do: left
+  defp latest_turn_end(left, right), do: max(left, right)
 
   defp attests_by_assignment(db) do
     {:ok, rows} =
@@ -2150,12 +2363,6 @@ defmodule Tightbeam.ExecutionMap do
          %{seq: seq, at: at, to_state: to_state}
        end)}
     end)
-  end
-
-  defp index_turns(turns, key) do
-    turns
-    |> Enum.reject(&is_nil(key.(&1)))
-    |> Enum.group_by(key)
   end
 
   defp session_owners(db) do
