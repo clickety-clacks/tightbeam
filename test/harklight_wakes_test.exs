@@ -1378,6 +1378,19 @@ defmodule Tightbeam.HarklightWakesTest do
                end
              )
 
+    for {status, token} <- [{2, "ambiguous_message_id"}, {5, "unsupported"}] do
+      assert %{outcome: "refused", code: ^token} =
+               HarklightSend.change_request(db, call, "revise",
+                 runner: fn ["message-get", "--item-id", "opaque-item"] ->
+                   {JSON.encode!(%{
+                      "kind" => "refused",
+                      "operation" => "message-get",
+                      "error" => token
+                    }), status}
+                 end
+               )
+    end
+
     wrong_session = put_in(call.params[:handle], "5365335c-b23c-4f66-8248-2c6f3bd7c03f")
 
     assert %{outcome: "refused", code: "harklight_session_mismatch"} =
