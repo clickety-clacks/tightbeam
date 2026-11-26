@@ -1,6 +1,8 @@
 defmodule Tightbeam.ExecutionMapTurnVersionsTest do
   use Tightbeam.TestCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Tightbeam.{DB, ExecutionMapTurnVersions, Ledger}
   alias Tightbeam.DB.Txn
 
@@ -41,6 +43,63 @@ defmodule Tightbeam.ExecutionMapTurnVersionsTest do
 
     assert :ok = ExecutionMapTurnVersions.backfill(db)
     assert [["wi_moved", 2], ["wi_new", 1], ["wi_old", 4996]] == groups(db)
+  end
+
+  test "a supervised backfill survives repeated overload and finishes after recovery" do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Ledger.ensure_schema(db)
+
+    assert {:ok, _} =
+             DB.query(db, """
+             INSERT INTO turns (sessionKey, messageId, origin, prompt, jobRef, createdAt)
+             VALUES ('source', 'historical-turn', 'process:test', '', 'wi_old', 1)
+             """)
+
+    assert :ok = ExecutionMapTurnVersions.ensure_schema(db)
+    refute ready?(db)
+    :sys.suspend(db)
+
+    {supervisor, worker, monitor} =
+      try do
+        for _ <- 1..128 do
+          send(db, {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}})
+        end
+
+        {worker_state, log} =
+          with_log(
+            [level: :debug],
+            fn ->
+              supervisor =
+                start_supervised!(%{
+                  id: :backfill_supervisor,
+                  start:
+                    {Supervisor, :start_link,
+                     [[{ExecutionMapTurnVersions, db}], [strategy: :one_for_one, max_restarts: 0]]},
+                  type: :supervisor
+                })
+
+              assert [{ExecutionMapTurnVersions, worker, :worker, _}] =
+                       Supervisor.which_children(supervisor)
+
+              monitor = Process.monitor(worker)
+              refute_receive {:DOWN, ^monitor, :process, ^worker, _}, 750
+              assert Process.alive?(supervisor)
+              assert {:message_queue_len, 128} = Process.info(db, :message_queue_len)
+              {supervisor, worker, monitor}
+            end
+          )
+
+        assert length(Regex.scan(~r/background pass deferred/, log)) >= 2
+        worker_state
+      after
+        :sys.resume(db)
+      end
+
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 5_000
+    assert Process.alive?(supervisor)
+    assert [] == Supervisor.which_children(supervisor)
+    assert ready?(db)
+    assert [["wi_old", 1]] == groups(db)
   end
 
   defp ready?(db) do

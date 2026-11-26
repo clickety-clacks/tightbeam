@@ -113,10 +113,26 @@ defmodule Tightbeam.ExecutionMapTurnVersions do
     ready == 1
   end
 
-  def backfill(db) do
-    case backfill_batch(db) do
-      :more -> backfill(db)
-      :done -> :ok
+  def child_spec(db) do
+    Supervisor.child_spec({Task, fn -> backfill(db) end},
+      id: __MODULE__,
+      restart: :temporary
+    )
+  end
+
+  def backfill(db), do: backfill(db, 250)
+
+  defp backfill(db, delay_ms) do
+    case DB.background_pass(fn -> backfill_batch(db) end, :overloaded) do
+      :more ->
+        backfill(db)
+
+      :done ->
+        :ok
+
+      :overloaded ->
+        Process.sleep(delay_ms)
+        backfill(db, min(delay_ms * 2, 5_000))
     end
   end
 

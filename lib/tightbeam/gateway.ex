@@ -421,11 +421,7 @@ defmodule Tightbeam.Gateway do
            plug: {Tightbeam.Wire.Router, router_deps},
            port: config.port
          ),
-         Supervisor.child_spec(
-           {Task, fn -> Tightbeam.ExecutionMapTurnVersions.backfill(db) end},
-           id: Tightbeam.ExecutionMapTurnVersions,
-           restart: :transient
-         )
+         {Tightbeam.ExecutionMapTurnVersions, db}
        ])
     |> Enum.reject(&is_nil/1)
   end
