@@ -323,6 +323,7 @@ jobs:
       - name: Smoke the assembled gateway package
         run: |
           for package in _build/npm/tightbeam-*.tgz; do
+            sh packaging/verify-setup-build.sh "$package" "$CI_SOURCE_SHA" || exit
             python3 packaging/gateway-smoke.py "$package" || exit
           done
 
