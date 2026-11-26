@@ -301,7 +301,7 @@ defmodule Tightbeam.Wire.Router do
       "version" => Tightbeam.CliCompatibility.required_version(),
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
-      "features" => ["stale-turn-settlement-v1"],
+      "features" => ["stale-turn-settlement-v1", "transcript-filters-v1"],
       "adapters" => snapshot.adapters,
       "adaptersAsOf" => snapshot.as_of,
       "diagnostics" => diagnostic_health(),
@@ -4069,9 +4069,6 @@ defmodule Tightbeam.Wire.Router do
         not is_list(attachments) or not Enum.all?(attachments, &rest_post_attachment?/1) ->
         {:error, 400, "invalid_message", nil}
 
-      byte_size(content) > 64 * 1024 ->
-        {:error, 400, "payload_too_large", nil}
-
       true ->
         post_params = %{
           client_message_id: id,
@@ -4863,7 +4860,7 @@ defmodule Tightbeam.Wire.Router do
     "decision-requests" => ~w(status)a,
     "dispatch" =>
       ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id parent_assignment_id work_item_id workdir_root owner_user_id)a,
-    "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
+    "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over limit after)a,
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
     "facts-read" => ~w(after kind limit scope)a,
@@ -4938,7 +4935,7 @@ defmodule Tightbeam.Wire.Router do
     "subtree-guidance-withdraw" => ~w(name)a,
     "topline" => ~w(history origin owner quiet_over session spec spec_sha state topline_id)a,
     "toplines" => ~w(origin owner quiet_over session spec spec_sha state)a,
-    "transcript" => ~w(after before limit name session_key)a,
+    "transcript" => ~w(after before limit name session_key roles no_notices since)a,
     "tune" =>
       ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
     "unlearn" => ~w(idempotency_key name)a,

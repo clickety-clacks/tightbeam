@@ -572,6 +572,15 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:tune_session_loaded, sid, model, cwd, mcp_servers, guidance})
       {:reply, Keyword.get(opts, :load_result, {:ok, model}), state}
     end
+
+    def handle_call(
+          {:new_candidate_session, model, _cwd, _mcp, _guidance},
+          _from,
+          {parent, _opts} = state
+        ) do
+      send(parent, {:tune_session_created, model})
+      {:reply, {:ok, "replacement-session"}, state}
+    end
   end
 
   defmodule FastTuneAdapterStub do
@@ -6238,7 +6247,10 @@ defmodule Tightbeam.GatewayTest do
     assert JSON.decode!(rest.resp_body)["item"] == harness_changed
 
     assert_receive {:candidate_guidance, "candidate-1", guidance}
-    assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50"
+
+    assert guidance =~
+             "tightbeam transcript --session \"swapme\" --limit 50 --no-notices --format text"
+
     assert guidance =~ "Do not replay or inject earlier messages"
     assert guidance =~ "Cross-harness handoff from durable session records"
     assert guidance =~ "REPLAY_SENTINEL_ONE"
@@ -8811,6 +8823,127 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert %Model{family: "claude-sonnet-4-6"} = Org.get(ctx.db, "k1").model
+  end
+
+  test "a spawned Claude session can be tuned before its first prompt", ctx do
+    opts = [resident: true, switch_result: {:error, :fork_requires_prompted_session}]
+    config = claude_tune_fixture(ctx, "spawn-engine", opts)
+
+    assert %{ok: true, requested: %{model: "claude-sonnet-4-6"}, applies: "now"} =
+             tune_claude_fixture(config)
+
+    assert_receive {:tune_session_created, %Model{family: "claude-sonnet-4-6"}}
+    assert_receive {:tune_session_closed, "spawn-engine"}
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "replacement-session"
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+  end
+
+  test "a cold Claude tune after a harness swap saves the selection when the transcript is absent",
+       ctx do
+    Org.set_harness(ctx.db, "k1", "codex", "openai", Model.new("gpt-5.6-sol"))
+    Org.append_pointer(ctx.db, "k1", "other-harness-engine", "created")
+
+    Org.set_harness(
+      ctx.db,
+      "k1",
+      "claude",
+      "anthropic",
+      Model.new("claude-sonnet-4-6", effort: "high")
+    )
+
+    missing = %{"code" => -32002, "message" => "Resource not found"}
+    diagnostic = Tightbeam.ErrorDiagnostic.from_reason(missing, operation: "session/load")
+    reason = Tightbeam.ErrorDiagnostic.diagnosed(missing, diagnostic)
+
+    config =
+      claude_tune_fixture(ctx, "post-swap-engine", resident: false, load_result: {:error, reason})
+
+    before = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: true, applies: "next_turn", projection_committed: true} =
+             tune_claude_fixture(config, %{setting: "set_reasoning", reasoningLevel: "medium"})
+
+    assert_receive {:tune_session_loaded, "post-swap-engine",
+                    %Model{family: "claude-sonnet-4-6", effort: "medium"}, _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.effort == "medium"
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
+  test "a cold Claude tune reloads a persisted conversation with the requested model", ctx do
+    config = claude_tune_fixture(ctx, "persisted-engine", resident: false)
+    before = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: true, applies: "now", engine_context: "preserved"} = tune_claude_fixture(config)
+
+    assert_receive {:tune_session_loaded, "persisted-engine", %Model{family: "claude-sonnet-4-6"},
+                    _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
+  for {label, load_error, origin} <- [
+        {"timeout", :timeout, "acp_transport"},
+        {"transport close", :closed, "acp_transport"},
+        {"JSON-RPC error", %{"code" => -32603, "message" => "Internal error"}, "acp_adapter"}
+      ] do
+    test "a Claude tune load #{label} leaves the conversation and stored selection intact", ctx do
+      reason = unquote(Macro.escape(load_error))
+
+      diagnostic =
+        Tightbeam.ErrorDiagnostic.from_reason(reason,
+          operation: "session/load",
+          origin: unquote(origin)
+        )
+
+      failure = Tightbeam.ErrorDiagnostic.diagnosed(reason, diagnostic)
+      sid = "existing-engine"
+
+      config = claude_tune_fixture(ctx, sid, resident: false, load_result: {:error, failure})
+      pointer = Org.current_pointer(ctx.db, "k1")
+      model = Org.get(ctx.db, "k1").model
+
+      assert %{
+               ok: false,
+               code: "model_apply_failed",
+               diagnostic: %{"operation" => "session/load"}
+             } =
+               tune_claude_fixture(config)
+
+      assert_receive {:tune_session_loaded, ^sid, %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp,
+                      _guidance}
+
+      assert Org.current_pointer(ctx.db, "k1") == pointer
+      assert Org.get(ctx.db, "k1").model == model
+      refute_received {:tune_session_created, _}
+      refute_received {:tune_session_closed, _}
+    end
+  end
+
+  defp claude_tune_fixture(ctx, sid, opts) do
+    base_dir = role_test_base(sid)
+    Archetypes.load!(base_dir)
+    host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", sid, "created")
+    start_lane!(ctx.db, "k1")
+    adapter = start_supervised!({TuneAdapterStub, {self(), opts}})
+    start_supervised!({CoordinatorStub, adapter})
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    gateway_config(base_dir, ctx.db, 0)
+  end
+
+  defp tune_claude_fixture(config, params \\ %{setting: "set_model", model: "claude-sonnet-4-6"}) do
+    Gateway.handlers(config)["tune"].(%{
+      origin: "user:flynn",
+      session_key: "k1",
+      params: params
+    })
   end
 
   test "initial set_model reports the harness selection when it differs from the request", ctx do
@@ -11877,7 +12010,10 @@ defmodule Tightbeam.GatewayTest do
     home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     assert_receive {:candidate_guidance, "candidate-1", guidance}
     assert guidance =~ "Codex developer message"
-    assert guidance =~ "tightbeam transcript --session \"k1\" --limit 50"
+
+    assert guidance =~
+             "tightbeam transcript --session \"k1\" --limit 50 --no-notices --format text"
+
     refute File.exists?(Path.join(home, "AGENTS.md"))
 
     assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
@@ -11986,13 +12122,9 @@ defmodule Tightbeam.GatewayTest do
     assert rest_post(ctx, "tbc_test", put_in(body, [:params, :clientMessageId], "bad")).status ==
              400
 
-    oversized =
-      rest_post(ctx, "tbc_test", put_in(body, [:params, :content], String.duplicate("x", 65_537)))
-
-    assert oversized.status == 400
-
-    assert %{"error" => %{"code" => "payload_too_large"}} =
-             JSON.decode!(oversized.resp_body)
+    invalid = rest_post(ctx, "tbc_test", put_in(body, [:params, :content], 123))
+    assert invalid.status == 400
+    assert %{"error" => %{"code" => "invalid_message"}} = JSON.decode!(invalid.resp_body)
 
     :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='k1'")
     retired = rest_post(ctx, "tbc_test", body)
@@ -12000,6 +12132,40 @@ defmodule Tightbeam.GatewayTest do
     assert %{"error" => %{"code" => "not_deliverable"}} = JSON.decode!(retired.resp_body)
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "REST human post preserves large decoded prompts and stable retry receipts", ctx do
+    for {content, index} <-
+          Enum.with_index([
+            String.duplicate("x", 65_535),
+            String.duplicate("x", 65_536),
+            String.duplicate("x", 65_537),
+            String.duplicate("é", 40_000),
+            String.duplicate("\"\n\u0001", 30_000),
+            String.duplicate("x", 3_000_000)
+          ]) do
+      body = %{
+        verb: "post",
+        asUser: "flynn",
+        sessionKey: "k1",
+        params: %{clientMessageId: "c_large_#{index}", deviceId: "chat_test", content: content}
+      }
+
+      response = rest_post(ctx, "tbc_test", body)
+      assert response.status == 200
+      receipt = JSON.decode!(response.resp_body)["result"]
+      assert receipt["outcome"] == "recorded"
+      assert Projection.get(ctx.db, receipt["messageId"]).content == content
+      duplicate = rest_post(ctx, "tbc_test", body)
+      assert duplicate.status == 200
+
+      assert JSON.decode!(duplicate.resp_body)["result"] ==
+               receipt
+               |> Map.delete("ack")
+               |> Map.merge(%{"outcome" => "duplicate", "dedupe" => "duplicate"})
+    end
+
+    assert {:ok, [[6]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
   end
 
   test "REST human post refuses session tokens and requires org user attribution", ctx do
@@ -16070,6 +16236,7 @@ defmodule Tightbeam.GatewayTest do
   test "REST post carries submitter through the parser into history and the model prompt", ctx do
     ensure_global_registry()
     owner = ctx.device.user_id
+    content = String.duplicate("hello é\n", 10_000)
     submitter = %{"identity" => nil, "displayName" => "Avery"}
 
     response =
@@ -16080,7 +16247,7 @@ defmodule Tightbeam.GatewayTest do
         params: %{
           clientMessageId: "c_rest_submitter",
           deviceId: "chat_submitter",
-          content: "hello",
+          content: content,
           attachments: [],
           submitter: submitter
         }
@@ -16093,13 +16260,15 @@ defmodule Tightbeam.GatewayTest do
 
     message_id = rest_post_message_id!(ctx.db, "k1", "chat_submitter", "c_rest_submitter")
 
-    assert %{content: "hello", submitter: ^submitter, sender: "user:" <> ^owner} =
+    assert %{content: ^content, submitter: ^submitter, sender: "user:" <> ^owner} =
              Projection.get(ctx.db, message_id)
 
     assert %{"submitter" => ^submitter} =
              ctx.db |> StateResources.query_message(message_id) |> StateResources.message()
 
-    assert {:ok, [["[from Avery]\n\nhello"]]} =
+    prompt = "[from Avery]\n\n" <> content
+
+    assert {:ok, [[^prompt]]} =
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE messageId=?1", [message_id])
   end
 
@@ -16126,7 +16295,7 @@ defmodule Tightbeam.GatewayTest do
       params: %{
         clientMessageId: "c_rest_attachment",
         deviceId: "chat_test",
-        content: "open sample.zip",
+        content: String.duplicate("open sample.zip\n", 8_000),
         attachments: [attachment]
       }
     }
@@ -16152,7 +16321,7 @@ defmodule Tightbeam.GatewayTest do
     message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", "c_rest_attachment")
     assert receipt_message_id == message_id
     raw = Projection.get(ctx.db, message_id)
-    assert raw.content == "open sample.zip"
+    assert raw.content == String.duplicate("open sample.zip\n", 8_000)
     assert raw.sender == "user:#{owner}"
     assert raw.attachments == [attachment]
 
