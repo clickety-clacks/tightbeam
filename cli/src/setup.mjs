@@ -120,10 +120,10 @@ function service(kind, mode) {
     remove() {
       if (mac) {
         if (this.active()) execute('launchctl', ['bootout', `${domain}/${label}`]);
-        fs.rmSync(file, { force: true });
+        execute('rm', ['-f', file]);
       } else {
-        execute('systemctl', [...systemctl, 'disable', '--now', linuxName]);
-        fs.rmSync(file, { force: true });
+        if (this.active() || this.enabled()) execute('systemctl', [...systemctl, 'disable', '--now', linuxName]);
+        execute('rm', ['-f', file]);
         execute('systemctl', [...systemctl, 'daemon-reload']);
       }
     },
@@ -214,7 +214,7 @@ async function installChat(scratch) {
       fs.rmSync(staging, { recursive: true, force: true });
     }
   }
-  fs.symlinkSync(destination, chatCurrent);
+  selectLink(chatCurrent, destination);
 }
 
 function linkTarget(link) {
@@ -370,7 +370,7 @@ async function setup() {
     if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error('Choose a valid gateway port.');
     const localOrigin = `http://127.0.0.1:${port}`;
     const advertised = mode === 'quick' ? localOrigin
-      : env.TIGHTBEAM_ADVERTISED_URL ?? receipt?.advertised ?? localOrigin;
+      : env.TIGHTBEAM_ADVERTISED_URL ?? (receipt?.mode === 'full' ? receipt.advertised : undefined) ?? localOrigin;
     const chatOrigin = new URL(advertised.replace(/^ws/, 'http')).origin;
     const version = run(cli, ['--version'], { stdio: 'pipe' }).trim();
     const upgrade = receipt?.mode === 'quick' && mode === 'full';
@@ -380,7 +380,10 @@ async function setup() {
     const payload = path.resolve(path.dirname(cli), '..');
     const release = jsonFile(path.join(payload, 'setup-build.json'));
     const tag = release?.tag;
-    const stage = mode === 'full' && (receipt?.mode !== 'full' || receipt.tag !== tag ||
+    if (receipt?.mode === 'full' && receipt.tag && receipt.tag !== tag) {
+      throw new Error('Use the Tightbeam release upgrade procedure to back up and upgrade an existing full installation.');
+    }
+    const stage = mode === 'full' && (receipt?.mode !== 'full' ||
       !fs.existsSync(path.join(root, 'current/tightbeam/bin/tightbeam-gateway')));
     const credentials = path.join(base, 'setup-device-token');
     const needsPair = !fs.existsSync(credentials);
@@ -431,15 +434,19 @@ async function setup() {
     const writeChat = chatConfigChanged || !fs.existsSync(chat.file) || receipt?.chatOrigin !== chatOrigin;
     const startChat = !chatActive || !chat.enabled();
     const providers = providerActions(host);
-    const pending = providers.filter(({ needed }) => needed);
+    const withoutKeys = providers.filter(({ provider, key, needed }) => needed && !env[key] &&
+      (provider === 'cursor' || (provider === 'opencode-go' && !env.TIGHTBEAM_CREDENTIALS_DIRECTORY)));
+    const pending = providers.filter(({ needed }) => needed).filter((provider) => !withoutKeys.includes(provider));
     const needsFirstRun = env.TIGHTBEAM_FIRST_RUN_ONBOARDING === 'true' &&
       !fs.existsSync(path.join(base, 'first-run-onboarding.done')) &&
       /^  onboard --first-run$/m.test(command(cli, ['help', 'onboard'], { cwd: home }).stdout ?? '');
     const bwrap = available('bwrap');
     const canBubblewrap = () => command(bwrap, ['--unshare-net', '--ro-bind', '/', '/', '/bin/true']).status === 0;
     const readSysctl = (key) => command('sysctl', ['-n', key]).stdout?.trim();
-    const checkNamespaces = !mac && mode === 'full' && providers.some(({ provider }) => provider === 'openai');
-    const namespaceFix = checkNamespaces && bwrap && !canBubblewrap();
+    const checkNamespaces = !mac && providers.some(({ provider }) => provider === 'openai');
+    const sandboxUnavailable = checkNamespaces && (!bwrap || !canBubblewrap());
+    const namespaceFix = mode === 'full' && sandboxUnavailable && bwrap;
+    const readiness = !receipt?.ready && !needsFirstRun;
     const appArmor = namespaceFix && readSysctl('kernel.apparmor_restrict_unprivileged_userns') === '1';
     const sysctlKey = namespaceFix && [
       'kernel.unprivileged_userns_clone', 'user.max_user_namespaces',
@@ -451,35 +458,36 @@ async function setup() {
     if (!['darwin', 'linux'].includes(process.platform)) missing.push('a supported operating system');
     if (Number(process.versions.node.split('.')[0]) < 24) missing.push('Node.js 24 or later');
     if (mode === 'full' && !available('sudo')) missing.push('sudo');
-    if (checkNamespaces && !bwrap) missing.push('bubblewrap');
     if (!(stage || stageQuick) && !fs.existsSync(binary)) missing.push('the bundled tightbeam-gateway binary');
     if (!mac && command('systemctl', ['--user', 'show-environment']).status !== 0) missing.push('a running systemd user manager');
     if (mac && command('launchctl', ['print', `gui/${account.uid}`]).status !== 0) missing.push('a logged-in macOS desktop session');
-    add(missing.length, `Missing prerequisites: ${missing.join(', ')}.`);
+    if (missing.length) throw new Error(`Install the missing prerequisites and run setup again: ${missing.join(', ')}.`);
     add(stageQuick, 'Copy the verified Tightbeam package to a stable location in your home directory.');
     add(stage, 'Verify and stage the Tightbeam release under /opt/tightbeam and select it for the system service.');
     add(appArmor, 'Grant bubblewrap access to user namespaces through its AppArmor profile.');
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
-    add(namespaceFix && !appArmor && !sysctlKey, 'Check why the Codex sandbox cannot start on this Linux machine.');
+    add(sandboxUnavailable && !appArmor && !sysctlKey, mode === 'quick'
+      ? 'Codex cannot use its sandbox here. Use full mode to repair it, or use Claude or Pi.'
+      : 'Codex cannot use its sandbox here. Claude and Pi can run if configured.');
     add(upgrade, `Replace the user gateway service with a system service while keeping all data in ${base}.`);
     add(writeGateway || startGateway, mode === 'quick'
-      ? 'Start Tightbeam as a local-only user service with lighter isolation than full mode.'
-      : 'Start Tightbeam as a system service that runs your agents under your ordinary user account.');
+      ? 'Start a local-only Tightbeam user service with lighter isolation that can stop when you sign out.'
+      : `Start the Tightbeam system service under your ordinary user account, advertising ${chatOrigin}.`);
     add(linkCli, `Expose the Tightbeam command at ${commandLink}.`);
     add(needsPair, `Pair this computer and create the first Tightbeam administrator for ${account.username}.`);
     for (const { provider } of pending) add(true, `Set up your ${provider} credential for agent turns.`);
+    for (const { provider, key } of withoutKeys) add(true, `Skip ${provider} credential setup until you provide ${key}.`);
     add(needsMain, 'Create your main Tightbeam conversation.');
     add(installChatPackage, 'Download and verify the published Tightbeam Chat package.');
-    add(writeChat || startChat, 'Start Tightbeam Chat on this machine as a user service.');
+    add(writeChat || startChat, 'Start local Tightbeam Chat as a user service that can stop when you sign out.');
+    add(readiness, 'Ask your main agent for a short reply to verify it can run a turn.');
     add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
     for (const line of install) console.log(`- ${line}`);
-    if (flags.dryRun) return;
+    if (flags.dryRun || !install.length) return;
     if (!flags.yes && await ask(answers, 'Install yes or no') !== 'yes') return;
     reader.close();
     process.stdin.pause();
 
-    if (missing.length) throw new Error(`Install the missing prerequisites and run setup again: ${missing.join(', ')}.`);
-    if (!install.length) return;
     if ((stage || stageQuick) && (!/^v[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$/.test(tag ?? '') ||
         !/^[0-9a-f]{40}$/.test(release?.commit ?? ''))) {
       throw new Error('Setup needs the complete, verified Tightbeam release package.');
@@ -505,7 +513,7 @@ async function setup() {
         const profile = '/etc/apparmor.d/bwrap';
         if (fs.existsSync(profile)) throw new Error(`The existing ${profile} needs attention before the Codex sandbox can start.`);
         const source = path.join(scratch, 'bwrap');
-        fs.writeFileSync(source, 'abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n');
+        fs.writeFileSync(source, `abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap ${JSON.stringify(bwrap)} flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n`);
         run('sudo', ['apparmor_parser', '-Q', source]);
         run('sudo', ['install', '-m', '0644', source, profile]);
         run('sudo', ['apparmor_parser', '-r', profile]);
@@ -517,7 +525,9 @@ async function setup() {
         run('sudo', ['install', '-m', '0644', source, conf]);
         run('sudo', ['sysctl', '-p', conf]);
       }
-      if (checkNamespaces && !canBubblewrap()) throw new Error('The Linux Codex sandbox still cannot create a user namespace.');
+      if (namespaceFix && !canBubblewrap()) {
+        console.error('The Codex sandbox still cannot create a user namespace. Claude and Pi can run if configured.');
+      }
       if (stageQuick) installQuick(payload, release);
       if (stage) await stageGateway(scratch, release, () => {
         if (upgrade) {
@@ -536,6 +546,7 @@ async function setup() {
       }, 'The gateway did not become ready. Check the service log and run setup again.');
       Object.assign(state, { mode, version, advertised, tag });
       save();
+      removedQuick = false;
 
       if (linkCli) {
         selectLink(commandLink, targetCli);
@@ -587,15 +598,45 @@ async function setup() {
         const target = await getJson(`${chatUrl}/chat-config.json`);
         return target?.sessionKey === state.main && target?.gateway === chatOrigin;
       }, 'Chat did not serve the installed Main conversation. Check its service log.');
-      console.log('Tightbeam Chat is ready at http://127.0.0.1:4178');
+      console.log(`Tightbeam Chat is available at ${chatUrl}`);
+      if (readiness) {
+        const credential = fs.readFileSync(credentials, 'utf8');
+        if (!state.readinessWake) {
+          const wake = run(cli, ['wake', '--session', state.main, '--as-user', state.admin,
+            '--prompt', 'Reply briefly to confirm that this Tightbeam installation can run a turn.'],
+          { cwd: home, stdio: 'pipe' });
+          state.readinessWake = JSON.parse(wake).wakeId;
+          if (!state.readinessWake) throw new Error('The gateway did not queue the setup readiness turn.');
+          save();
+        }
+        const turnUrl = `${localOrigin}/api/sessions/${encodeURIComponent(state.main)}/turns?limit=20&tail=true`;
+        await waitFor(async () => {
+          const history = await getJson(turnUrl, credential);
+          const turn = history?.items?.find(({ wakeId }) => wakeId === state.readinessWake);
+          if (turn?.status === 'delivered') return true;
+          if (['failed', 'failed_unknown', 'canceled'].includes(turn?.status)) {
+            delete state.readinessWake;
+            save();
+            throw new Error('Main could not finish a turn. Check its credential and model in Chat, then rerun setup.');
+          }
+        }, 'The readiness turn is still pending. Check Main in Chat and rerun setup to verify it.');
+        state.ready = true;
+        save();
+        console.log('Main completed a turn. Open Chat to talk with Main and ask about Uncle Enzo.');
+      }
       if (needsFirstRun) {
         run(targetCli, ['onboard', '--first-run'], {
           cwd: home, env: { ...env, TIGHTBEAM_CHAT_URL: chatUrl, CHAT_PUBLIC_ORIGIN: chatUrl },
         });
       }
     } catch (error) {
-      if (removedQuick && !gateway.active() && state.gatewayFile) {
-        quickGateway.install(state.gatewayFile, scratch, false);
+      if (removedQuick && state.gatewayFile) {
+        try {
+          if (fs.existsSync(gateway.file) || gateway.active()) gateway.remove();
+          quickGateway.install(state.gatewayFile, scratch, false);
+        } catch (rollback) {
+          throw new Error(`${error.message} The quick service could not be restored: ${rollback.message}`);
+        }
       }
       throw error;
     } finally {
