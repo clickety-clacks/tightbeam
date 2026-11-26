@@ -5,6 +5,7 @@ defmodule Tightbeam.RowReactions.Expression do
   @binary ~w(eq ne gt gte lt lte in add)
   @unary ~w(not is_null count first unique json sha256)
   @variadic ~w(and or coalesce concat)
+  @subtree_binary ~w(contains)
 
   def validate!(value)
       when is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value),
@@ -31,8 +32,12 @@ defmodule Tightbeam.RowReactions.Expression do
   end
 
   def validate!(%{"op" => op, "args" => args} = value) do
+    # `contains` exists only while role-scoped rules are switched on.
+    if op in @subtree_binary and not Tightbeam.SubtreeRules.enabled?(),
+      do: raise(ArgumentError, "unsupported reaction operation or arity: #{inspect(op)}")
+
     unless map_size(value) == 2 and is_list(args) and
-             ((op in @binary and length(args) == 2) or
+             ((op in (@binary ++ @subtree_binary) and length(args) == 2) or
                 (op in @unary and length(args) == 1) or
                 (op in @variadic and args != []) or (op == "if" and length(args) == 3)),
            do: raise(ArgumentError, "unsupported reaction operation or arity: #{inspect(op)}")
@@ -99,6 +104,7 @@ defmodule Tightbeam.RowReactions.Expression do
   defp apply_operation("lte", [a, b]) when is_number(a) and is_number(b), do: a <= b
   defp apply_operation("add", [a, b]) when is_number(a) and is_number(b), do: a + b
   defp apply_operation("in", [a, b]) when is_list(b), do: a in b
+  defp apply_operation("contains", [a, b]), do: Tightbeam.SubtreeRules.contains?(a, b)
   defp apply_operation("not", [a]) when is_boolean(a), do: not a
   defp apply_operation("is_null", [a]), do: is_nil(a)
   defp apply_operation("count", [a]) when is_list(a), do: length(a)

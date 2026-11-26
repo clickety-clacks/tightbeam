@@ -13,7 +13,10 @@ defmodule Tightbeam.Rules do
   A nil fact never satisfies any operator, including `ne` and `not_in`.
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
   for a caller holding no roles, and `assignment.verdicts not_in
-  ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
+  ["reviewed-clean"]` fires for an assignment with no verdicts. With the
+  `subtree_rules` switch on, `contains` is also accepted on text and list
+  facts: it holds when any item contains any of the given texts, ignoring
+  case, as plain text (no patterns). List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
   `assignment.qualifying_review_verdict_kinds`,
@@ -239,6 +242,8 @@ defmodule Tightbeam.Rules do
     "verifier.holder_is_other" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
+  # Admitted only while role-scoped rules are switched on.
+  @subtree_operators ~w(contains)
   @predicate_binding_keys ~w(
     workItemId assignmentId decisionRequestId artifact
     conditionKind conditionScope conditionAfterId conditionFactId
@@ -2862,9 +2867,21 @@ defmodule Tightbeam.Rules do
     type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
-    unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+
+    unless op in @operators or (op in @subtree_operators and Tightbeam.SubtreeRules.enabled?()),
+      do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+
     validate_value!(type, op, value, index, fail)
     %{fact: fact, op: op, value: value}
+  end
+
+  defp validate_value!(type, "contains", value, index, fail) do
+    unless type in [:string, {:list, :string}],
+      do: fail.("condition ##{index} operator contains is invalid for #{inspect(type)}")
+
+    unless (is_binary(value) or (is_list(value) and value != [])) and
+             Enum.all?(List.wrap(value), &(is_binary(&1) and &1 != "")),
+           do: fail.("condition ##{index} value must be nonempty text or a non-empty list of it")
   end
 
   defp validate_value!({:list, :string}, op, value, index, fail) do
@@ -4873,6 +4890,8 @@ defmodule Tightbeam.Rules do
   defp compare(left, "gte", right), do: left >= right
   defp compare(left, "lt", right), do: left < right
   defp compare(left, "lte", right), do: left <= right
+
+  defp compare(left, "contains", right), do: Tightbeam.SubtreeRules.contains?(left, right)
 
   defp compare(left, "in", right) when is_list(left),
     do: not MapSet.disjoint?(MapSet.new(left), MapSet.new(right))

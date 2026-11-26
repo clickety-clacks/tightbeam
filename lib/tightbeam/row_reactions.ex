@@ -374,7 +374,12 @@ defmodule Tightbeam.RowReactions do
   end
 
   def admit(txn, event) do
-    facts = event_scope_facts(event, Snapshot.current(txn, event, %{}))
+    facts =
+      event_scope_facts(
+        event,
+        Snapshot.subtree_facts(txn, event, Snapshot.current(txn, event, %{}))
+      )
+
     actions = Store.admit(txn, event, facts)
     Enum.each(actions, &execute_action(txn, event, &1, event["at"]))
     Store.actions(txn, event["org"], event["id"])
@@ -496,7 +501,10 @@ defmodule Tightbeam.RowReactions do
     {_event, original} = Store.event(txn, event["org"], event["id"])
 
     facts =
-      event_scope_facts(event, Snapshot.current(txn, event, original))
+      event_scope_facts(
+        event,
+        Snapshot.subtree_facts(txn, event, Snapshot.current(txn, event, original))
+      )
       |> Map.put("transition", transition)
       |> Map.put(
         "reaction_actions",
