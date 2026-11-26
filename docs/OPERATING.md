@@ -17,8 +17,8 @@ or the LaunchDaemons for full mode. Remove the service definitions you
 unloaded and ask systemd to reload its configuration on Linux.
 
 After the services have stopped, remove the Tightbeam package with the
-package manager you used. For an npx installation, remove its Tightbeam
-release files from your home directory. Check that neither service is still
+package manager you used. For an npx installation, remove the installed
+release files under `~/.local/share/tightbeam-install`. Check that neither service is still
 running or listening on its configured port.
 
 Keep your base directory if you want to retain your installation's identity,
