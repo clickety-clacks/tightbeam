@@ -624,21 +624,9 @@ defmodule Tightbeam.StateResources do
 
   @doc "Return one bounded, principal-visible work-item page in creation order."
   def query_work_item_page(db, filters, call, boundary, limit) do
-    {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
-
-    {visibility, visibility_params} =
-      cond do
-        is_admin ->
-          {"1 = 1", []}
-
-        principal_kind == "user" ->
-          {"wi.ownerUserId = ?", [principal_id]}
-
-        principal_kind == "session" ->
-          {"1 = 1", []}
-      end
+    {visibility, visibility_params} = work_item_page_visibility(call)
 
     {where, params} =
       append_work_item_filters(
@@ -665,38 +653,68 @@ defmodule Tightbeam.StateResources do
       "work_items AS wi LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
         "LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id"
 
-    case DB.read_transaction(db, fn txn ->
-           query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
+    with_read_transaction(db, fn txn ->
+      query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
 
-           page =
-             Keyset.page(
-               query,
-               select_from,
-               probe_from,
-               where,
-               params,
-               ["wi.createdAt", "wi.id"],
-               boundary,
-               limit,
-               fn row -> [Enum.at(row, 14), hd(row)] end
-             )
+      page =
+        Keyset.page(
+          query,
+          select_from,
+          probe_from,
+          where,
+          params,
+          ["wi.createdAt", "wi.id"],
+          boundary,
+          limit,
+          fn row -> [Enum.at(row, 14), hd(row)] end
+        )
 
-           rows =
-             page.rows
-             |> Enum.map(&work_item_query_row/1)
-             |> then(&WorkItemSummary.attach_many(txn, &1))
+      rows =
+        page.rows
+        |> Enum.map(&work_item_query_row/1)
+        |> then(&attach_work_item_summaries(txn, &1, :page, call))
 
-           %{page | rows: rows}
-         end) do
-      {:ok, page} ->
-        %{
-          rows: page.rows,
-          has_more_before: page.has_more_before,
-          has_more_after: page.has_more_after
-        }
+      %{rows: rows, has_more_before: page.has_more_before, has_more_after: page.has_more_after}
+    end)
+  end
 
-      {:error, error} ->
-        raise error
+  @doc false
+  def query_work_item_version_page(%Txn{} = txn, principal, boundary, limit) do
+    trace_core_detail(principal, {:au4_visibility, "work items"})
+    {where, params} = work_item_page_visibility(%{rest_principal: principal})
+
+    from = """
+    work_items AS wi
+    LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+    """
+
+    page =
+      Keyset.page(
+        fn sql, args -> observed_query(txn, principal, sql, args) end,
+        "SELECT wi.id, wi.createdAt, COALESCE(v.rowVersion, wi.createdAt) FROM " <> from,
+        from,
+        where,
+        params,
+        ["wi.createdAt", "wi.id"],
+        boundary,
+        limit,
+        fn [id, created_at, _version] -> [created_at, id] end
+      )
+
+    %{
+      items:
+        Enum.map(page.rows, fn [id, created_at, row_version] ->
+          %{id: id, created_at: created_at, row_version: row_version}
+        end),
+      has_more_after: page.has_more_after
+    }
+  end
+
+  defp work_item_page_visibility(call) do
+    case detail_principal(call) do
+      {_kind, _id, true} -> {"1 = 1", []}
+      {"user", id, false} -> {"wi.ownerUserId = ?", [id]}
+      {"session", _id, false} -> {"1 = 1", []}
     end
   end
 
@@ -1932,7 +1950,8 @@ defmodule Tightbeam.StateResources do
           {"ownerUserId", "wi.ownerUserId"},
           {"createdBySession", "wi.createdBySession"},
           {"createdByUser", "wi.createdByUser"},
-          {"specRefName", "wi.specRefName"}
+          {"specRefName", "wi.specRefName"},
+          {"specRefSha256", "wi.specRefSha256"}
         ],
         {where, params},
         fn {field, column}, {where, params} ->
@@ -1947,6 +1966,13 @@ defmodule Tightbeam.StateResources do
         "false" -> 0
       end)
       |> then(&append_in_filter(where, params, "wi.isBug", &1))
+
+    where =
+      case filters["executionMapOrigin"] do
+        "user" -> where <> " AND wi.createdByUser IS NOT NULL"
+        "session" -> where <> " AND wi.createdByUser IS NULL"
+        _ -> where
+      end
 
     holder_keys = Map.get(filters, "holderKey", [])
 

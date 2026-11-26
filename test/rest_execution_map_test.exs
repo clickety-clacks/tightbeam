@@ -782,6 +782,64 @@ defmodule Tightbeam.RestExecutionMapTest do
     refute recreated["dependencyVersion"] == inserted["dependencyVersion"]
   end
 
+  test "quiet pages and off-page attest dependencies span internal item batches", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, """
+             WITH RECURSIVE n(i) AS (
+               VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 260
+             )
+             INSERT INTO work_items
+               (id, title, isBug, ownerUserId, state, createdByUser, createdAt, createdContextKnown)
+             SELECT printf('wi_chunk_%03d', i), 'Page fixture', 0, 'owner', 'open', 'owner',
+                    40000 + i, 0
+             FROM n
+             """)
+
+    assignment =
+      insert_assignment!(ctx.db, "asg_off_page_attest",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: "wi_chunk_001"
+      )
+
+    insert_attest!(
+      ctx.db,
+      "att_off_page",
+      assignment,
+      ctx.owner_session.session_key,
+      45_000
+    )
+
+    call = %{
+      principal: %{kind: "user", id: "owner", is_admin: false},
+      filters: %{"quietOverMs" => 1},
+      boundary: :latest,
+      limit: 2,
+      now: 50_000
+    }
+
+    page = ExecutionMap.list_execution_map(ctx.db, call)
+    assert Enum.map(page.items, & &1.id) == ["wi_chunk_259", "wi_chunk_260"]
+    assert page.flags == %{has_more_before: true, has_more_after: false}
+
+    earlier =
+      ExecutionMap.list_execution_map(ctx.db, %{
+        call
+        | boundary: {:before, [40_259, "wi_chunk_259"]}
+      })
+
+    assert Enum.map(earlier.items, & &1.id) == ["wi_chunk_257", "wi_chunk_258"]
+    assert earlier.flags == %{has_more_before: true, has_more_after: true}
+    assert earlier.dependency_version == page.dependency_version
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE attests SET ts=ts+1 WHERE id='att_off_page'")
+
+    changed = ExecutionMap.list_execution_map(ctx.db, call)
+    assert changed.items == page.items
+    refute changed.dependency_version == page.dependency_version
+  end
+
   test "REST uses visible turn dependencies while the index backfills", ctx do
     visible = insert_work_item!(ctx.db, "wi_backfill_visible", "owner", 42_000)
     hidden = insert_work_item!(ctx.db, "wi_backfill_hidden", "other", 43_000)
