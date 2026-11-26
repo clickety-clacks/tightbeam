@@ -88,7 +88,7 @@ jobs:
       - name: Detect install channels in the selected candidate
         id: channels
         run: |
-          if [ -f packaging/npm/package.json ]; then
+          if [ -f packaging/prepare-install-channels.mjs ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -269,8 +269,38 @@ jobs:
             and .soak.source_sha == $sha
           ' release/release-provenance.json > /dev/null
 
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ inputs.candidate_sha }}
+          name: Tightbeam ${{ inputs.release_tag }}
+          generate_release_notes: true
+          prerelease: false
+          make_latest: "true"
+          fail_on_unmatched_files: true
+          files: |
+            release/tightbeam-*.tgz
+            release/release-candidate-manifest.json
+            release/SHA256SUMS
+            release/release-provenance.json
+
+      - name: Report legacy candidate publication
+        if: needs.prepare.outputs.install_channels != 'true'
+        run: echo "Published GitHub release. The selected candidate predates npm and Homebrew distribution." >> "$GITHUB_STEP_SUMMARY"
+
+  distribute:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.install_channels == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
       - name: Check publication credentials
-        if: needs.prepare.outputs.install_channels == 'true'
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -290,33 +320,6 @@ jobs:
             *) echo "npm registry lookup failed (HTTP $status)" >&2; exit 1 ;;
           esac
 
-      - name: Create the GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          token: ${{ github.token }}
-          tag_name: ${{ inputs.release_tag }}
-          target_commitish: ${{ inputs.candidate_sha }}
-          name: Tightbeam ${{ inputs.release_tag }}
-          generate_release_notes: true
-          prerelease: false
-          make_latest: "true"
-          fail_on_unmatched_files: true
-          files: |
-            release/tightbeam-*.tgz
-            release/release-candidate-manifest.json
-            release/SHA256SUMS
-            release/release-provenance.json
-
-  distribute:
-    needs: [prepare, publish]
-    if: needs.prepare.outputs.install_channels == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      RELEASE_TAG: ${{ inputs.release_tag }}
-    steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.candidate_sha }}

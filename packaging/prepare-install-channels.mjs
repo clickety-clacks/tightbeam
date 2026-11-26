@@ -16,11 +16,6 @@ function resource(name, platform) {
   ].join('\n');
 }
 
-function sourceMetadata(platform) {
-  const { name, sha256 } = platforms[platform];
-  return JSON.stringify({ tag, archive: name, sha256 });
-}
-
 const formula = `class Tightbeam < Formula
   desc "Run and coordinate AI agents"
   homepage "https://github.com/clickety-clacks/tightbeam"
@@ -37,12 +32,6 @@ ${resource('linux', 'linux-x64')}
 
   def install
     libexec.install Dir["*"]
-    source = if OS.mac?
-      '${sourceMetadata('darwin-arm64')}'
-    else
-      '${sourceMetadata('linux-x64')}'
-    end
-    (libexec/"tightbeam-install-source.json").write(source + "\\n")
     bin.install_symlink libexec/"bin/tightbeam"
   end
 

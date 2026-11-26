@@ -28,8 +28,6 @@ else
   esac
 fi
 binary=$(find "$scratch/home/.local/share/tightbeam-install" -path '*/bin/tightbeam' -type f)
-npm_source="$(dirname "$binary")/../tightbeam-install-source.json"
-jq -e --arg tag "$target" '.tag == $tag' "$npm_source"
 release_version=${target#v}
 "$binary" --version | grep -F "${release_version%%+*}"
 
@@ -71,7 +69,6 @@ brew upgrade "$formula"
 brew test "$formula"
 new_prefix=$(cd "$(brew --prefix --installed "$formula")" && pwd -P)
 test "$old_prefix" != "$new_prefix"
-jq -e --slurpfile npm "$npm_source" '. == $npm[0]' "$new_prefix/libexec/tightbeam-install-source.json"
 "$new_prefix/bin/tightbeam" --version | grep -F "${release_version%%+*}"
 
 ruby -pi -e 'gsub(/sha256 "[a-f0-9]{64}"/, "sha256 \"" + "0" * 64 + "\"")' \
