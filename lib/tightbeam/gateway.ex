@@ -358,25 +358,27 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
          # R8: retain listener evidence across Wakes and Bandit restarts.
          {Tightbeam.ListenerLifecycle, []},
-         {Tightbeam.Wakes,
-          db: db,
-          # Off by default: each check reads every open assignment's holder
-          # wakes on the database writer, at every turn end.
-          holder_prod: false,
-          deliver: deliver,
-          delivery_opts: delivery_config,
-          internal_consumers: %{
-            "rate_limit_reset" => &Tightbeam.RateLimitReset.release(db, &1),
-            # These internal consumers remain only to drain wakes persisted by
-            # pre-removal releases. They intentionally neither read generations
-            # nor send effort-check-in decisions/notices.
-            "effort_probe" => &EffortCheckin.ignore_retired_wake(db, &1),
-            "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1)
-          },
-          tick_ms: config.wake_tick_ms,
-          identity_staleness_check: fn -> emit_identity_staleness_alarm(db) end,
-          identity_staleness_interval_ms: @identity_staleness_interval_ms,
-          name: Tightbeam.WakeScheduler},
+         {
+           Tightbeam.Wakes,
+           # Off by default: each check reads every open assignment's holder
+           # wakes on the database writer, at every turn end.
+           db: db,
+           holder_prod: false,
+           deliver: deliver,
+           delivery_opts: delivery_config,
+           internal_consumers: %{
+             "rate_limit_reset" => &Tightbeam.RateLimitReset.release(db, &1),
+             # These internal consumers remain only to drain wakes persisted by
+             # pre-removal releases. They intentionally neither read generations
+             # nor send effort-check-in decisions/notices.
+             "effort_probe" => &EffortCheckin.ignore_retired_wake(db, &1),
+             "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1)
+           },
+           tick_ms: config.wake_tick_ms,
+           identity_staleness_check: fn -> emit_identity_staleness_alarm(db) end,
+           identity_staleness_interval_ms: @identity_staleness_interval_ms,
+           name: Tightbeam.WakeScheduler
+         },
          {Tightbeam.HarklightReceipts, db: db},
          {Tightbeam.HarklightBounces, db: db, runner: Map.get(config, :harklight_bounce_runner)},
          {Tightbeam.HarklightWakes,

@@ -6,7 +6,10 @@ defmodule Tightbeam.WorkItemWaits do
   def enabled?, do: Application.get_env(:tightbeam, :work_item_waits_enabled, false) == true
 
   def disabled_error do
-    %{code: "feature_disabled", message: "Work-item waits are disabled; enable work_item_waits_enabled to use this command."}
+    %{
+      code: "feature_disabled",
+      message: "Work-item waits are disabled; enable work_item_waits_enabled to use this command."
+    }
   end
 
   def ensure_schema(db) do
