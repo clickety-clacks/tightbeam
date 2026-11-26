@@ -1291,6 +1291,9 @@ defmodule Tightbeam.Org do
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
     Tightbeam.Retirements.session_retired_in_txn(txn, session_key)
 
+    unless Keyword.get(opts, :defer_people_messages, false),
+      do: Tightbeam.PeopleMessages.retire_in_txn(txn, session_key)
+
     unless Keyword.get(opts, :defer_harklight, false) do
       Txn.handoff(
         txn,
@@ -1320,6 +1323,8 @@ defmodule Tightbeam.Org do
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
+        AND NOT EXISTS (SELECT 1 FROM people_events e WHERE e.wakeId=w.wakeId)
+        AND NOT EXISTS (SELECT 1 FROM people_operations o WHERE o.wakeId=w.wakeId)
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_entries e WHERE e.wakeId=w.wakeId
         )

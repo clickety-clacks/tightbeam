@@ -8,6 +8,10 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
   end
 
+  if relay = System.get_env("TIGHTBEAM_PEOPLE_MESSAGE_RELAY_SESSION") do
+    config :tightbeam, :people_message_relay_session, relay
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end

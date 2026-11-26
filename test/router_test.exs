@@ -985,6 +985,70 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  test "people messaging uses the authenticated session and preserves relay acknowledgments",
+       ctx do
+    sender = create_session(ctx.db, "people-sender", ctx.device.user_id)
+    relay = create_session(ctx.db, "people-relay", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+    previous = Application.fetch_env(:tightbeam, :people_message_relay_session)
+    Application.put_env(:tightbeam, :people_message_relay_session, relay.session_key)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, session} -> Application.put_env(:tightbeam, :people_message_relay_session, session)
+        :error -> Application.delete_env(:tightbeam, :people_message_relay_session)
+      end
+    end)
+
+    work = "wi-people-wire"
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt)
+        VALUES(?1,'Fixture work',?2,?2,1)
+        """,
+        [work, ctx.device.user_id]
+      )
+
+    response =
+      dispatch_cli(ctx, sender.cli_token, %{
+        verb: "people-send",
+        params: %{title: "News", body: "Message", work_item_id: work}
+      })
+
+    assert response.status == 200
+
+    assert %{"result" => %{"relay_configured" => true, "record" => record}} =
+             JSON.decode!(response.resp_body)
+
+    assert record["sender_session"] == sender.session_key
+    assert record["addresses"] == ["user:" <> ctx.device.user_id]
+
+    assert dispatch_cli(ctx, sender.cli_token, %{verb: "people-collect"}).status == 403
+    assert dispatch_cli(ctx, relay.cli_token, %{verb: "people-collect"}).status == 200
+
+    report = %{
+      verb: "people-report",
+      params: %{
+        id: record["id"],
+        outcomes: [
+          %{address: hd(record["addresses"]), status: "reached"}
+        ],
+        server_id: "service",
+        remote_conversation_id: "conversation"
+      }
+    }
+
+    assert %{"result" => %{"accepted" => true, "duplicate" => false}} =
+             dispatch_cli(ctx, relay.cli_token, report).resp_body |> JSON.decode!()
+
+    assert %{"result" => %{"accepted" => true, "duplicate" => true}} =
+             dispatch_cli(ctx, relay.cli_token, report).resp_body |> JSON.decode!()
+  end
+
   test "existing sentinel unsubscribe remains available through agent dispatch", ctx do
     session = create_session(ctx.db, "sentinel-unsubscribe-wire", ctx.device.user_id)
     subscription_id = "sub_router_allowlist"

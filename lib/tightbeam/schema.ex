@@ -49,6 +49,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
+    Tightbeam.PeopleMessages,
     Tightbeam.HarklightWakes,
     Tightbeam.NoticeBatcher,
     Tightbeam.AdminProjection,
