@@ -8880,29 +8880,42 @@ defmodule Tightbeam.GatewayTest do
     refute_received {:tune_session_closed, _}
   end
 
-  test "a Claude tune load timeout leaves the conversation and stored selection intact", ctx do
-    diagnostic = Tightbeam.ErrorDiagnostic.from_reason(:timeout, operation: "session/load")
-    timeout = Tightbeam.ErrorDiagnostic.diagnosed(:timeout, diagnostic)
+  for {label, load_error, origin} <- [
+        {"timeout", :timeout, "acp_transport"},
+        {"transport close", :closed, "acp_transport"},
+        {"JSON-RPC error", %{"code" => -32603, "message" => "Internal error"}, "acp_adapter"}
+      ] do
+    test "a Claude tune load #{label} leaves the conversation and stored selection intact", ctx do
+      reason = unquote(Macro.escape(load_error))
 
-    config =
-      claude_tune_fixture(ctx, "timed-out-engine",
-        resident: false,
-        load_result: {:error, timeout}
-      )
+      diagnostic =
+        Tightbeam.ErrorDiagnostic.from_reason(reason,
+          operation: "session/load",
+          origin: unquote(origin)
+        )
 
-    pointer = Org.current_pointer(ctx.db, "k1")
-    model = Org.get(ctx.db, "k1").model
+      failure = Tightbeam.ErrorDiagnostic.diagnosed(reason, diagnostic)
+      sid = "existing-engine"
 
-    assert %{ok: false, code: "model_apply_failed", diagnostic: %{"operation" => "session/load"}} =
-             tune_claude_fixture(config)
+      config = claude_tune_fixture(ctx, sid, resident: false, load_result: {:error, failure})
+      pointer = Org.current_pointer(ctx.db, "k1")
+      model = Org.get(ctx.db, "k1").model
 
-    assert_receive {:tune_session_loaded, "timed-out-engine", %Model{family: "claude-sonnet-4-6"},
-                    _cwd, _mcp, _guidance}
+      assert %{
+               ok: false,
+               code: "model_apply_failed",
+               diagnostic: %{"operation" => "session/load"}
+             } =
+               tune_claude_fixture(config)
 
-    assert Org.current_pointer(ctx.db, "k1") == pointer
-    assert Org.get(ctx.db, "k1").model == model
-    refute_received {:tune_session_created, _}
-    refute_received {:tune_session_closed, _}
+      assert_receive {:tune_session_loaded, ^sid, %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp,
+                      _guidance}
+
+      assert Org.current_pointer(ctx.db, "k1") == pointer
+      assert Org.get(ctx.db, "k1").model == model
+      refute_received {:tune_session_created, _}
+      refute_received {:tune_session_closed, _}
+    end
   end
 
   defp claude_tune_fixture(ctx, sid, opts) do
