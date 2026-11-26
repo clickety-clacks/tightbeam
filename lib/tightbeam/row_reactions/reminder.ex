@@ -49,6 +49,7 @@ defmodule Tightbeam.RowReactions.Reminder do
   @work_item_facts ~w(work_item.title work_item.state work_item.artifact_titles work_item.artifact_kinds)
   @assignment_facts ~w(assignment.effect_kind assignment.is_review assignment.notes assignment.verdicts) ++
                       @work_item_facts
+  @list_facts ~w(assignment.notes assignment.verdicts work_item.artifact_titles work_item.artifact_kinds)
   @people_facts ~w(holder opener delivery_owner)
 
   @targets %{
@@ -199,13 +200,17 @@ defmodule Tightbeam.RowReactions.Reminder do
     subject_ref = ref("facts." <> fact)
 
     case operator do
-      "in" ->
-        unless is_list(value), do: fail.("#{label} op in needs a list value")
-        op("in", [subject_ref, value])
+      membership when membership in ~w(in not_in) ->
+        unless is_list(value), do: fail.("#{label} op #{membership} needs a list value")
+        matches = membership(fact, subject_ref, value)
 
-      "not_in" ->
-        unless is_list(value), do: fail.("#{label} op not_in needs a list value")
-        op("not", [op("in", [subject_ref, value])])
+        case membership do
+          "in" -> op("and", [present(subject_ref), matches])
+          "not_in" -> op("and", [present(subject_ref), op("not", [matches])])
+        end
+
+      "ne" ->
+        op("and", [present(subject_ref), op("ne", [subject_ref, value])])
 
       "contains" ->
         unless text_value?(value),
@@ -226,6 +231,13 @@ defmodule Tightbeam.RowReactions.Reminder do
   # The expression language has no type test; ordering on a missing fact must
   # read as false, not fail the whole evaluation. `coalesce` supplies a number
   # that cannot satisfy the comparison when the fact is absent.
+  defp membership(fact, subject, values) when fact in @list_facts,
+    do: op("or", Enum.map(values, &op("in", [&1, subject])))
+
+  defp membership(_fact, subject, values), do: op("in", [subject, values])
+
+  defp present(subject), do: op("not", [op("is_null", [subject])])
+
   defp numeric(operator, subject_ref, value) do
     fallback = if operator in ~w(gt gte), do: value - 1, else: value + 1
     op(operator, [op("coalesce", [subject_ref, fallback]), value])

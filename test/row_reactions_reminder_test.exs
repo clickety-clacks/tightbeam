@@ -210,6 +210,32 @@ defmodule Tightbeam.RowReactionsReminderTest do
       refute Enum.any?(plans, & &1.selected)
     end
 
+    test "list membership matches an overlapping item and ignores missing facts", ctx do
+      for {operation, matching, nonmatching} <- [
+            {"in", ["other", "accepted"], ["other"]},
+            {"not_in", ["other"], ["other", "accepted"]}
+          ] do
+        rule =
+          String.replace(
+            @plain,
+            ~s(fact = "assignment.effect_kind", op = "eq", value = "code"),
+            ~s(fact = "assignment.verdicts", op = "#{operation}", value = ["accepted"])
+          )
+
+        put_file(ctx, "membership.toml", rule)
+        assert [%{name: "plain"}] = load(ctx)
+
+        for {snapshot, expected} <- [
+              {put_in(facts(), ["assignment", "verdicts"], matching), true},
+              {put_in(facts(), ["assignment", "verdicts"], nonmatching), false},
+              {facts(), false}
+            ] do
+          assert Enum.map(Rules.reaction_plans(completed_event(), snapshot), & &1.selected) ==
+                   [expected, expected]
+        end
+      end
+    end
+
     test "a missing placeholder value is shown as unknown rather than failing", _ctx do
       load_plain()
       facts = put_in(facts(), ["names", "holder"], nil)
