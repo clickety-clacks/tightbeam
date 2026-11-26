@@ -1099,6 +1099,14 @@ defmodule Tightbeam.ExecutionMap do
   # Work-item and assignment visibility can change after a turn ends. Keep
   # admission on the read side, using the same original links as the turn.
   defp rest_turn_dependency(txn, principal, item_ids, assignment_ids) do
+    if Tightbeam.ExecutionMapTurnVersions.ready?(txn) do
+      indexed_turn_dependency(txn, principal, item_ids, assignment_ids)
+    else
+      unindexed_turn_dependency(txn, principal, item_ids, assignment_ids)
+    end
+  end
+
+  defp indexed_turn_dependency(txn, principal, item_ids, assignment_ids) do
     rows =
       Txn.q(
         txn,
@@ -1124,6 +1132,56 @@ defmodule Tightbeam.ExecutionMap do
       )
 
     {rows, MapSet.new(rows, fn [_item, _assignment, session, _revision] -> session end)}
+  end
+
+  # Until the backfill commits its final cursor, read the same visible turn
+  # dependencies directly. Keep the read snapshot and bound the rows returned
+  # to the BEAM per query. Partial projection revisions never enter the token.
+  defp unindexed_turn_dependency(txn, principal, item_ids, assignment_ids) do
+    params = [0, nil | turn_principal_params(principal)]
+    links = {MapSet.new(item_ids), MapSet.new(assignment_ids)}
+
+    {hash, sessions} =
+      hash_turn_dependencies(txn, params, links, :crypto.hash_init(:sha256), MapSet.new())
+
+    {Base.encode16(:crypto.hash_final(hash), case: :lower), sessions}
+  end
+
+  defp hash_turn_dependencies(txn, params, {item_ids, assignment_ids} = links, hash, sessions) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT t.seq, t.jobRef, t.assignmentId, t.sessionKey,
+               MAX(COALESCE(t.endedAt, 0), COALESCE(t.startedAt, 0), t.createdAt, t.seq)
+        FROM turns AS t NOT INDEXED
+        JOIN sessions AS s ON s.sessionKey = t.sessionKey
+        WHERE t.seq > ?1 AND (#{@rest_turn_visibility})
+        ORDER BY t.seq
+        LIMIT 2048
+        """,
+        params
+      )
+
+    case rows do
+      [] ->
+        {hash, sessions}
+
+      rows ->
+        {entries, sessions} =
+          Enum.reduce(rows, {[], sessions}, fn [seq, item, assignment, key, version],
+                                               {entries, sessions} ->
+            if MapSet.member?(item_ids, item) or MapSet.member?(assignment_ids, assignment) do
+              {[[JSON.encode!([seq, key, version]), "\n"] | entries], MapSet.put(sessions, key)}
+            else
+              {entries, sessions}
+            end
+          end)
+
+        [last_seq | _] = List.last(rows)
+        hash = :crypto.hash_update(hash, Enum.reverse(entries))
+        hash_turn_dependencies(txn, List.replace_at(params, 0, last_seq), links, hash, sessions)
+    end
   end
 
   defp turn_principal_params(principal) do

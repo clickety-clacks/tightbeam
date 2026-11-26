@@ -782,6 +782,50 @@ defmodule Tightbeam.RestExecutionMapTest do
     refute recreated["dependencyVersion"] == inserted["dependencyVersion"]
   end
 
+  test "REST uses visible turn dependencies while the index backfills", ctx do
+    visible = insert_work_item!(ctx.db, "wi_backfill_visible", "owner", 42_000)
+    hidden = insert_work_item!(ctx.db, "wi_backfill_hidden", "other", 43_000)
+
+    for {ref, session} <- [{visible, ctx.owner_session}, {hidden, ctx.other_session}] do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: session.session_key,
+                 message_id: "backfill-" <> ref,
+                 origin: "process:test",
+                 prompt: "Turn before index activation",
+                 job_ref: ref
+               })
+    end
+
+    # Model an upgrade before any historical batches have committed.
+    assert :ok =
+             DB.execute(ctx.db, """
+             DELETE FROM execution_map_turn_versions;
+             UPDATE execution_map_turn_version_activation
+             SET lastSeq = 0, throughSeq = (SELECT MAX(seq) FROM turns);
+             """)
+
+    path = "/api/execution-map"
+    before = get(ctx, path, ctx.token) |> decode_success()
+    assert [%{"turns" => %{"total" => 1}}] = before["items"]
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET createdAt=createdAt+1 WHERE jobRef=?1", [hidden])
+
+    hidden_change = get(ctx, path, ctx.token) |> decode_success()
+    assert hidden_change["dependencyVersion"] == before["dependencyVersion"]
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET createdAt=createdAt+1 WHERE jobRef=?1", [visible])
+
+    visible_change = get(ctx, path, ctx.token) |> decode_success()
+    refute visible_change["dependencyVersion"] == before["dependencyVersion"]
+
+    assert :ok = Tightbeam.ExecutionMapTurnVersions.backfill(ctx.db)
+    ready = get(ctx, path, ctx.token) |> decode_success()
+    assert [%{"turns" => %{"total" => 1}}] = ready["items"]
+  end
+
   test "all unpaged routes reject each page parameter before the resource query", ctx do
     item = insert_work_item!(ctx.db, "wi_unpaged", "owner", 44_000)
 
