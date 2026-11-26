@@ -10,6 +10,7 @@ mod contain;
 mod cursor_execution_identity;
 mod cursor_rails;
 mod dispatch;
+mod first_run;
 mod github_auth;
 mod harklight_child;
 mod harness_process;
@@ -38,6 +39,14 @@ fn main() {
             "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
         );
         std::process::exit(1);
+    }
+
+    if args == ["onboard", "--first-run"] {
+        if let Err(error) = first_run::run() {
+            eprintln!("First-run onboarding: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if args.first().is_some_and(|arg| arg == "harklight-child") {
