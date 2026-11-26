@@ -43,7 +43,15 @@ defmodule Tightbeam.RailScriptTest do
       # current schema. Historical wake storage would also break the decision
       # outbox and hide whether this invocation failure is durably escalated.
       assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM assignments")
-      :ok = DB.execute(db, "DROP TABLE assignments")
+      # The decision ledger must still be writable with the intentionally
+      # unavailable assignment relation in this fixture.
+      :ok =
+        DB.execute(db, """
+        DROP TRIGGER IF EXISTS execution_map_revision_decision_requests_insert;
+        DROP TRIGGER IF EXISTS execution_map_revision_decision_requests_update;
+        DROP TRIGGER IF EXISTS execution_map_revision_decision_requests_delete;
+        DROP TABLE assignments;
+        """)
       assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
     end
 

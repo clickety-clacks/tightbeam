@@ -17,6 +17,7 @@ sha2 = "0.10"
 serde_json = "1"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 ureq = { version = "=2.12.1", default-features = true }
+url = "2"
 
 [patch.crates-io]
 ureq = { path = "vendor/ureq-2.12.1" }
