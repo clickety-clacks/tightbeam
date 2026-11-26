@@ -87,7 +87,10 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    call = if Tightbeam.WaitLinks.enabled?(), do: with_source_work_item_ref(txn, call, result), else: call
+    call =
+      if Tightbeam.WaitLinks.enabled?(),
+        do: with_source_work_item_ref(txn, call, result),
+        else: call
 
     Txn.handoff(
       txn,
@@ -258,9 +261,10 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc false
   def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
     refs =
-      if Tightbeam.WaitLinks.enabled?() and String.starts_with?(class, ["wake.", "decision_request."]),
-        do: Map.merge(refs, source_work_item_ref(txn, payload)),
-        else: refs
+      if Tightbeam.WaitLinks.enabled?() and
+           String.starts_with?(class, ["wake.", "decision_request."]),
+         do: Map.merge(refs, source_work_item_ref(txn, payload)),
+         else: refs
 
     if class == "kungfu.updated" do
       Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
@@ -589,7 +593,16 @@ defmodule Tightbeam.Firehose.Publisher do
     case @state_verbs[verb] do
       {class, serializer} ->
         result = canonical_result(db, call, result)
-        build(class, if(Tightbeam.WaitLinks.enabled?(), do: with_source_work_item_ref(db, call, result), else: call), result, serializer)
+
+        build(
+          class,
+          if(Tightbeam.WaitLinks.enabled?(),
+            do: with_source_work_item_ref(db, call, result),
+            else: call
+          ),
+          result,
+          serializer
+        )
 
       nil ->
         nil

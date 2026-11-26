@@ -240,7 +240,9 @@ defmodule Tightbeam.WaitLinks do
 
   @doc false
   def publish_source_change_in_txn(txn, work_item_id, assignment_id) do
-    if enabled?(), do: publish_source_change_in_txn_enabled(txn, work_item_id, assignment_id), else: :ok
+    if enabled?(),
+      do: publish_source_change_in_txn_enabled(txn, work_item_id, assignment_id),
+      else: :ok
   end
 
   defp publish_source_change_in_txn_enabled(txn, work_item_id, assignment_id) do
@@ -294,7 +296,11 @@ defmodule Tightbeam.WaitLinks do
   defp with_schedule(wake, _txn), do: wake
 
   def request(query, kind, id) do
-    if enabled?(), do: request_enabled(query, kind, id), else: {:error, 409, "feature_disabled", "Wait-link reads are disabled; enable wait_links_enabled to use this endpoint."}
+    if enabled?(),
+      do: request_enabled(query, kind, id),
+      else:
+        {:error, 409, "feature_disabled",
+         "Wait-link reads are disabled; enable wait_links_enabled to use this endpoint."}
   end
 
   defp request_enabled(query, kind, id) do
@@ -319,7 +325,8 @@ defmodule Tightbeam.WaitLinks do
   end
 
   def page(db, kind, id, principal, request) do
-    if enabled?(), do: page_enabled(db, kind, id, principal, request),
+    if enabled?(),
+      do: page_enabled(db, kind, id, principal, request),
       else: {:error, :feature_disabled}
   end
 

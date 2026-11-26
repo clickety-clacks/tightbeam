@@ -9083,7 +9083,8 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
-        wait_reason: if(not omitted? and (wait? or Tightbeam.WaitLinks.enabled?()), do: reason, else: nil),
+        wait_reason:
+          if(not omitted? and (wait? or Tightbeam.WaitLinks.enabled?()), do: reason, else: nil),
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.

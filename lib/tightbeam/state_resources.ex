@@ -2154,7 +2154,12 @@ defmodule Tightbeam.StateResources do
 
     row
     |> public()
-    |> then(fn item -> if Tightbeam.WaitLinks.enabled?(), do: Map.put(item, "waitOn", Map.get(row, "waitOn") || Tightbeam.WaitLinks.wake_targets(row)), else: item end)
+    |> then(fn item ->
+      if Tightbeam.WaitLinks.enabled?(),
+        do:
+          Map.put(item, "waitOn", Map.get(row, "waitOn") || Tightbeam.WaitLinks.wake_targets(row)),
+        else: item
+    end)
     |> closed_projection("wakes")
   end
 
@@ -2659,8 +2664,10 @@ defmodule Tightbeam.StateResources do
 
   defp item_fields(resource) do
     fields = Map.fetch!(@item_field_order, resource)
+
     if resource == "work items" and not Tightbeam.WaitLinks.enabled?(),
-      do: fields -- ["waiting", "running"], else: fields
+      do: fields -- ["waiting", "running"],
+      else: fields
   end
 
   defp conditional_fields!("decision requests", fields, %{"kind" => "agent"}) do
@@ -2729,7 +2736,8 @@ defmodule Tightbeam.StateResources do
   defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
     do: fields ++ ["waitReason"] ++ if(Tightbeam.WaitLinks.enabled?(), do: ["waitOn"], else: [])
 
-  defp conditional_fields!("wakes", fields, _item), do: fields ++ if(Tightbeam.WaitLinks.enabled?(), do: ["waitOn"], else: [])
+  defp conditional_fields!("wakes", fields, _item),
+    do: fields ++ if(Tightbeam.WaitLinks.enabled?(), do: ["waitOn"], else: [])
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 

@@ -1,5 +1,13 @@
 # Wake reasons and direct wait links
 
+This feature defaults off. Enable the application setting `wait_links_enabled`
+(or `TIGHTBEAM_WAIT_LINKS_ENABLED=true` at startup) to use the read endpoints,
+optional reasons and missing-reason notices described here. While off, these
+endpoints refuse, existing response shapes remain unchanged, and required
+holder-wait reasons remain supported. Explicit item waits have their own
+`work_item_waits_enabled` flag. See [feature flags](feature-flags.md) for the
+additive schema work and rollout ownership.
+
 A wake's `waitReason` explains why its sender scheduled it. Its prompt tells the
 recipient what to do. The reason uses the existing `WaitReason` contract: a
 nonblank single line of at most 140 characters. `wake --wait-reason` accepts this

@@ -4,12 +4,16 @@ defmodule Tightbeam.WaitLinksTest do
   setup do
     previous = Application.get_env(:tightbeam, :wait_links_enabled)
     Application.put_env(:tightbeam, :wait_links_enabled, true)
+
     on_exit(fn ->
-      if is_nil(previous), do: Application.delete_env(:tightbeam, :wait_links_enabled),
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
         else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
     end)
+
     :ok
   end
+
   import Plug.Conn
   import Plug.Test
 
@@ -238,9 +242,13 @@ defmodule Tightbeam.WaitLinksTest do
         params: Map.put(params, :prompt, "Continue work")
       })
 
-  test "disabled wait links refuse reads and do not publish or query summaries", %{db: db} do
+  test "disabled wait links refuse reads and do not publish or query summaries",
+       %{db: db} = ctx do
     Application.delete_env(:tightbeam, :wait_links_enabled)
     refute WaitLinks.enabled?()
+    item = item(ctx)
+    refute Map.has_key?(item, "waiting")
+    refute Map.has_key?(item, "running")
     assert {:error, 409, "feature_disabled", _} = WaitLinks.request(%{}, "work-item", "missing")
     assert {:error, :feature_disabled} = WaitLinks.page(db, "work-item", "missing", %{}, %{})
     assert %{"missing" => %{}} = WaitLinks.summaries(:unused_database, ["missing"])

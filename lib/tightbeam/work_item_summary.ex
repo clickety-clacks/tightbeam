@@ -44,7 +44,8 @@ defmodule Tightbeam.WorkItemSummary do
       })
       |> then(fn item ->
         if Tightbeam.WaitLinks.enabled?(),
-          do: Map.merge(item, %{waiting: summary.waiting, running: summary.running}), else: item
+          do: Map.merge(item, %{waiting: summary.waiting, running: summary.running}),
+          else: item
       end)
     end)
   end

@@ -4,10 +4,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
   setup do
     previous = Application.get_env(:tightbeam, :wait_links_enabled)
     Application.put_env(:tightbeam, :wait_links_enabled, true)
+
     on_exit(fn ->
-      if is_nil(previous), do: Application.delete_env(:tightbeam, :wait_links_enabled),
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
         else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
     end)
+
     :ok
   end
 
