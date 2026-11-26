@@ -725,7 +725,7 @@ async function setup() {
           cwd: home, env: onboardingEnv,
         });
       } else {
-        console.log(`Open Main in Chat: ${mainLink}`);
+        console.log(`Open Main in Chat to get started with Uncle Enzo, the recommended kungfu: ${mainLink}`);
       }
     } catch (error) {
       if (removedQuick && state.gatewayFile) {
