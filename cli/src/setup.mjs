@@ -460,7 +460,8 @@ async function setup() {
     const startChat = !chatActive || !chat.enabled();
     const providers = providerActions(host);
     const withoutKeys = providers.filter(({ provider, key, needed }) => needed && !env[key] &&
-      (provider === 'cursor' || (provider === 'opencode-go' && !env.TIGHTBEAM_CREDENTIALS_DIRECTORY)));
+      (provider === 'cursor' || (provider === 'opencode-go' && !env.TIGHTBEAM_CREDENTIALS_DIRECTORY) ||
+        (!process.stdin.isTTY && ['openai', 'anthropic'].includes(provider))));
     const eligible = providers.filter((provider) => !withoutKeys.includes(provider));
     const pending = eligible.filter(({ needed }) => needed);
     const needsFirstRun = env.TIGHTBEAM_FIRST_RUN_ONBOARDING === 'true' &&
@@ -512,7 +513,7 @@ async function setup() {
     add(needsMain, 'Create your main Tightbeam conversation.');
     add(installChatPackage, 'Download and verify the published Tightbeam Chat package.');
     add(writeChat || startChat, 'Start local Tightbeam Chat as a user service that can stop when you sign out.');
-    add(readiness && eligible.length, 'Ask your main agent for a short reply to verify it can run a turn.');
+    add(readiness || pending.length, 'Check whether this installation can run a turn.');
     add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
     for (const line of [...install, ...notes]) console.log(`- ${line}`);
     if (flags.dryRun || !install.length) return;
@@ -598,7 +599,6 @@ async function setup() {
       }, 'The gateway did not become ready. Check the service log and run setup again.');
       if (versionChanged) {
         state.ready = false;
-        delete state.readinessWake;
       }
       Object.assign(state, { mode, version, advertised, tag, codexDisabled: disableCodex });
       save();
@@ -659,35 +659,28 @@ async function setup() {
       }, 'Chat did not serve the installed Main conversation. Check its service log.');
       const mainLink = new URL(chatUrl);
       mainLink.search = new URLSearchParams({ gateway: chatOrigin, session: state.main });
-      if (readiness && usable.length) {
+      const credential = fs.readFileSync(credentials, 'utf8');
+      const checkReadiness = () => getJson(`${localOrigin}/api/setup-readiness`, credential, 8000);
+      let report = await checkReadiness();
+      if (!report?.ready && usable.length) {
         try {
-          const credential = fs.readFileSync(credentials, 'utf8');
-          if (!state.readinessWake) {
-            const wake = run(cli, ['wake', '--session', state.main, '--as-user', state.admin,
-              '--prompt', 'Reply briefly to confirm that this Tightbeam installation can run a turn.'],
-            { cwd: home, stdio: 'pipe' });
-            state.readinessWake = JSON.parse(wake).wakeId;
-            if (!state.readinessWake) throw new Error('The gateway did not queue the setup readiness turn.');
-            save();
-          }
-          const turnUrl = `${localOrigin}/api/sessions/${encodeURIComponent(state.main)}/turns?limit=20&tail=true`;
           await waitFor(async () => {
-            const history = await getJson(turnUrl, credential);
-            const turn = history?.items?.find(({ wakeId }) => wakeId === state.readinessWake);
-            if (turn?.status === 'delivered') return true;
-            if (['failed', 'failed_unknown', 'canceled'].includes(turn?.status)) {
-              delete state.readinessWake;
-              save();
-              throw new Error('Main could not finish a turn. Check its credential and model in Chat, then rerun setup.');
-            }
-          }, 'The readiness turn is still pending. Check Main in Chat and rerun setup to verify it.');
-          state.ready = true;
-          save();
+            report = await checkReadiness() ?? report;
+            return report?.ready;
+          }, 'The model catalog did not confirm turn readiness.');
         } catch (error) {
-          console.error(`Readiness check: ${error.message}`);
+          console.error(error.message);
         }
       }
-      console.log(state.ready ? 'READY: Main completed a turn.' : 'NOT READY: Main has yet to complete a turn.');
+      if (state.ready !== Boolean(report?.ready)) {
+        state.ready = Boolean(report?.ready);
+        save();
+      }
+      if (report?.lines) {
+        for (const line of report.lines) console.log(line);
+      } else {
+        console.log('NOT READY: Tightbeam could not read the gateway readiness check.');
+      }
       if (needsFirstRun && state.ready) {
         run(targetCli, ['onboard', '--first-run'], {
           cwd: home, env: { ...env, TIGHTBEAM_CHAT_URL: chatUrl, CHAT_PUBLIC_ORIGIN: chatUrl },

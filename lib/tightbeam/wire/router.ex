@@ -515,6 +515,17 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  get "/api/setup-readiness" do
+    with {:ok, %{is_admin: true}} <- device_auth(conn),
+         check when is_function(check, 0) <- deps(conn)[:setup_readiness] do
+      json(conn, 200, check.())
+    else
+      {:ok, _} -> error(conn, 403, "admin_required", nil)
+      nil -> error(conn, 404, "not_found", nil)
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
   get "/api/streams" do
     with {:ok, device} <- device_auth(conn),
          {:ok, query} <- decode_state_query(conn),

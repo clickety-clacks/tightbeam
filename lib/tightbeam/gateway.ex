@@ -302,7 +302,11 @@ defmodule Tightbeam.Gateway do
         cli_token: cli_token,
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
-        adapter_coordinator: Tightbeam.AdapterCoordinator
+        adapter_coordinator: Tightbeam.AdapterCoordinator,
+        setup_readiness: fn ->
+          readiness = Tightbeam.Readiness.summary(config, Tightbeam.ModelCatalog, Archetypes.all())
+          %{ready: readiness.runnable?, lines: Tightbeam.Readiness.render(readiness, config)}
+        end
       })
 
     # EDGE half of the heal trigger. Off the coordinator's process: the sweep
