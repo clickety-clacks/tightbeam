@@ -568,6 +568,15 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:tune_session_loaded, sid, model, cwd, mcp_servers, guidance})
       {:reply, Keyword.get(opts, :load_result, {:ok, model}), state}
     end
+
+    def handle_call(
+          {:new_candidate_session, model, _cwd, _mcp, _guidance},
+          _from,
+          {parent, _opts} = state
+        ) do
+      send(parent, {:tune_session_created, model})
+      {:reply, {:ok, "replacement-session"}, state}
+    end
   end
 
   defmodule FastTuneAdapterStub do
@@ -8807,6 +8816,89 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert %Model{family: "claude-sonnet-4-6"} = Org.get(ctx.db, "k1").model
+  end
+
+  test "a spawned Claude session can be tuned before its first prompt", ctx do
+    opts = [resident: true, switch_result: {:error, :fork_requires_prompted_session}]
+    config = claude_tune_fixture(ctx, "spawn-engine", opts)
+
+    assert %{ok: true, requested: %{model: "claude-sonnet-4-6"}, applies: "now"} =
+             tune_claude_fixture(config)
+
+    assert_receive {:tune_session_created, %Model{family: "claude-sonnet-4-6"}}
+    assert_receive {:tune_session_closed, "spawn-engine"}
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "replacement-session"
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+  end
+
+  test "a cold Claude tune after a harness swap saves the selection when the transcript is absent",
+       ctx do
+    Org.set_harness(ctx.db, "k1", "codex", "openai", Model.new("gpt-5.6-sol"))
+    Org.append_pointer(ctx.db, "k1", "other-harness-engine", "created")
+
+    Org.set_harness(
+      ctx.db,
+      "k1",
+      "claude",
+      "anthropic",
+      Model.new("claude-sonnet-4-6", effort: "high")
+    )
+
+    missing = %{"code" => -32002, "message" => "Resource not found"}
+    diagnostic = Tightbeam.ErrorDiagnostic.from_reason(missing, operation: "session/load")
+    reason = Tightbeam.ErrorDiagnostic.diagnosed(missing, diagnostic)
+
+    config =
+      claude_tune_fixture(ctx, "post-swap-engine", resident: false, load_result: {:error, reason})
+
+    before = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: true, applies: "next_turn", projection_committed: true} =
+             tune_claude_fixture(config, %{setting: "set_reasoning", reasoningLevel: "medium"})
+
+    assert_receive {:tune_session_loaded, "post-swap-engine",
+                    %Model{family: "claude-sonnet-4-6", effort: "medium"}, _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.effort == "medium"
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
+  test "a cold Claude tune reloads a persisted conversation with the requested model", ctx do
+    config = claude_tune_fixture(ctx, "persisted-engine", resident: false)
+    before = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: true, applies: "now", engine_context: "preserved"} = tune_claude_fixture(config)
+
+    assert_receive {:tune_session_loaded, "persisted-engine", %Model{family: "claude-sonnet-4-6"},
+                    _cwd, _mcp, _guidance}
+
+    assert Org.current_pointer(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+    refute_received {:tune_session_created, _}
+    refute_received {:tune_session_closed, _}
+  end
+
+  defp claude_tune_fixture(ctx, sid, opts) do
+    base_dir = role_test_base(sid)
+    Archetypes.load!(base_dir)
+    host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", sid, "created")
+    start_lane!(ctx.db, "k1")
+    adapter = start_supervised!({TuneAdapterStub, {self(), opts}})
+    start_supervised!({CoordinatorStub, adapter})
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    gateway_config(base_dir, ctx.db, 0)
+  end
+
+  defp tune_claude_fixture(config, params \\ %{setting: "set_model", model: "claude-sonnet-4-6"}) do
+    Gateway.handlers(config)["tune"].(%{
+      origin: "user:flynn",
+      session_key: "k1",
+      params: params
+    })
   end
 
   test "initial set_model reports the harness selection when it differs from the request", ctx do
