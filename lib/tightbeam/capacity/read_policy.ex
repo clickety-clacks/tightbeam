@@ -23,11 +23,12 @@ defmodule Tightbeam.Capacity.ReadPolicy do
   def action(_, :wait, _now), do: :wait
   def action(%{sample: nil}, :background, _now), do: :wait
 
-  def action(%{sample: %{observed_at: observed}}, :background, now)
-      when now - observed <= @cache_ms,
-      do: :snapshot
+  def action(%{sample: sample}, :background, now) do
+    if cache_fresh?(sample, now), do: :snapshot, else: :background
+  end
 
-  def action(_, :background, _now), do: :background
+  def cache_fresh?(%{observed_at: observed}, now), do: now - observed <= @cache_ms
+  def cache_fresh?(nil, _), do: false
 
   def result(account_id, sample, error, source) do
     status =

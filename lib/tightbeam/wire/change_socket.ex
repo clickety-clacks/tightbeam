@@ -9,7 +9,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   require Logger
   @max_subscriptions 100
   @turn_classes ~w(turn.queued turn.started turn.ended)
-  @filter_keys ~w(classes sessionKey workItemId origin principal archetype)
+  @filter_keys ~w(classes sessionKey workItemId origin principal archetype accountId)
   defstruct phase: :unauthed,
             user_id: nil,
             device_id: nil,
@@ -180,6 +180,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             mode: :filtered,
             user_id: device.user_id,
             device_id: device.device_id,
+            is_admin: device.is_admin,
             principal_kind: :user,
             principal_id: device.user_id
           })
@@ -224,6 +225,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
         Hub.register(hub(state), self(), %{
           mode: :filtered,
           user_id: user.user_id,
+          is_admin: user.is_admin,
           principal_kind: :user,
           principal_id: user.user_id
         })

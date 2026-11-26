@@ -87,3 +87,17 @@ For an archetype-filtered subscription, rebuild by listing sessions with the
 requested archetype filter and then using the existing per-session message and
 tool-call reads for each returned session. There is no cross-session message
 or tool-call collection.
+
+### Capacity snapshots
+
+With `provider_accounts_enabled`, administrators can subscribe to the
+`capacity.changed` class and rebuild from `GET /api/capacity?refresh=cache`.
+Wait for subscription readiness before fetching the snapshot. For a changed
+account, use its opaque `refs.accountId` with
+`GET /api/capacity/:accountId?refresh=cache`. Cache reads never call the provider.
+Rebuild the snapshot after reconnect or `reload_required`.
+
+The event has `op: "observe"` and a `payload.sourceVersion` derived from the
+gateway's completion timestamp. A successful observation advances that
+timestamp even when usage is unchanged. The event carries no provider account
+identity, upstream response, or credential data.

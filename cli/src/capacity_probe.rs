@@ -4,6 +4,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(test)]
+mod native;
+
 use chrono::DateTime;
 use serde_json::{Value, json};
 
@@ -33,6 +36,10 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
 }
 
 fn read(path: &str, usage: fn(&Value, &ureq::Agent) -> ProbeResult) -> ProbeResult {
+    usage(&credential(path.as_ref())?, &usage_agent())
+}
+
+fn credential(path: &std::path::Path) -> ProbeResult {
     let raw = std::fs::read(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             error("CREDENTIAL_MISSING")
@@ -40,22 +47,21 @@ fn read(path: &str, usage: fn(&Value, &ureq::Agent) -> ProbeResult) -> ProbeResu
             error("CREDENTIAL_UNREADABLE")
         }
     })?;
-    let credential = serde_json::from_slice(&raw).map_err(|_| error("CREDENTIAL_REJECTED"))?;
-    let agent = ureq::AgentBuilder::new()
+    serde_json::from_slice(&raw).map_err(|_| error("CREDENTIAL_REJECTED"))
+}
+
+fn usage_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .redirects(0)
         .timeout(TIMEOUT)
-        .build();
-    usage(&credential, &agent)
+        .build()
 }
 
 fn codex_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
     let tokens = &credential["tokens"];
     let access = required_string(&tokens["access_token"])?;
     let account = required_string(&tokens["account_id"])?;
-    let expires = jwt_claims(access)
-        .and_then(|claims| claims["exp"].as_i64())
-        .and_then(|expiry| expiry.checked_mul(1000));
-    require_unexpired(expires)?;
+    require_unexpired(codex_expiry(&tokens["access_token"]))?;
 
     let payload = request(
         agent
@@ -67,6 +73,12 @@ fn codex_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
     let mut sample = normalize_codex(&payload, observed)?;
     sample["subscription"] = codex_subscription(tokens["id_token"].as_str(), observed);
     Ok(sample)
+}
+
+fn codex_expiry(access: &Value) -> Option<i64> {
+    jwt_claims(access.as_str()?)
+        .and_then(|claims| claims["exp"].as_i64())
+        .and_then(|expiry| expiry.checked_mul(1000))
 }
 
 fn claude_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
@@ -353,15 +365,17 @@ fn codex_window(
             return None;
         }
     }
-    let reset = if let Some(reset) = value["reset_at"].as_i64() {
-        Some(reset.checked_mul(1000)?)
-    } else if let Some(delay) = value["reset_after_seconds"].as_i64() {
-        Some(observed.checked_add(delay.checked_mul(1000)?)?)
+    let reset = match value["reset_at"].as_i64() {
+        Some(seconds) => Some(seconds.checked_mul(1000)?),
+        None => None,
+    };
+    let reset_after = if reset.is_none() {
+        value["reset_after_seconds"].as_i64()
     } else {
         None
     };
     let model = additional.then_some(name);
-    window(
+    let mut normalized = window(
         id,
         name,
         if additional { "model" } else { "account" },
@@ -369,13 +383,90 @@ fn codex_window(
         &value["used_percent"],
         reset,
         value["limit_window_seconds"].as_i64(),
-    )
+    )?;
+
+    if let Some(delay) = reset_after {
+        observed.checked_add(delay.checked_mul(1000)?)?;
+        normalized["resetAfterSeconds"] = json!(delay);
+    }
+    Some(normalized)
 }
 
 const CODEX_WINDOWS: [(&str, &str, &str); 2] = [
     ("primary_window", "primary", "Primary"),
     ("secondary_window", "secondary", "Secondary"),
 ];
+
+// Convert the app-server's bounded, on-host reply into the same window mapping
+// as the read-only endpoint. The caller can fall back to HTTPS if the version
+// cannot describe a bucket without inventing an ID or plan.
+fn normalize_codex_app_server(doc: &Value, account: &Value, observed: i64) -> ProbeResult {
+    let main = doc["rateLimits"]
+        .as_object()
+        .ok_or_else(|| error("UPSTREAM_CONTRACT_CHANGED"))?;
+    let plan = main
+        .get("planType")
+        .and_then(Value::as_str)
+        .or_else(|| account["account"]["planType"].as_str());
+    let mut additional = Vec::new();
+
+    if let Some(buckets) = doc["rateLimitsByLimitId"].as_object() {
+        let primary_id = main
+            .get("limitId")
+            .and_then(Value::as_str)
+            .unwrap_or("codex");
+        for (id, bucket) in buckets {
+            if id != primary_id {
+                let name = bucket["limitName"]
+                    .as_str()
+                    .filter(|name| !slug(name).is_empty())
+                    .ok_or_else(|| error("UPSTREAM_CONTRACT_CHANGED"))?;
+                additional.push(
+                    json!({ "limit_name": name, "rate_limit": native_codex_windows(bucket)? }),
+                );
+            }
+        }
+    }
+
+    normalize_codex(
+        &json!({
+            "plan_type": plan,
+            "rate_limit": native_codex_windows(&doc["rateLimits"])?,
+            "additional_rate_limits": additional
+        }),
+        observed,
+    )
+}
+
+fn native_codex_windows(bucket: &Value) -> ProbeResult {
+    let mut windows = serde_json::Map::new();
+    for (source, target) in [
+        ("primary", "primary_window"),
+        ("secondary", "secondary_window"),
+    ] {
+        let window = &bucket[source];
+        if !window.is_null() {
+            let seconds = match &window["windowDurationMins"] {
+                Value::Null => None,
+                minutes => Some(
+                    minutes
+                        .as_i64()
+                        .and_then(|value| value.checked_mul(60))
+                        .ok_or_else(|| error("UPSTREAM_CONTRACT_CHANGED"))?,
+                ),
+            };
+            windows.insert(
+                target.into(),
+                json!({
+                    "used_percent": window["usedPercent"],
+                    "reset_at": window["resetsAt"],
+                    "limit_window_seconds": seconds
+                }),
+            );
+        }
+    }
+    Ok(Value::Object(windows))
+}
 
 fn normalize_codex(doc: &Value, observed: i64) -> ProbeResult {
     if !doc.is_object() || (!doc["plan_type"].is_null() && !doc["plan_type"].is_string()) {
@@ -593,13 +684,37 @@ mod tests {
         assert_eq!(
             sample["windows"],
             json!([
-                {"id":"primary","name":"Primary","scope":"account","model":null,"usedPercent":42.0,"resetsAt":61000,"windowSeconds":18000},
+                {"id":"primary","name":"Primary","scope":"account","model":null,"usedPercent":42.0,"resetsAt":null,"resetAfterSeconds":60,"windowSeconds":18000},
                 {"id":"additional:gpt-extra:primary","name":"GPT Extra Primary","scope":"model","model":"GPT Extra","usedPercent":20.0,"resetsAt":20000,"windowSeconds":null},
                 {"id":"additional:gpt-extra","name":"GPT Extra","scope":"model","model":"GPT Extra","usedPercent":15.0,"resetsAt":null,"windowSeconds":null}
             ])
         );
         assert_eq!(sample["diagnostics"].as_array().unwrap().len(), 2);
         assert!(!sample.to_string().contains("upstream-private-id"));
+    }
+
+    #[test]
+    fn codex_app_server_shares_http_window_ids_and_units() {
+        let primary = json!({"usedPercent":42, "windowDurationMins":300, "resetsAt":1795538965});
+        let result = json!({
+            "rateLimits":{"limitId":"codex", "primary":primary},
+            "rateLimitsByLimitId":{
+                "codex":{"limitId":"codex", "primary":primary},
+                "metered":{"limitId":"metered", "limitName":"GPT Extra",
+                           "secondary":{"usedPercent":65, "windowDurationMins":10080, "resetsAt":null}}
+            }
+        });
+        let account = json!({"account":{"planType":"pro", "email":"private-fixture"}});
+        let sample = normalize_codex_app_server(&result, &account, 1000).unwrap();
+        assert_eq!(sample["plan"], "pro");
+        assert_eq!(
+            sample["windows"],
+            json!([
+                {"id":"primary", "name":"Primary", "scope":"account", "model":null, "usedPercent":42.0, "windowSeconds":18000, "resetsAt":1795538965000i64},
+                {"id":"additional:gpt-extra:secondary", "name":"GPT Extra Secondary", "scope":"model", "model":"GPT Extra", "usedPercent":65.0, "windowSeconds":604800, "resetsAt":null}
+            ])
+        );
+        assert!(!sample.to_string().contains("private-fixture"));
     }
 
     #[test]

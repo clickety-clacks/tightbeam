@@ -5,9 +5,24 @@ defmodule Tightbeam.Harness.CapacityProbe do
 
   @error_codes ~w(
     CREDENTIAL_MISSING CREDENTIAL_REJECTED CREDENTIAL_UNREADABLE
-    CREDENTIAL_EXPIRED CREDENTIAL_EXPIRY_UNKNOWN TOKEN_SCOPE_INSUFFICIENT
+    CREDENTIAL_EXPIRED CREDENTIAL_EXPIRY_UNKNOWN TOKEN_SCOPE_INSUFFICIENT REFRESH_REJECTED
     UPSTREAM_CONTRACT_CHANGED UPSTREAM_RATE_LIMITED UPSTREAM_TIMEOUT UPSTREAM_UNAVAILABLE
   )
+
+  def provider_atom("openai"), do: :openai
+  def provider_atom("anthropic"), do: :anthropic
+
+  def local_cli_availability do
+    Map.new([Tightbeam.Harness.Codex, Tightbeam.Harness.Claude], fn harness ->
+      {to_string(harness.credential_provider()),
+       System.find_executable(harness.cli_binary()) != nil}
+    end)
+  end
+
+  @doc false
+  def idle_argv(executable, vendor_binary, provider, home) do
+    [executable, "capacity-probe", "--idle-native", to_string(provider), home, vendor_binary]
+  end
 
   def read(target, executable, provider, credential_path) do
     command = [executable, "capacity-probe", to_string(provider), credential_path]
@@ -86,6 +101,7 @@ defmodule Tightbeam.Harness.CapacityProbe do
            name: window["name"],
            used_percent: window["usedPercent"],
            resets_at: integer(window["resetsAt"]),
+           reset_after_seconds: integer(window["resetAfterSeconds"]),
            window_seconds: positive(window["windowSeconds"]),
            scope: window["scope"],
            model: string(window["model"])

@@ -1,5 +1,7 @@
 import Config
 
+config :tightbeam, :provider_accounts_enabled, false
+
 config :tightbeam, :escalation_decision_deadline_ms, 86_400_000
 
 # Compaction uses the host's existing gateway ACP access. The selected model

@@ -13,21 +13,21 @@ defmodule Tightbeam.Capacity.Pools do
     "Providers, plans, window IDs, and window durations remain separate quotas."
   ]
 
-  def aggregate(accounts_with_labels, now) do
-    accounts_with_labels =
-      Enum.sort_by(accounts_with_labels, fn {account, _} -> account.account_id end)
+  def aggregate(logins, now) do
+    logins =
+      Enum.sort_by(logins, fn {account, _, _} -> account.account_id end)
 
-    accounts = Enum.map(accounts_with_labels, &elem(&1, 0))
+    accounts = Enum.map(logins, &elem(&1, 0))
 
     pools =
-      accounts_with_labels
-      |> Enum.flat_map(fn {account, label} ->
+      logins
+      |> Enum.flat_map(fn {account, label, identity_key} ->
         Enum.map(account.windows, fn window ->
-          {pool_key(account, window), account, label, window}
+          {pool_key(account, window), account, label, window, identity_key}
         end)
       end)
       |> Enum.group_by(&elem(&1, 0))
-      |> Enum.map(fn {key, entries} -> pool(key, entries, now) end)
+      |> Enum.map(fn {key, entries} -> pool(key, representatives(key, entries), now) end)
       |> Enum.sort_by(& &1.key)
 
     comparable? = Enum.any?(pools, & &1.comparable)
@@ -96,9 +96,27 @@ defmodule Tightbeam.Capacity.Pools do
     end
   end
 
-  defp pool({key, compatibility}, [{_, first, _, first_window} | _] = entries, now) do
+  defp representatives({_, "same_capacity"}, entries) do
+    entries
+    |> Enum.sort_by(fn {_, account, _, window, _} ->
+      eligible? =
+        account.account_status == "ready" and account.status not in @unmeasurable and
+          account.history_error == nil and window.status != "stale"
+
+      {not eligible?, -(account.latest_observed_at || 0), account.account_id}
+    end)
+    |> Enum.uniq_by(fn
+      {_, account, _, _, nil} -> {:account, account.account_id}
+      {_, _, _, _, identity_key} -> {:identity, identity_key}
+    end)
+    |> Enum.sort_by(fn {_, account, _, _, _} -> account.account_id end)
+  end
+
+  defp representatives(_, entries), do: entries
+
+  defp pool({key, compatibility}, [{_, first, _, first_window, _} | _] = entries, now) do
     members =
-      Enum.map(entries, fn {_, account, label, window} -> member(account, label, window) end)
+      Enum.map(entries, fn {_, account, label, window, _} -> member(account, label, window) end)
 
     {measured, missing} = Enum.split_with(members, &measured?/1)
     remaining = Enum.sum(Enum.map(members, & &1.remaining_percent))
@@ -122,7 +140,9 @@ defmodule Tightbeam.Capacity.Pools do
       rate_48h_percent_points_per_hour: sum_rate(measured, :rate_48h_percent_per_hour),
       coverage_hours: Enum.min(Enum.map(members, & &1.coverage_hours)),
       lookback_hours:
-        entries |> Enum.map(fn {_, _, _, window} -> window.lookback_48h_hours end) |> Enum.min(),
+        entries
+        |> Enum.map(fn {_, _, _, window, _} -> window.lookback_48h_hours end)
+        |> Enum.min(),
       measured_member_count: length(measured),
       capacity_member_count: length(members),
       missing_rate_member_count: length(missing),
@@ -250,7 +270,7 @@ defmodule Tightbeam.Capacity.Pools do
   end
 
   defp member_diagnostics(entries) do
-    Enum.reduce(entries, [], fn {_, account, _, window}, diagnostics ->
+    Enum.reduce(entries, [], fn {_, account, _, window, _}, diagnostics ->
       diagnostics
       |> add_diagnostic(
         account.status == "estimated_qualified",
