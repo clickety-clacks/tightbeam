@@ -466,13 +466,13 @@ async function setup() {
     const pending = eligible.filter(({ needed }) => needed);
     const needsFirstRun = env.TIGHTBEAM_FIRST_RUN_ONBOARDING === 'true' &&
       !fs.existsSync(path.join(base, 'first-run-onboarding.done')) &&
-      /^  onboard --first-run$/m.test(command(cli, ['help', 'onboard'], { cwd: home }).stdout ?? '');
+      command(cli, ['help', 'onboard --first-run'], { cwd: home }).status === 0;
     const bwrap = available('bwrap');
     const canBubblewrap = () => command(bwrap, ['--unshare-net', '--ro-bind', '/', '/', '/bin/true']).status === 0;
     const readSysctl = (key) => command('sysctl', ['-n', key]).stdout?.trim();
     const checkNamespaces = !mac && providers.some(({ provider }) => provider === 'openai');
     const sandboxUnavailable = checkNamespaces && (!bwrap || !canBubblewrap());
-    const namespaceFix = mode === 'full' && sandboxUnavailable && bwrap;
+    const namespaceFix = mode === 'full' && sandboxUnavailable && Boolean(bwrap);
     const readiness = !receipt?.ready || versionChanged;
     const codexDisabled = mode === 'full' && sandboxUnavailable && !namespaceFix;
     const writeGateway = !fs.existsSync(gateway.file) || upgrade || receipt?.advertised !== advertised ||
@@ -481,6 +481,10 @@ async function setup() {
     const sysctlKey = namespaceFix && [
       'kernel.unprivileged_userns_clone', 'user.max_user_namespaces',
     ].find((key) => readSysctl(key) === '0');
+    const lingering = !mac && command('loginctl', ['show-user', account.username, '--property=Linger', '--value']).stdout?.trim() === 'yes';
+    const enableLinger = !mac && !lingering && available('pkcheck') &&
+      command('pkcheck', ['--action-id', 'org.freedesktop.login1.set-self-linger', '--process', String(process.pid)]).status === 0;
+    const endsAtLogout = mac || (!lingering && !enableLinger);
     const install = [];
     const notes = [];
     const add = (when, text) => { if (when) install.push(text); };
@@ -499,12 +503,15 @@ async function setup() {
     add(stage, 'Verify and stage the Tightbeam release under /opt/tightbeam and select it for the system service.');
     add(appArmor, 'Grant bubblewrap access to user namespaces through its AppArmor profile.');
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
-    if (sandboxUnavailable && !appArmor && !sysctlKey) notes.push(mode === 'quick'
-      ? 'Codex agents cannot run commands until an administrator repairs the sandbox. Run tightbeam setup --mode full from an administrator account.'
-      : 'Disable Codex on this machine because its sandbox is unavailable. Claude and Pi can run if configured.');
+    if (sandboxUnavailable && !appArmor && !sysctlKey) {
+      const installBubblewrap = !bwrap ? ' An administrator also needs to install bubblewrap.' : '';
+      notes.push(mode === 'quick'
+        ? `Codex agents cannot run commands until an administrator repairs the sandbox.${installBubblewrap} To apply the system fixes, run tightbeam setup --mode full from an administrator account.`
+        : `Disable Codex on this machine because its sandbox is unavailable.${installBubblewrap} Claude and Pi can run if configured.`);
+    }
     add(upgrade, `Replace the user gateway service with a system service while keeping all data in ${base}.`);
     add(writeGateway || startGateway, mode === 'quick'
-      ? `${versionChanged ? 'Restart' : 'Start'} a local-only Tightbeam user service with lighter isolation. It runs under your account, skips administrator sandbox changes, and can stop when you sign out.`
+      ? `${versionChanged ? 'Restart' : 'Start'} a local-only Tightbeam user service with lighter isolation. It runs the release from your home directory and skips administrator sandbox changes.${endsAtLogout ? ' It stops when you sign out.' : ''}`
       : `Start the Tightbeam system service under your ordinary user account, advertising ${chatOrigin}.`);
     add(linkCli, `Expose the Tightbeam command at ${commandLink}.`);
     add(needsPair, `Pair this computer and create the first Tightbeam administrator for ${account.username}.`);
@@ -512,7 +519,8 @@ async function setup() {
     for (const { provider, key } of withoutKeys) notes.push(`Skip ${provider} credential setup until you provide ${key}.`);
     add(needsMain, 'Create your main Tightbeam conversation.');
     add(installChatPackage, 'Download and verify the published Tightbeam Chat package.');
-    add(writeChat || startChat, 'Start local Tightbeam Chat as a user service that can stop when you sign out.');
+    add(enableLinger, 'Allow your Tightbeam user services to keep running after you sign out.');
+    add(writeChat || startChat, `Start local Tightbeam Chat as a user service.${endsAtLogout ? ' It stops when you sign out.' : ''}`);
     add(readiness || pending.length, 'Check whether this installation can run a turn.');
     add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
     for (const line of [...install, ...notes]) console.log(`- ${line}`);
@@ -543,6 +551,9 @@ async function setup() {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'tightbeam-setup-'));
     let removedQuick = false;
     try {
+      if (enableLinger && command('loginctl', ['enable-linger', account.username]).status !== 0) {
+        console.error('This account could not enable lingering. Tightbeam user services stop when you sign out.');
+      }
       try {
         if (appArmor) {
           const profile = '/etc/apparmor.d/bwrap';
