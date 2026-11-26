@@ -2,6 +2,7 @@ mod anthropic_oauth;
 mod args;
 mod attempt_diagnostic;
 mod base_dir;
+mod capacity_probe;
 mod catalog_probe;
 mod ceremonies;
 mod child_process;
@@ -112,6 +113,16 @@ fn main() {
 
     if args.first().is_some_and(|arg| arg == "catalog-probe") {
         match catalog_probe::probe(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "capacity-probe") {
+        match capacity_probe::probe(&args[1..]) {
             Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");
