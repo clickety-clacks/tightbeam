@@ -2,13 +2,13 @@
 
 A Tightbeam session has an address, a harness, and a working identity. It can receive messages, wake on events, and hold assignments. Work items record intended outcomes, assignments record who owes a result, and attests record progress, verdicts, and completion. These records outlast the conversations that produced them. See [Architecture](ARCHITECTURE.md) for the gateway and its records.
 
-Starting with 0.1.17, switching harnesses keeps the session and its work and carries working context into the first prompt in the destination harness. Tightbeam fits that context to the destination's available budget.
+Starting with 0.1.17, switching harnesses keeps the session, conversation history, and assignments. The destination harness receives working context in its first prompt. Tightbeam fits that context to the destination's available budget.
 
 ## Archetypes and kungfu
 
 An archetype supplies guidance and skills for an agent's job. A kungfu bundle can supply archetypes, guidance, skills, and rails for a domain. Rails enforce a condition, such as requiring a review before an assignment can be completed.
 
-Main starts with a neutral identity. Uncle Enzo is a shipped kungfu bundle for software work. Its executive keeps track of your intent and works with deliverators who each own delivery of a feature or concern. Use `tightbeam kungfu list` to see the bundles available in your version. Learning or unlearning a bundle does not transfer responsibility for existing assignments or change provider credentials.
+Main starts with a neutral identity. Uncle Enzo is the primary shipped kungfu. It uses a mostly flat delivery structure. An executive holds your intent and talks to you, deliverators each own delivery of a feature or concern, and generic agents do the work with briefs tailored to their assignments. Use `tightbeam kungfu list` to see the bundles available in your version. Learning or unlearning a bundle does not transfer responsibility for existing assignments or change provider credentials.
 
 ## Models and gateway settings
 

@@ -40,7 +40,7 @@ brew install clickety-clacks/tap/tightbeam
 tightbeam setup --mode full
 ```
 
-Setup shows its plan and asks for confirmation before proceeding.
+Setup shows its plan and asks for confirmation before proceeding. If your coding agent is installing for you, stay available to confirm the plan and authorize administrator access when prompted.
 
 For releases without `tightbeam setup`, follow the [install instructions for your release](https://github.com/clickety-clacks/tightbeam/releases).
 
