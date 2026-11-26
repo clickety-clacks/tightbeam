@@ -177,7 +177,8 @@ jobs:
           if git cat-file -e "$CANDIDATE_SHA:cli/src/setup.mjs" 2>/dev/null; then
             for package in "$darwin_source" "$linux_source"; do
               if ! tar -xOf "$package" tightbeam/setup-build.json |
-                jq -e --slurp --arg commit "$CANDIDATE_SHA" --arg tag "$RELEASE_TAG"                   'length == 1 and .[0].commit == $commit and .[0].tag == $tag' >/dev/null; then
+                jq -e --slurp --arg commit "$CANDIDATE_SHA" --arg tag "$RELEASE_TAG" \
+                  'length == 1 and .[0].commit == $commit and .[0].tag == $tag' >/dev/null; then
                 echo "release: missing or invalid setup build identity in $package" >&2
                 exit 1
               fi
