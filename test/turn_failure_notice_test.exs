@@ -121,6 +121,73 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     assert refusal_prompt =~ "did not perform work"
   end
 
+  # The receipt check as shipped before the split, kept to prove the same answers.
+  @shipped_initial_admitted_sql """
+  SELECT 1 FROM wakes WHERE wakeId=?1 OR (wakeId>=?2 AND wakeId<?3)
+  UNION ALL
+  SELECT 1 FROM turns WHERE wakeId>=?2 AND wakeId<?3
+  UNION ALL
+  SELECT 1 FROM sessions recipient
+  WHERE EXISTS (
+    SELECT 1 FROM messages
+    WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam'
+      AND (clientMessageId=?4 OR (clientMessageId>=?6 AND clientMessageId<?7))
+      AND substr(content,-length(?5))=?5
+  )
+  LIMIT 1
+  """
+
+  test "the split receipt check gives the shipped query's answer in every message case", ctx do
+    suffix = "\nReason: the provider refused"
+
+    cases = [
+      {"exact id", 101, ctx.lane.session_key, "process:tightbeam", "wake-undelivered:101",
+       "notice" <> suffix, true},
+      {"assignment range id", 102, ctx.lane.session_key, "process:tightbeam",
+       "wake-undelivered:102:asg_review", "notice" <> suffix, true},
+      {"another existing session", 103, ctx.reviewer.session_key, "process:tightbeam",
+       "wake-undelivered:103", "notice" <> suffix, true},
+      {"a session that does not exist", 104, "agent:gone", "process:tightbeam",
+       "wake-undelivered:104", "notice" <> suffix, false},
+      {"another device", 105, ctx.lane.session_key, "user", "wake-undelivered:105",
+       "notice" <> suffix, false},
+      {"wrong reason suffix", 106, ctx.lane.session_key, "process:tightbeam",
+       "wake-undelivered:106", "notice\nReason: something else", false},
+      {"a longer sequence sharing the prefix", 107, ctx.lane.session_key, "process:tightbeam",
+       "wake-undelivered:1070", "notice" <> suffix, false},
+      {"assignment range id with a wrong reason suffix", 108, ctx.lane.session_key,
+       "process:tightbeam", "wake-undelivered:108:asg_review", "notice\nReason: something else",
+       false}
+    ]
+
+    for {label, seq, session_key, device_id, client_message_id, content, expected} <- cases do
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO messages(id,sessionKey,role,content,timestamp,deviceId,clientMessageId,llmVisibleMessageId)
+          VALUES (?1,?2,'assistant',?3,1,?4,?5,?1)
+          """,
+          ["m_#{seq}", session_key, content, device_id, client_message_id]
+        )
+
+      args = [
+        "w_health_redelivery_parent_#{seq}",
+        "bubble:#{seq}:",
+        "bubble:#{seq};",
+        "wake-undelivered:#{seq}",
+        suffix,
+        "wake-undelivered:#{seq}:",
+        "wake-undelivered:#{seq};"
+      ]
+
+      assert {:ok, shipped} = DB.query(ctx.db, @shipped_initial_admitted_sql, args)
+      assert {:ok, split} = DB.query(ctx.db, TurnFailureNotice.initial_admitted_sql(), args)
+      assert split == shipped, label
+      assert {label, split != []} == {label, expected}
+    end
+  end
+
   test "the cross-session receipt check seeks the message dedupe index, never every session's messages",
        ctx do
     args = [
