@@ -250,6 +250,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert %{"rules" => [%{"name" => "example-rule", "revision" => ^revision}]} =
              JSON.decode!(shown)
 
+    assert {outside, 0} =
+             run.(["show", "--role", "cli-holder", "--session", ctx.worker.session_key])
+
+    assert %{"rules" => []} = JSON.decode!(outside)
+
     assert {withdrawn, 0} = run.(["withdraw", "--role", "cli-holder", "--name", "example-rule"])
     assert %{"name" => "example-rule"} = JSON.decode!(withdrawn)
 

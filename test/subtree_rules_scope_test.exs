@@ -837,6 +837,64 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
                saved_call(ctx, "rule-show", "member", %{session_key: "member"})
     end
 
+    test "incompatible stored revisions are skipped and reported without disabling healthy rules",
+         ctx do
+      names = ~w(broken-definition broken-json healthy-definition)
+      toml = Enum.map_join(names, &scoped_rule(&1, "work-item-close", nil))
+
+      assert %{rules: [%{revision: incompatible}, %{revision: malformed}, _]} =
+               saved_call(ctx, "rule-set", "lead", %{role: "team:alpha", toml: toml})
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE saved_rules SET definition=json_remove(definition,'$.text') WHERE revision=?1",
+                 [incompatible]
+               )
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "UPDATE saved_rules SET definition='{' WHERE revision=?1", [
+                 malformed
+               ])
+
+      seed_work_item!(ctx.db, "wi-member", "member", nil)
+      call = user_call("work-item-close", "wi-member")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert_denied_by(Rules.evaluate(ctx.db, call), "healthy-definition")
+        end)
+
+      assert log =~ "saved rule team:alpha/broken-definition revision #{incompatible} unavailable"
+      assert log =~ "saved rule team:alpha/broken-json revision #{malformed} unavailable"
+
+      for params <- [%{}, %{role: "team:alpha", session_key: "member"}] do
+        assert %{
+                 rules: [
+                   %{revision: ^incompatible, covers_nobody: true, unavailable_reason: reason},
+                   %{
+                     revision: ^malformed,
+                     covers_nobody: true,
+                     unavailable_reason: malformed_reason
+                   },
+                   %{name: "healthy-definition", covers_nobody: false}
+                 ]
+               } = saved_call(ctx, "rule-show", "lead", params)
+
+        assert reason =~ "missing or blank text"
+        assert is_binary(malformed_reason)
+      end
+
+      assert %{rules: []} =
+               saved_call(ctx, "rule-show", "lead", %{session_key: "outsider"})
+
+      assert %{withdrawn_revision: ^incompatible} =
+               saved_call(ctx, "rule-withdraw", "lead", %{
+                 role: "team:alpha",
+                 name: "broken-definition"
+               })
+    end
+
     test "a saved check keeps the executable used to validate its revision", ctx do
       bytes = "#!/bin/sh\nprintf 'blocked\\n'\n"
       script = Path.join(ctx.base_dir, "identity/rails/scripts/check-saved")

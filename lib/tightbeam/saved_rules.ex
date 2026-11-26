@@ -3,6 +3,7 @@ defmodule Tightbeam.SavedRules do
 
   alias Tightbeam.{DB, FeatureFlags, RailScope, Rules, SubtreeScope}
   alias Tightbeam.DB.Txn
+  require Logger
 
   @ddl """
   CREATE TABLE IF NOT EXISTS saved_rules (
@@ -118,7 +119,7 @@ defmodule Tightbeam.SavedRules do
       {:error, reason} -> invalid("invalid TOML: #{inspect(reason)}")
     end
   rescue
-    error in [ArgumentError, File.Error] -> invalid(Exception.message(error))
+    error -> invalid(Exception.message(error))
   end
 
   defp validate(_role, _toml), do: invalid("expected TOML text")
@@ -181,8 +182,18 @@ defmodule Tightbeam.SavedRules do
   def compiled(db, kind, verb \\ nil) do
     if FeatureFlags.subtree_rules?() do
       rows(db, kind, verb)
-      |> Enum.map(fn [role, _, entry_kind, definition, hash, revision, _, _, bytes] ->
-        compile_row(role, entry_kind, definition, hash, revision, bytes)
+      |> Enum.flat_map(fn [role, name, _, _, _, revision | _] = row ->
+        case compile_row(row) do
+          {:ok, rule} ->
+            [rule]
+
+          {:error, reason} ->
+            Logger.warning(
+              "saved rule #{role}/#{name} revision #{revision} unavailable: #{reason}"
+            )
+
+            []
+        end
       end)
     else
       []
@@ -210,17 +221,13 @@ defmodule Tightbeam.SavedRules do
   defp show(txn, role, session) do
     lineage = if is_binary(session), do: SubtreeScope.lineage(txn, session), else: []
 
-    for [anchor, name, kind, definition, hash, revision, author, at, bytes] <- rows(txn, nil),
+    for [anchor, name, kind, _, hash, revision, author, at, _] = row <- rows(txn, nil),
         is_nil(role) or role == anchor,
         holder <- [SubtreeScope.anchor_holder(txn, anchor)],
-        is_nil(session) or is_nil(holder) or
-          (holder in lineage and
-             audience_matches?(
-               txn,
-               session,
-               compile_row(anchor, kind, definition, hash, revision, bytes)
-             )) do
-      %{
+        is_nil(session) or is_nil(holder) or holder in lineage,
+        result <- [compile_row(row)],
+        is_nil(session) or is_nil(holder) or audience_matches?(txn, session, result) do
+      report = %{
         role: anchor,
         name: name,
         kind: kind,
@@ -231,15 +238,28 @@ defmodule Tightbeam.SavedRules do
         anchor_session_key: holder,
         covers_nobody: is_nil(holder)
       }
+
+      case result do
+        {:ok, _rule} ->
+          report
+
+        {:error, reason} ->
+          %{report | covers_nobody: true}
+          |> Map.put(:unavailable_reason, reason)
+      end
     end
   end
 
-  defp compile_row(role, kind, definition, hash, revision, bytes) do
+  defp compile_row([role, _, kind, definition, hash, revision, _, _, bytes]) do
     bytes = if bytes, do: Base.decode64!(bytes)
-    Rules.compile_saved!(role, kind, JSON.decode!(definition), hash, revision, bytes)
+    {:ok, Rules.compile_saved!(role, kind, JSON.decode!(definition), hash, revision, bytes)}
+  rescue
+    error -> {:error, Exception.message(error)}
   end
 
-  defp audience_matches?(txn, session, rule) do
+  defp audience_matches?(_txn, _session, {:error, _reason}), do: true
+
+  defp audience_matches?(txn, session, {:ok, rule}) do
     case Txn.q(txn, "SELECT archetype FROM sessions WHERE sessionKey=?1 AND state='active'", [
            session
          ]) do
@@ -265,8 +285,11 @@ defmodule Tightbeam.SavedRules do
         FROM saved_rules
         WHERE endedAt IS NULL
           AND (?1 IS NULL OR (?1='rule' AND kind='rule') OR (?1='reaction' AND kind!='rule'))
-          AND (?2 IS NULL OR json_extract(definition,'$.verb')=?2
-               OR EXISTS (SELECT 1 FROM json_each(definition,'$.verbs') WHERE value=?2))
+          AND CASE
+            WHEN ?2 IS NULL OR NOT json_valid(definition) THEN 1
+            ELSE json_extract(definition,'$.verb')=?2
+              OR EXISTS (SELECT 1 FROM json_each(definition,'$.verbs') WHERE value=?2)
+          END
         ORDER BY role,name
         """,
         [kind, verb]
