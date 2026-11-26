@@ -1865,6 +1865,14 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   def register_work_item_wait_in_txn(txn, input, declaration) do
+    if Tightbeam.WorkItemWaits.enabled?() do
+      register_enabled_work_item_wait_in_txn(txn, input, declaration)
+    else
+      {:error, Tightbeam.WorkItemWaits.disabled_error()}
+    end
+  end
+
+  defp register_enabled_work_item_wait_in_txn(txn, input, declaration) do
     with :ok <- Tightbeam.WaitReason.validate(input[:wait_reason], "--wait-reason"),
          {:ok, _contracts} <- dependency_contracts(declaration.conditions),
          {:ok, resolver} <-

@@ -1235,9 +1235,13 @@ defmodule Tightbeam.WorkItems do
         item ->
           %{
             workItem: Mementos.attach(db, "work_item", handler_detail_work_item(db, item)),
-            assignments: Tightbeam.Assignments.__for_work_item__(db, item.id),
-            wait: Tightbeam.WorkItemWaits.get(db, item.id)
+            assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
+          |> then(fn result ->
+            if Tightbeam.WorkItemWaits.enabled?(),
+              do: Map.put(result, :wait, Tightbeam.WorkItemWaits.get(db, item.id)),
+              else: result
+          end)
       end
     end
   end

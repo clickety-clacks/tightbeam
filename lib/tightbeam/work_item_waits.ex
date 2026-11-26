@@ -3,6 +3,12 @@ defmodule Tightbeam.WorkItemWaits do
   alias Tightbeam.{DB, Wakes, RowReactions, Org, Gateway}
   alias Tightbeam.DB.Txn
 
+  def enabled?, do: Application.get_env(:tightbeam, :work_item_waits_enabled, false) == true
+
+  def disabled_error do
+    %{code: "feature_disabled", message: "Work-item waits are disabled; enable work_item_waits_enabled to use this command."}
+  end
+
   def ensure_schema(db) do
     DB.execute(db, """
     CREATE TABLE IF NOT EXISTS work_item_waits (
@@ -21,6 +27,10 @@ defmodule Tightbeam.WorkItemWaits do
   end
 
   def get_in_txn(txn, id) do
+    if enabled?(), do: get_in_txn_enabled(txn, id), else: nil
+  end
+
+  defp get_in_txn_enabled(txn, id) do
     case Txn.q(txn, "SELECT wakeId,releasedAt FROM work_item_waits WHERE workItemId=?1", [id]) do
       [[wake_id, released_at]] ->
         wake = Wakes.get_in_txn(txn, wake_id)
@@ -45,15 +55,27 @@ defmodule Tightbeam.WorkItemWaits do
   end
 
   def active_in_txn?(txn, id) do
+    if enabled?(), do: active_in_txn_enabled?(txn, id), else: false
+  end
+
+  defp active_in_txn_enabled?(txn, id) do
     Txn.q(txn, "SELECT 1 FROM work_item_waits WHERE workItemId=?1 AND releasedAt IS NULL", [id]) !=
       []
   end
 
   def linked_in_txn?(txn, wake_id) do
+    if enabled?(), do: linked_in_txn_enabled?(txn, wake_id), else: false
+  end
+
+  defp linked_in_txn_enabled?(txn, wake_id) do
     Txn.q(txn, "SELECT 1 FROM work_item_waits WHERE wakeId=?1", [wake_id]) != []
   end
 
-  def apply_in_txn(txn, item, call, :record) do
+  def apply_in_txn(txn, item, call, operation) do
+    if enabled?(), do: apply_enabled_in_txn(txn, item, call, operation), else: disabled_error()
+  end
+
+  defp apply_enabled_in_txn(txn, item, call, :record) do
     with :ok <- bare_open(txn, item),
          :ok <- Tightbeam.WaitReason.validate(call.params[:wait_reason], "--wait-reason"),
          {:ok, declaration} <- declaration(txn, call.params),
@@ -107,7 +129,7 @@ defmodule Tightbeam.WorkItemWaits do
     end
   end
 
-  def apply_in_txn(txn, item, call, :withdraw) do
+  defp apply_enabled_in_txn(txn, item, call, :withdraw) do
     case get_in_txn(txn, item.id) do
       nil ->
         %{wait: nil}
@@ -197,6 +219,10 @@ defmodule Tightbeam.WorkItemWaits do
   # Called only after the resolver and predicate have validated. Keep replacement,
   # reminder withdrawal and snapshot recognition in the registration transaction.
   def link_in_txn(txn, id, wake) do
+    if enabled?(), do: link_in_txn_enabled(txn, id, wake), else: disabled_error()
+  end
+
+  defp link_in_txn_enabled(txn, id, wake) do
     case get_in_txn(txn, id) do
       nil ->
         :ok
@@ -250,6 +276,10 @@ defmodule Tightbeam.WorkItemWaits do
   end
 
   def release_in_txn(txn, wake_id) do
+    if enabled?(), do: release_in_txn_enabled(txn, wake_id), else: :ok
+  end
+
+  defp release_in_txn_enabled(txn, wake_id) do
     case Txn.q(
            txn,
            "SELECT workItemId FROM work_item_waits WHERE wakeId=?1 AND releasedAt IS NULL",
@@ -285,6 +315,10 @@ defmodule Tightbeam.WorkItemWaits do
   end
 
   def dispose_in_txn(txn, id, transition_id) do
+    if enabled?(), do: dispose_in_txn_enabled(txn, id, transition_id), else: :ok
+  end
+
+  defp dispose_in_txn_enabled(txn, id, transition_id) do
     case get_in_txn(txn, id) do
       nil ->
         :ok
@@ -341,6 +375,10 @@ defmodule Tightbeam.WorkItemWaits do
   end
 
   def readdress_in_txn(txn, wake_id) do
+    if enabled?(), do: readdress_in_txn_enabled(txn, wake_id), else: :ok
+  end
+
+  defp readdress_in_txn_enabled(txn, wake_id) do
     case Txn.q(txn, "SELECT workItemId FROM work_item_waits WHERE wakeId=?1", [wake_id]) do
       [[id]] ->
         target = recipient(txn, id)

@@ -59,6 +59,13 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   setup do
+    previous_item_wait_flag = Application.get_env(:tightbeam, :work_item_waits_enabled)
+    Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+    on_exit(fn ->
+      if is_nil(previous_item_wait_flag),
+        do: Application.delete_env(:tightbeam, :work_item_waits_enabled),
+        else: Application.put_env(:tightbeam, :work_item_waits_enabled, previous_item_wait_flag)
+    end)
     db = :"brackets_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: ConnRegistry})
@@ -100,6 +107,21 @@ defmodule Tightbeam.WorkItemBracketsTest do
       holder: holder,
       dsession: dsession
     }
+  end
+
+  test "item waits default off refuses commands without storing wakes or links", ctx do
+    Application.delete_env(:tightbeam, :work_item_waits_enabled)
+    refute Tightbeam.WorkItemWaits.enabled?()
+    item = create(ctx, {:user, "flynn"}, %{title: "Flag off"})
+    before = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes", [])
+    for verb <- ["work-item-wait", "work-item-wait-withdraw"] do
+      assert %{code: "feature_disabled"} =
+        ctx.handlers[verb].(work_item_call(verb, {:user, "flynn"}, %{work_item_id: item.id}))
+    end
+    assert DB.query(ctx.db, "SELECT COUNT(*) FROM wakes", []) == before
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM work_item_waits", [])
+    result = ctx.handlers["work-item-get"].(work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: item.id}))
+    refute Map.has_key?(result, :wait)
   end
 
   test "custody transfer keeps assigned and bare item ownership after source retirement", ctx do
