@@ -46,6 +46,8 @@ defmodule Tightbeam.ExecutionMap do
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
+  @empty_turn_summary %{total: 0, last_ended_at: nil, running: false, minds: []}
+  @rest_work_item_batch_size 256
   @rest_assignment_batch_size 900
   @rest_attest_page_size 2_000
   @terminal_states ~w(closed failed iceboxed)
@@ -56,18 +58,110 @@ defmodule Tightbeam.ExecutionMap do
   )
   @doc "The canonical D2 flat ExecutionMap collection query."
   def list_execution_map(db, call) do
-    with_rest_world(db, call, fn world ->
-      {world, appearing} = execution_map_appearing(world, call.filters)
-      page = execution_map_page(appearing, call.boundary, call.limit)
+    with_rest_snapshot(db, call, fn txn ->
+      context = rest_context(txn, call)
+      page = rest_flat_page(context, call)
+      world = rest_page_world(context, page.items)
       world = load_turn_summaries(world, page.items)
 
       %{
         items: Enum.map(page.items, &rest_node(world, &1)),
         flags: %{has_more_before: page.has_more_before, has_more_after: page.has_more_after},
-        dependency_version: world.dependency_version,
+        dependency_version: rest_scoped_dependency(context),
         attribution_cutoff: world.cutoff
       }
     end)
+  end
+
+  defp rest_flat_page(context, call) do
+    if is_nil(call.filters["quietOverMs"]) do
+      rest_work_item_page(context.txn, call)
+    else
+      rest_quiet_page(context, call)
+    end
+  end
+
+  defp rest_work_item_page(txn, call) do
+    filters =
+      [
+        {"state", "state"},
+        {"ownerUserId", "ownerUserId"},
+        {"sessionKey", "createdBySession"},
+        {"specRefName", "specRefName"},
+        {"specRefSha256", "specRefSha256"}
+      ]
+      |> Enum.reduce(%{}, fn {source, target}, filters ->
+        case call.filters[source] do
+          nil -> filters
+          value -> Map.put(filters, target, [value])
+        end
+      end)
+      |> Map.put("executionMapOrigin", call.filters["origin"])
+
+    page =
+      StateResources.query_work_item_page(
+        txn,
+        filters,
+        %{rest_principal: call.principal, include_work_item_summary: false},
+        call.boundary,
+        call.limit
+      )
+
+    %{
+      items: Enum.map(page.rows, &rest_work_item/1),
+      has_more_before: page.has_more_before,
+      has_more_after: page.has_more_after
+    }
+  end
+
+  defp rest_quiet_page(context, call) do
+    boundary = call.boundary
+    limit = call.limit
+    bound = call.filters["quietOverMs"]
+
+    {candidates, first, last} =
+      context
+      |> rest_item_pages(call.filters)
+      |> Enum.reduce({[], nil, nil}, fn items, {kept, first, last} ->
+        world = rest_scope(context, items)
+        details = rest_details(world, rest_member_ids(world.by_item))
+        world = world |> Map.merge(rest_telemetry(details)) |> load_turn_summaries(items)
+        quiet = Enum.filter(items, &rest_quiet_item?(world, &1, bound))
+        matches = Enum.filter(quiet, &rest_boundary_match?(&1, boundary))
+
+        kept =
+          case boundary do
+            :latest -> Enum.take(kept ++ matches, -(limit + 1))
+            {:before, _} -> Enum.take(kept ++ matches, -(limit + 1))
+            _ -> Enum.take(kept ++ matches, limit + 1)
+          end
+
+        {kept, first || List.first(quiet), List.last(quiet) || last}
+      end)
+
+    candidates
+    |> Kernel.++([first, last])
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(& &1.id)
+    |> Enum.sort_by(&{&1.created_at, &1.id})
+    |> execution_map_page(boundary, limit)
+  end
+
+  defp rest_boundary_match?(item, {:before, [time, id]}),
+    do: {item.created_at, item.id} < {time, id}
+
+  defp rest_boundary_match?(item, {:after, [time, id]}),
+    do: {item.created_at, item.id} > {time, id}
+
+  defp rest_boundary_match?(_item, _boundary), do: true
+
+  defp rest_quiet_item?(world, item, bound) do
+    set = Map.get(world.by_item, item.id, [])
+    turns = Map.get(world.turn_summaries, item.id, @empty_turn_summary)
+
+    not turns.running and
+      world.now - anchor(world, item, set, turns.last_ended_at) > bound and
+      not pending_session_wake?(world, current_holders(world, set))
   end
 
   @doc "The canonical D2 ExecutionMap forest query."
@@ -655,8 +749,6 @@ defmodule Tightbeam.ExecutionMap do
     Enum.reduce(set, 0, &(&2 + Map.get(world.open_requests, &1, 0)))
   end
 
-  @empty_turn_summary %{total: 0, last_ended_at: nil, running: false, minds: []}
-
   defp turn_summary(%{turn_summaries: summaries}, id) do
     summary = Map.get(summaries, id, @empty_turn_summary)
     %{summary | minds: sort_minds(Enum.reverse(summary.minds))}
@@ -878,12 +970,15 @@ defmodule Tightbeam.ExecutionMap do
   ## REST D2 query path. Source admission happens before every derived map.
 
   defp with_rest_world(db, call, fun) do
+    with_rest_snapshot(db, call, fn txn -> fun.(rest_world(txn, call)) end)
+  end
+
+  defp with_rest_snapshot(db, call, fun) do
     principal = Map.fetch!(call, :principal)
 
     case DB.read_transaction(db, fn txn ->
            txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
-           world = rest_world(txn, call)
-           fun.(world)
+           fun.(txn)
          end) do
       {:ok, result} -> result
       {:error, error} -> raise error
@@ -891,8 +986,210 @@ defmodule Tightbeam.ExecutionMap do
   end
 
   defp rest_world(txn, call) do
+    world = rest_structure(txn, call)
+    assignment_ids = rest_member_ids(world.by_item)
+    details = rest_details(world, assignment_ids)
+
+    world
+    |> Map.merge(rest_telemetry(details))
+    |> Map.put(:dependency_version, rest_scoped_dependency(world))
+  end
+
+  defp rest_context(txn, call) do
+    %{
+      txn: txn,
+      principal: call.principal,
+      cutoff: CausalEvents.epoch(txn),
+      now: Map.get(call, :now) || System.system_time(:millisecond),
+      turn_summaries: %{}
+    }
+  end
+
+  defp rest_page_world(context, items) do
+    world = rest_scope(context, items)
+    details = rest_details(world, rest_member_ids(world.by_item))
+
+    world
+    |> Map.merge(rest_telemetry(details))
+    |> Map.put(:parents, rest_scoped_parents(context, items))
+  end
+
+  defp rest_scoped_parents(context, items) do
+    case Enum.reduce_while(items, %{}, fn item, linked ->
+           case rest_candidate_parent(context, item) do
+             nil ->
+               {:cont, linked}
+
+             parent ->
+               if rest_cycle_member?(context, parent, item.id, MapSet.new()) do
+                 {:halt, :cyclic}
+               else
+                 {:cont, Map.put(linked, item.id, parent.id)}
+               end
+           end
+         end) do
+      :cyclic ->
+        # The legacy edge removed from a cycle depends on the earliest
+        # visible item that reaches it, including items outside the page.
+        context.txn
+        |> rest_structure(context)
+        |> Map.fetch!(:parents)
+        |> Map.take(Enum.map(items, & &1.id))
+
+      linked ->
+        parents(items, linked)
+    end
+  end
+
+  defp rest_cycle_member?(_context, %{id: id}, id, _visited), do: true
+  defp rest_cycle_member?(_context, nil, _root, _visited), do: false
+
+  defp rest_cycle_member?(context, item, root, visited) do
+    if MapSet.member?(visited, item.id) do
+      false
+    else
+      rest_cycle_member?(
+        context,
+        rest_candidate_parent(context, item),
+        root,
+        MapSet.put(visited, item.id)
+      )
+    end
+  end
+
+  defp rest_candidate_parent(context, %{context_known: true, created_in_turn_seq: seq} = item)
+       when is_integer(seq) do
+    turn = Map.get(rest_creation_turns(context.txn, context.principal, [item]), seq)
+
+    id =
+      case turn do
+        %{job_ref: ref} when is_binary(ref) -> ref
+        %{assignment_id: id} when is_binary(id) -> rest_assignment_target(context, id)
+        _ -> nil
+      end
+
+    if is_binary(id) do
+      case StateResources.query_work_item(context.txn, id, %{
+             rest_principal: context.principal,
+             include_work_item_summary: false
+           }) do
+        nil -> nil
+        row -> rest_work_item(row)
+      end
+    end
+  end
+
+  defp rest_candidate_parent(_context, _item), do: nil
+
+  defp rest_scope(context, items) do
+    members =
+      rest_scoped_assignments(context.txn, context.principal, Enum.map(items, & &1.id), nil, -1)
+
+    rest_scope(context, items, members)
+  end
+
+  defp rest_scope(context, items, members) do
+    Map.merge(context, %{
+      items: items,
+      items_by_id: Map.new(items, &{&1.id, &1}),
+      assignments_by_id: Map.new(members, fn {_item_id, row} -> {row.id, row} end),
+      by_item: Enum.group_by(members, &elem(&1, 0), fn {_item_id, row} -> row.id end)
+    })
+  end
+
+  # Fixed batches make the principal-wide token independent of the requested
+  # filter, cursor and REST view. Off-page rows contribute revisions only.
+  defp rest_scoped_dependency(context) do
+    context
+    |> rest_version_pages()
+    |> Enum.reduce(:crypto.hash_init(:sha256), fn items, hash ->
+      ids = Enum.map(items, & &1.id)
+
+      context
+      |> rest_member_pages(ids)
+      |> Enum.reduce(hash, fn members, hash ->
+        world = rest_scope(context, items, members)
+        assignment_ids = rest_member_ids(world.by_item)
+        details = rest_details(world, assignment_ids, false)
+        token = rest_world_dependency(world, details, assignment_ids)
+        attests = rest_attest_dependency(world.txn, world.principal, assignment_ids)
+        evidence = rest_evidence_dependency(world.txn, ids, assignment_ids)
+        :crypto.hash_update(hash, [token, attests, evidence])
+      end)
+    end)
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
+  end
+
+  defp rest_member_pages(context, item_ids) do
+    Stream.unfold(:first, fn
+      :done ->
+        nil
+
+      boundary ->
+        after_id = if boundary == :first, do: nil, else: boundary
+
+        members =
+          rest_scoped_assignments(
+            context.txn,
+            context.principal,
+            item_ids,
+            after_id,
+            @rest_assignment_batch_size + 1
+          )
+
+        if length(members) > @rest_assignment_batch_size do
+          page = Enum.take(members, @rest_assignment_batch_size)
+          {_item, last} = List.last(page)
+          {page, last.id}
+        else
+          {members, :done}
+        end
+    end)
+  end
+
+  defp rest_version_pages(context) do
+    rest_page_stream(fn boundary ->
+      StateResources.query_work_item_version_page(
+        context.txn,
+        context.principal,
+        boundary,
+        @rest_work_item_batch_size
+      )
+    end)
+  end
+
+  defp rest_item_pages(context, filters) do
+    rest_page_stream(fn boundary ->
+      rest_work_item_page(context.txn, %{
+        principal: context.principal,
+        filters: filters,
+        boundary: boundary,
+        limit: @rest_work_item_batch_size
+      })
+    end)
+  end
+
+  defp rest_page_stream(fetch_page) do
+    Stream.unfold(:earliest, fn
+      nil ->
+        nil
+
+      boundary ->
+        page = fetch_page.(boundary)
+
+        next_boundary =
+          if page.has_more_after do
+            item = List.last(page.items)
+            {:after, [item.created_at, item.id]}
+          end
+
+        {page.items, next_boundary}
+    end)
+  end
+
+  defp rest_structure(txn, call) do
     principal = call.principal
-    cutoff = CausalEvents.epoch(txn)
 
     items =
       StateResources.query_work_item(txn, %{}, %{rest_principal: principal})
@@ -904,50 +1201,14 @@ defmodule Tightbeam.ExecutionMap do
     assignments_by_id = Map.new(assignments, &{&1.id, &1})
     resolved = resolve_all(assignments, assignments_by_id)
     by_item = membership(resolved, items_by_id)
-
-    visible_assignment_ids =
-      by_item |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
-
     turns_by_seq = rest_creation_turns(txn, principal, items)
-
-    {turn_dependency, turn_sessions} =
-      rest_turn_dependency(txn, principal, Map.keys(items_by_id), visible_assignment_ids)
-
     linked = retain_acyclic(items, candidate_edges(items, items_by_id, turns_by_seq, resolved))
-    attests = rest_allowed_attests(txn, principal, visible_assignment_ids)
-
-    {wakes, pending_wake_sessions, pending_wake_classes_by_session} =
-      rest_allowed_pending_wakes(txn, principal, assignments_by_id, by_item)
-
-    {requests, open_requests} =
-      rest_allowed_open_requests(txn, principal, visible_assignment_ids)
-
-    {markers, markers_by_assignment} =
-      rest_allowed_markers(txn, visible_assignment_ids)
-
-    {disposition_rows, dispositions} = rest_allowed_dispositions(txn, items_by_id)
-
-    visibility_rows = rest_visibility_rows(txn, principal, turn_sessions, wakes)
-
-    dependency_entries =
-      rest_dependency_entries(
-        items,
-        assignments_by_id,
-        visible_assignment_ids,
-        attests,
-        wakes,
-        requests,
-        markers,
-        disposition_rows,
-        visibility_rows,
-        cutoff
-      )
 
     %{
       txn: txn,
       now: Map.get(call, :now) || System.system_time(:millisecond),
       principal: principal,
-      cutoff: cutoff,
+      cutoff: CausalEvents.epoch(txn),
       items: items,
       items_by_id: items_by_id,
       assignments_by_id: assignments_by_id,
@@ -955,19 +1216,86 @@ defmodule Tightbeam.ExecutionMap do
       by_item: by_item,
       turn_summaries: %{},
       linked: linked,
-      parents: parents(items, linked),
-      attests_by_assignment: Enum.group_by(attests, & &1.assignment_id),
-      commit_refs:
-        Map.new(attests, fn attest ->
-          {attest.id, attest.commit_refs}
-        end),
-      markers_by_assignment: markers_by_assignment,
-      open_requests: open_requests,
-      pending_wake_sessions: pending_wake_sessions,
-      pending_wake_classes_by_session: pending_wake_classes_by_session,
-      dispositions: dispositions,
-      dependency_version: dependency_version(dependency_entries, turn_dependency)
+      parents: parents(items, linked)
     }
+  end
+
+  defp rest_member_ids(by_item) do
+    by_item |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
+  end
+
+  defp rest_details(world, assignment_ids, telemetry? \\ true) do
+    %{txn: txn, principal: principal} = world
+    attests = if telemetry?, do: rest_allowed_attests(txn, principal, assignment_ids), else: []
+
+    {wakes, pending_wake_sessions, pending_wake_classes_by_session} =
+      rest_allowed_pending_wakes(txn, principal, world.assignments_by_id, world.by_item)
+
+    {requests, open_requests} = rest_allowed_open_requests(txn, principal, assignment_ids)
+
+    markers_by_assignment =
+      if telemetry? do
+        {_rows, by_assignment} = rest_allowed_markers(txn, assignment_ids)
+        by_assignment
+      else
+        %{}
+      end
+
+    dispositions =
+      if telemetry? do
+        {_rows, by_item} = rest_allowed_dispositions(txn, world.items_by_id)
+        by_item
+      else
+        %{}
+      end
+
+    %{
+      attests: attests,
+      wakes: wakes,
+      requests: requests,
+      dispositions: dispositions,
+      open_requests: open_requests,
+      markers_by_assignment: markers_by_assignment,
+      pending_wake_sessions: pending_wake_sessions,
+      pending_wake_classes_by_session: pending_wake_classes_by_session
+    }
+  end
+
+  defp rest_telemetry(details) do
+    details
+    |> Map.take([
+      :dispositions,
+      :open_requests,
+      :markers_by_assignment,
+      :pending_wake_sessions,
+      :pending_wake_classes_by_session
+    ])
+    |> Map.put(:attests_by_assignment, Enum.group_by(details.attests, & &1.assignment_id))
+    |> Map.put(:commit_refs, Map.new(details.attests, &{&1.id, &1.commit_refs}))
+  end
+
+  defp rest_world_dependency(world, details, assignment_ids) do
+    {turn_dependency, turn_sessions} =
+      rest_turn_dependency(
+        world.txn,
+        world.principal,
+        Map.keys(world.items_by_id),
+        assignment_ids
+      )
+
+    visibility_rows =
+      rest_visibility_rows(world.txn, world.principal, turn_sessions, details.wakes)
+
+    world.items
+    |> rest_dependency_entries(
+      world.assignments_by_id,
+      assignment_ids,
+      details.wakes,
+      details.requests,
+      visibility_rows,
+      world.cutoff
+    )
+    |> dependency_version(turn_dependency)
   end
 
   defp rest_work_item(row) do
@@ -989,6 +1317,71 @@ defmodule Tightbeam.ExecutionMap do
     }
   end
 
+  @rest_assignment_visibility """
+  (?1 = 1 OR
+    (?2 = 'session' AND (a.holderKey = ?3 OR COALESCE(a.currentOpenerSessionKey,a.openedBySession) = ?3)) OR
+    (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3)))
+  """
+
+  defp rest_assignment_target(context, id) do
+    case Txn.q(
+           context.txn,
+           """
+           WITH RECURSIVE chain(id, job, reviews) AS (
+             SELECT a.id, a.workItemId, a.reviewsAssignmentId
+             FROM assignments AS a
+             LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+             WHERE a.id = ?4 AND #{@rest_assignment_visibility}
+             UNION
+             SELECT a.id, a.workItemId, a.reviewsAssignmentId
+             FROM chain AS c
+             JOIN assignments AS a ON a.id = c.reviews
+             LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+             WHERE c.job IS NULL AND #{@rest_assignment_visibility}
+           )
+           SELECT job FROM chain WHERE job IS NOT NULL
+           """,
+           turn_principal_params(context.principal) ++ [id]
+         ) do
+      [[job]] -> job
+      [] -> nil
+    end
+  end
+
+  defp rest_scoped_assignments(_txn, _principal, [], _after_id, _limit), do: []
+
+  defp rest_scoped_assignments(txn, principal, item_ids, after_id, limit) do
+    Txn.q(
+      txn,
+      """
+      WITH RECURSIVE members(item_id, assignment_id) AS (
+        SELECT a.workItemId, a.id
+        FROM json_each(?4) AS requested
+        CROSS JOIN assignments AS a ON a.workItemId = requested.value
+        LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+        WHERE #{@rest_assignment_visibility}
+        UNION ALL
+        SELECT m.item_id, a.id
+        FROM members AS m
+        JOIN assignments AS a ON a.reviewsAssignmentId = m.assignment_id
+        LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+        WHERE a.workItemId IS NULL AND #{@rest_assignment_visibility}
+      )
+      SELECT m.item_id, a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey,
+             a.state, a.outcome, a.openedAt, a.closingAttestId, a.closedAt
+      FROM members AS m
+      JOIN assignments AS a ON a.id = m.assignment_id
+      WHERE (?5 IS NULL OR a.id > ?5)
+      ORDER BY a.id
+      LIMIT ?6
+      """,
+      turn_principal_params(principal) ++ [JSON.encode!(item_ids), after_id, limit]
+    )
+    |> Enum.map(fn [item_id | row] ->
+      {item_id, row |> rest_assignment_query_row() |> rest_assignment()}
+    end)
+  end
+
   defp rest_visible_assignments(txn, principal) do
     {kind, id, is_admin} = detail_principal(principal)
 
@@ -999,9 +1392,7 @@ defmodule Tightbeam.ExecutionMap do
              a.state, a.outcome, a.openedAt, a.closingAttestId, a.closedAt
       FROM assignments AS a
       LEFT JOIN work_items AS wi ON wi.id = a.workItemId
-      WHERE ?1 = 1 OR
-            (?2 = 'session' AND (a.holderKey = ?3 OR COALESCE(a.currentOpenerSessionKey,a.openedBySession) = ?3)) OR
-            (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3))
+      WHERE #{@rest_assignment_visibility}
       ORDER BY a.id
       """,
       [if(is_admin, do: 1, else: 0), kind, id]
@@ -1193,6 +1584,90 @@ defmodule Tightbeam.ExecutionMap do
     (is_binary(turn.job_ref) and Map.has_key?(items_by_id, turn.job_ref)) or
       (is_binary(turn.assignment_id) and
          Map.has_key?(items_by_id, Map.get(resolved, turn.assignment_id)))
+  end
+
+  defp rest_evidence_dependency(txn, item_ids, assignment_ids) do
+    markers = """
+    SELECT id FROM subagent_markers
+    WHERE assignmentId IN (SELECT value FROM json_each(?1)) AND id > ?2
+    ORDER BY id LIMIT ?3
+    """
+
+    dispositions = """
+    SELECT seq FROM causal_events
+    WHERE kind = 'disposition_transition'
+      AND jobRef IN (SELECT value FROM json_each(?1)) AND seq > ?2
+    ORDER BY seq LIMIT ?3
+    """
+
+    [
+      hash_evidence_ids(
+        txn,
+        markers,
+        JSON.encode!(assignment_ids),
+        0,
+        :crypto.hash_init(:sha256)
+      ),
+      hash_evidence_ids(txn, dispositions, JSON.encode!(item_ids), 0, :crypto.hash_init(:sha256))
+    ]
+  end
+
+  defp hash_evidence_ids(txn, query, ids, boundary, hash) do
+    rows = Txn.q(txn, query, [ids, boundary, @rest_attest_page_size])
+    hash = :crypto.hash_update(hash, JSON.encode!(rows))
+
+    if length(rows) == @rest_attest_page_size do
+      [last_id] = List.last(rows)
+      hash_evidence_ids(txn, query, ids, last_id, hash)
+    else
+      :crypto.hash_final(hash)
+    end
+  end
+
+  defp rest_attest_dependency(txn, principal, assignment_ids) do
+    {visible, visible_params} = StateVisibility.attest_collection_scope(principal)
+
+    assignment_ids
+    |> Enum.chunk_every(@rest_assignment_batch_size)
+    |> Enum.reduce(:crypto.hash_init(:sha256), fn ids, hash ->
+      params = [JSON.encode!(ids) | visible_params]
+      hash_rest_attests(txn, visible, params, "", hash)
+    end)
+    |> :crypto.hash_final()
+  end
+
+  defp hash_rest_attests(txn, visible, params, after_id, hash) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT att.id, att.ts
+        FROM attests AS att
+        JOIN assignments AS parent ON parent.id = att.assignmentId
+        LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+        WHERE att.assignmentId IN (SELECT value FROM json_each(?))
+          AND (#{visible}) AND att.id > ?
+        ORDER BY att.id
+        LIMIT ?
+        """,
+        params ++ [after_id, @rest_attest_page_size]
+      )
+
+    hash =
+      Enum.reduce(rows, hash, fn
+        [id, ts], acc when is_integer(ts) and ts > 0 ->
+          :crypto.hash_update(acc, [JSON.encode!([id, ts]), "\n"])
+
+        _, _acc ->
+          raise ArgumentError, "execution-map attest dependency has an invalid version"
+      end)
+
+    if length(rows) == @rest_attest_page_size do
+      [last_id, _] = List.last(rows)
+      hash_rest_attests(txn, visible, params, last_id, hash)
+    else
+      hash
+    end
   end
 
   defp rest_allowed_attests(_txn, _principal, []), do: []
@@ -1448,11 +1923,8 @@ defmodule Tightbeam.ExecutionMap do
          items,
          assignments_by_id,
          assignment_ids,
-         attests,
          wakes,
          requests,
-         markers,
-         dispositions,
          visibility_rows,
          cutoff
        ) do
@@ -1461,7 +1933,6 @@ defmodule Tightbeam.ExecutionMap do
         Enum.map(assignment_ids, fn id ->
           ["assignments", id, Map.fetch!(assignments_by_id, id).row_version]
         end) ++
-        Enum.map(attests, &["attests", &1.id, &1.row_version]) ++
         Enum.map(wakes, &["wakes", &1.wake_id, &1.row_version]) ++
         Enum.map(requests, &["decision requests", &1.id, &1.row_version]) ++
         Enum.map(visibility_rows.sessions, &["sessions", &1.session_key, &1.row_version]) ++
@@ -1473,12 +1944,7 @@ defmodule Tightbeam.ExecutionMap do
           ]
         ]
 
-    evidence =
-      Enum.map(markers, &["subagent markers", &1.id, &1.id]) ++
-        Enum.map(dispositions, &["causal events", &1.seq, &1.seq]) ++
-        [["causal events epoch", "causal_events_epoch", cutoff]]
-
-    entries = resources ++ evidence
+    entries = resources ++ [["causal events epoch", "causal_events_epoch", cutoff]]
 
     Enum.each(entries, fn
       [_resource, _key, version] when is_integer(version) and version > 0 -> :ok
