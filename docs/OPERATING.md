@@ -35,29 +35,6 @@ credentials, sessions, and work records. It defaults to `~/.tightbeam`.
 Check your configured base directory before removing any program files so
 you can preserve your data.
 
-## Shared Harklight origin listener
-
-With an origin-capable Harklight Agent and Server, a sending Tightbeam session
-can move one of its existing conversations to the shared listener:
-
-```sh
-tightbeam harklight-cover --session <Harklight-handle>
-```
-
-Opt in each handle separately. The shared listener uses the gateway's
-configured Agent enrollment and sender scope. Other conversations keep their
-per-handle listeners.
-
-A `covered` result confirms that the move finished. For a `pending` result,
-repeat the command for the same handle to continue the move. Tightbeam
-retains captured offers during the handover and resumes a recorded move
-after restart. Repeating the command continues the move without sending a
-new conversation.
-
-An external support declaration for the handle that omits `origin_listener`
-withdraws coverage. Acknowledgments, replies, and results use separate
-Agent requests.
-
 ## Further reference
 
 - [Smoke runbook](SMOKE.md) for checking core user journeys.

@@ -25,7 +25,7 @@ tightbeam setup --mode quick
 
 ## Full install
 
-Use full mode for a permanent installation. You can run it over a quick installation to upgrade in place and keep your data.
+Use full mode for a permanent installation. Switching from quick to full mode on the same release keeps your data. If you’re also updating to a newer release, run quick setup on that release before switching to full mode.
 
 With npx:
 
