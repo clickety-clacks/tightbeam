@@ -19,7 +19,7 @@ cp "$package" "$TIGHTBEAM_SETUP_RELEASE_DIR/$asset"
 (
   cd "$TIGHTBEAM_SETUP_RELEASE_DIR"
   shasum -a 256 "$asset" > SHA256SUMS
-  printf '{"repository":"clickety-clacks/tightbeam","format":"tightbeam-release-provenance/v1","tag":"%s","commit":"%s"}\n' "$tag" "$commit" > release-provenance.json
+  printf '{"repository":"clickety-clacks/tightbeam","format":"tightbeam-release-provenance/v1","tag":"%s","commit":"%s","checksums":"SHA256SUMS","assets":["%s"],"workflow":"disposable setup evidence"}\n' "$tag" "$commit" "$asset" > release-provenance.json
 )
 if [ "$platform" = linux-x86_64 ]; then
   sudo loginctl enable-linger "$(id -un)"
@@ -33,7 +33,22 @@ export TIGHTBEAM_DEFAULT_HARNESS=pi
 export TIGHTBEAM_DEFAULT_MODEL=local/compat-fixture
 export TIGHTBEAM_DEFAULT_EFFORT=off
 node "$RUNNER_TEMP/setup-model-evidence.mjs" &
-trap 'kill "$!" 2>/dev/null || true' EXIT
+model_pid=$!
+collect_logs() {
+  status=$?
+  kill "$model_pid" 2>/dev/null || true
+  if [ "$status" != 0 ]; then
+    if [ "$platform" = linux-x86_64 ]; then
+      journalctl --user -n 120 -u tightbeam -u tightbeam-chat --no-pager || true
+      sudo journalctl -n 120 -u tightbeam --no-pager || true
+    else
+      for log in "$TIGHTBEAM_BASE_DIR"/*.log; do
+        if [ -f "$log" ]; then tail -80 "$log"; fi
+      done
+    fi
+  fi
+}
+trap collect_logs EXIT
 
 snapshot() {
   for target in "$HOME/.local/bin/tightbeam" "$HOME/.local/share/tightbeam/current" "$TIGHTBEAM_BASE_DIR/setup.json" "$HOME/.local/share/tightbeam-chat/current" \
