@@ -87,7 +87,8 @@ snapshot > "$RUNNER_TEMP/after"
 diff -u "$RUNNER_TEMP/before" "$RUNNER_TEMP/after"
 echo 'Decline filesystem and service diff: empty'
 setup --mode "$initial" --yes | tee "$RUNNER_TEMP/first-turn.log"
-grep -F "Main completed a turn" "$RUNNER_TEMP/first-turn.log"
+grep -E "^READY:" "$RUNNER_TEMP/first-turn.log"
+node "$RUNNER_TEMP/setup-turn-evidence.mjs"
 "$HOME/.local/bin/tightbeam" --version
 curl --fail --silent http://127.0.0.1:4178/chat-config.json
 test -f "$TIGHTBEAM_BASE_DIR/state.db"
