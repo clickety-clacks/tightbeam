@@ -8,6 +8,7 @@ defmodule Tightbeam.Harness.RecoveryProbe do
   @error_limit 512
   @help_output_limit 65_536
   @selection_output_limit 4_096
+  @node_unavailable_exit 69
   @schema_text """
   {"type":"object",
    "properties":{"ok":{"type":"boolean","enum":[true]}},
@@ -143,20 +144,51 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       {:inconclusive, "recovery check timed out during binary selection"}
     else
       root = Path.join(host_config.base_dir, "adapters")
-      env = "env -i PATH=#{shell_path_assignment(path)} HOME=#{Support.shell_quote(home)} "
-      command = env <> selection_command(harness, root, pin, host_config)
+      command = selection_script(path, home, selection_command(harness, root, pin, host_config))
 
       case port_command(host_config, command, timeout_ms, @selection_output_limit,
-             stderr_to_stdout: harness != "claude"
+             stderr_to_stdout: false
            ) do
-        {:exit, 0, output} -> decode_selected_binary(harness, output)
-        {:ok, output} -> decode_selected_binary(harness, output)
-        {:exit, _status, _output} -> {:uncheckable, "the selected harness CLI is unavailable"}
-        {:timeout, output} -> {:inconclusive, diagnostic(output)}
-        {:transport_error, output} -> {:inconclusive, diagnostic(output)}
-        {:error, reason} -> {:uncheckable, diagnostic(reason)}
+        {:exit, 0, output} ->
+          decode_selected_binary(harness, output)
+
+        {:ok, output} ->
+          decode_selected_binary(harness, output)
+
+        {:exit, @node_unavailable_exit, _output} ->
+          {:uncheckable, "Node.js is unavailable for the recovery check"}
+
+        {:exit, _status, _output} ->
+          {:uncheckable, "the selected harness CLI is unavailable"}
+
+        {:timeout, output} ->
+          {:inconclusive, diagnostic(output)}
+
+        {:transport_error, output} ->
+          {:inconclusive, diagnostic(output)}
+
+        {:error, reason} ->
+          {:uncheckable, diagnostic(reason)}
       end
     end
+  end
+
+  defp selection_script(path, home, selector) do
+    env = ~s(env -i PATH="$probe_path" HOME=#{Support.shell_quote(home)})
+
+    # Resolve through the host's configured PATH while HOME still belongs to
+    # the account running the shell. Verify the executable without that HOME.
+    """
+    probe_path=#{shell_path_assignment(path)}
+    probe_node=$(PATH="$probe_path" node -p 'process.execPath') || exit #{@node_unavailable_exit}
+    case "$probe_node" in
+      /*) ;;
+      *) exit #{@node_unavailable_exit} ;;
+    esac
+    [ -x "$probe_node" ] || exit #{@node_unavailable_exit}
+    #{env} "$probe_node" -e '' >/dev/null || exit #{@node_unavailable_exit}
+    exec #{env} #{selector}
+    """
   end
 
   defp selection_command("claude", root, pin, host_config) do
@@ -168,14 +200,15 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       end
 
     cwd = if host_config.ssh, do: "", else: Application.get_env(:tightbeam, :cwd, File.cwd!())
-    args = ClaudeCli.selection_args(Claude.installed_adapter(root), cwd)
-    override <> Enum.map_join(args, " ", &Support.shell_quote/1)
+    ["node" | args] = ClaudeCli.selection_args(Claude.installed_adapter(root), cwd)
+    override <> ~s("$probe_node" ) <> Enum.map_join(args, " ", &Support.shell_quote/1)
   end
 
   defp selection_command("codex", root, pin, _host_config) do
     script = binary_selection_program("codex")
 
-    "node -e #{Support.shell_quote(script)} #{Support.shell_quote(root)} codex #{Support.shell_quote(pin || "")}"
+    ~s("$probe_node" -e ) <>
+      "#{Support.shell_quote(script)} #{Support.shell_quote(root)} codex #{Support.shell_quote(pin || "")}"
   end
 
   defp decode_selected_binary("claude", output) do
