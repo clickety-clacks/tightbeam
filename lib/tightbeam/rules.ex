@@ -1981,19 +1981,25 @@ defmodule Tightbeam.Rules do
 
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
+
+    case Toml.decode(contents) do
+      {:ok, manifest} when map_size(manifest) == 0 ->
+        require Logger
+        Logger.warning("rule file #{path} contains no rules, policies, or reactions; skipping")
+        []
+
+      {:ok, manifest} ->
+        compile_file!(manifest, contents, path, valid_verbs, base_dir, identity_manifest_sha)
+
+      {:error, error} ->
+        raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
+    end
+  end
+
+  defp compile_file!(manifest, contents, path, valid_verbs, base_dir, identity_manifest_sha) do
     relative = Path.relative_to(path, Path.join(base_dir, "identity"))
     owner = Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative)
     owned_archetypes = owned_archetypes(base_dir, owner)
-
-    if String.trim(contents) == "" do
-      raise ArgumentError, "#{path}: empty TOML"
-    end
-
-    manifest =
-      case Toml.decode(contents) do
-        {:ok, decoded} -> decoded
-        {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
-      end
 
     unknown = unknown_keys(manifest, MapSet.new(["rule", "policy", "reaction"]))
 

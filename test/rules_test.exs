@@ -240,13 +240,43 @@ defmodule Tightbeam.RulesTest do
     assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
   end
 
+  for {description, contents} <- [
+        {"empty", ""},
+        {"comments-only", "# no rules here\n\t # another comment"},
+        {"whitespace-only", " \t\r\n\n "}
+      ] do
+    test "a #{description} rule file warns and leaves sibling rules in force", ctx do
+      path = put_raw(ctx, unquote(contents), "blank.toml")
+      put_rule(ctx, rule("deny-post", "post", "caller.origin_class", "eq", "user"))
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :warning], fn ->
+          assert [%{name: "deny-post"}] = Rules.load!(ctx.base_dir, ["post", "status"])
+        end)
+
+      assert log =~ "rule file #{path} contains no rules, policies, or reactions; skipping"
+      assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, call())
+      assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+    end
+  end
+
+  test "malformed TOML still makes all verbs unavailable", ctx do
+    path = put_raw(ctx, "[[rule]\n", "broken.toml")
+    put_rule(ctx, rule("deny-post", "post", "caller.origin_class", "eq", "user"))
+    error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["post", "status"]) end)
+
+    assert error.message =~ "rule file #{path} unavailable"
+    assert error.message =~ "invalid TOML"
+    assert {:deny, %{code: "rule_unavailable"}} = Rules.evaluate(ctx.db, call())
+
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
   test "file-level validation names only the file", ctx do
     cases = [
-      {"", "empty TOML"},
-      {"[[rule]\n", "invalid TOML"},
       {"answer = 42\n", "unknown root keys"},
-      {"title = \"only metadata\"\n", "unknown root keys"},
-      {"# comment only\n", "must contain one or more"}
+      {"title = \"only metadata\"\n", "unknown root keys"}
     ]
 
     for {contents, reason} <- cases do
