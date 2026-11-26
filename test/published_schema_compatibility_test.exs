@@ -78,6 +78,10 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     refute "currentOpenerSessionKey" in columns(db, "assignments")
+    running_model_columns = ~w(runningModelId runningModelLabel runningModelHarness)
+    assert running_model_columns -- columns(db, "sessions") == running_model_columns
+    {:ok, sessions_before} = DB.query(db, "SELECT sessionKey, harness, model FROM sessions")
+    assert sessions_before != []
     rows_before = release_rows(db)
 
     assert rows_before == %{
@@ -101,6 +105,19 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
     assert release_rows(db) == rows_before
     assert "currentOpenerSessionKey" in columns(db, "assignments")
     assert ["recordEventIds", "submitter"] -- columns(db, "messages") == []
+
+    # The running model is additive: the 0.1.16 sessions keep every value, gain the
+    # three nullable columns with nothing reported, and the stamp is unchanged.
+    assert running_model_columns -- columns(db, "sessions") == []
+
+    assert {:ok, ^sessions_before} =
+             DB.query(db, "SELECT sessionKey, harness, model FROM sessions")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM sessions WHERE runningModelId IS NOT NULL OR runningModelLabel IS NOT NULL OR runningModelHarness IS NOT NULL"
+             )
 
     schema_after = full_schema(db)
     assert :ok = Schema.ensure_all(db)

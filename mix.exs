@@ -33,9 +33,65 @@ defmodule Tightbeam.MixProject do
       tightbeam_gateway: [
         include_erts: true,
         include_executables_for: [:unix],
-        strip_beams: true
+        strip_beams: true,
+        steps: [:assemble, &local_release/1]
       ]
     ]
+  end
+
+  # Customize the OTP launch boundary after Mix assembles its stock wrapper.
+  # Match the pinned template exactly so toolchain changes fail assembly.
+  defp local_release(release) do
+    launcher = Path.join([release.path, "bin", Atom.to_string(release.name)])
+    cookie = Path.join([release.path, "releases", "COOKIE"])
+
+    script =
+      launcher
+      |> File.read!()
+      |> replace_release_fragment(
+        ~S|RELEASE_COOKIE="${RELEASE_COOKIE:-"$(cat "$RELEASE_ROOT/releases/COOKIE")"}"| <>
+          "\nexport RELEASE_COOKIE",
+        "unset RELEASE_COOKIE",
+        1
+      )
+      |> replace_release_fragment(
+        ~S(RELEASE_DISTRIBUTION="${RELEASE_DISTRIBUTION:-"sname"}"),
+        "RELEASE_DISTRIBUTION=none",
+        1
+      )
+      |> replace_release_fragment(~S(--cookie "$RELEASE_COOKIE" ), "", 4)
+      |> replace_release_fragment(
+        ~S(--erl "-mode $RELEASE_MODE"),
+        ~S(--erl "-mode $RELEASE_MODE -start_epmd false"),
+        1
+      )
+      |> replace_release_fragment(
+        ~S(case $1 in),
+        """
+        case "$RELEASE_COMMAND" in
+          rpc|remote|restart|stop|pid)
+            echo "Distributed commands are unavailable in this release. Use tightbeam-gateway stop or pid for lifecycle control." >&2
+            exit 64
+            ;;
+        """,
+        1
+      )
+
+    File.write!(launcher, script)
+    File.rm!(cookie)
+    release
+  end
+
+  defp replace_release_fragment(script, expected, replacement, count) do
+    case String.split(script, expected) do
+      parts when length(parts) == count + 1 ->
+        Enum.join(parts, replacement)
+
+      _ ->
+        Mix.raise(
+          "Unexpected Mix release launcher. Review the local release launch configuration."
+        )
+    end
   end
 
   def application do

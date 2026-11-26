@@ -212,9 +212,13 @@ defmodule Tightbeam.Org do
           cleared_through_seq: integer(),
           state: String.t(),
           mechanical_status: String.t(),
+          running_model: running_model() | nil,
           created_at: integer(),
           updated_at: integer()
         }
+
+  @typedoc "The model a session's harness reports it is running right now; nil when unknown."
+  @type running_model :: %{id: String.t(), label: String.t() | nil, harness: String.t()}
 
   @typedoc "One link in a session's append-only harness-session pointer chain."
   @type pointer :: %{
@@ -318,7 +322,10 @@ defmodule Tightbeam.Org do
     mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
                      CHECK (mechanicalStatus IN ('idle','running')),
     createdAt     INTEGER NOT NULL,
-    updatedAt     INTEGER NOT NULL
+    updatedAt     INTEGER NOT NULL,
+    runningModelId    TEXT,
+    runningModelLabel TEXT,
+    runningModelHarness TEXT
   );
   CREATE INDEX IF NOT EXISTS sessions_owner ON sessions (ownerUserId, state);
   CREATE TABLE IF NOT EXISTS harness_pointers (
@@ -396,6 +403,24 @@ defmodule Tightbeam.Org do
 
   @doc false
   def ensure_r1_schema(db), do: ensure_schema_ddl(db, @r1_ddl)
+
+  @running_model_columns ~w(runningModelId runningModelLabel runningModelHarness)
+
+  # The published running model is additive and nullable, so a database opened
+  # from any predecessor gains the columns here without a new schema stamp, as
+  # messages.submitter did. Nothing is backfilled: null means "not reported".
+  @doc false
+  def ensure_running_model_columns(db \\ Tightbeam.DB) do
+    {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")
+    present = MapSet.new(columns, &Enum.at(&1, 1))
+
+    Enum.each(@running_model_columns, fn column ->
+      unless MapSet.member?(present, column),
+        do: :ok = DB.execute(db, "ALTER TABLE sessions ADD COLUMN #{column} TEXT")
+    end)
+
+    :ok
+  end
 
   def ensure_schema(db \\ Tightbeam.DB), do: ensure_schema_ddl(db, @ddl)
 
@@ -1072,7 +1097,8 @@ defmodule Tightbeam.Org do
           txn,
           """
           UPDATE sessions SET model=?4, thinkingLevel=?7, modelContext=?8, harness=?5,
-            provider=?6, clearedThroughSeq=?11
+            provider=?6, clearedThroughSeq=?11,
+            #{running_model_kept_while("harness = ?5")}
           WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?9
             AND modelContext IS ?10 AND harness=?3
           """,
@@ -1110,7 +1136,7 @@ defmodule Tightbeam.Org do
   """
   @spec set_host(db(), String.t(), String.t()) :: session()
   def set_host(db \\ Tightbeam.DB, session_key, host) do
-    update(db, session_key, "host = ?2", [host])
+    update(db, session_key, "host = ?2, #{running_model_kept_while("host = ?2")}", [host])
   end
 
   @doc false
@@ -1137,7 +1163,7 @@ defmodule Tightbeam.Org do
   @doc "Transaction-owned host recorder for workspace-motion compositions."
   @spec set_host_in_txn(Txn.t(), String.t(), String.t()) :: session()
   def set_host_in_txn(%Txn{} = txn, session_key, host) do
-    update_in_txn(txn, session_key, "host = ?2", [host])
+    update_in_txn(txn, session_key, "host = ?2, #{running_model_kept_while("host = ?2")}", [host])
   end
 
   @doc "Replace the normalized overrides and their derived identity name together."
@@ -1255,7 +1281,8 @@ defmodule Tightbeam.Org do
             SELECT 1 FROM turns
             WHERE turns.sessionKey = sessions.sessionKey
               AND turns.status IN ('queued','running')
-          ) THEN 'running' ELSE 'idle' END
+          ) THEN 'running' ELSE 'idle' END,
+          runningModelId = NULL, runningModelLabel = NULL, runningModelHarness = NULL
       WHERE sessionKey = ?1 AND state = 'active'
       """,
       [session_key]
@@ -1795,6 +1822,28 @@ defmodule Tightbeam.Org do
       ]
     )
 
+    # A different harness session is a different engine state (fork, reset, engine
+    # swap, resumed elsewhere): the old value no longer describes it. Empty it in
+    # this transaction; the writer restores a report it already holds for the new
+    # id when the handoff below arrives.
+    if previous_pointer && previous_pointer.harness_session_id != harness_session_id do
+      mutate_session_in_txn(txn, session_key, fn ->
+        Txn.q(
+          txn,
+          """
+          UPDATE sessions
+          SET runningModelId=NULL, runningModelLabel=NULL, runningModelHarness=NULL
+          WHERE sessionKey=?1
+          """,
+          [session_key]
+        )
+      end)
+    end
+
+    # A harness reports its model when it creates a session, a moment before this
+    # pointer exists; the writer holds that report until the pointer names it.
+    Txn.handoff(txn, Tightbeam.RunningModel, {:pointer_recorded, session_key, harness_session_id})
+
     # Loading an existing harness session still belongs in the pointer history,
     # but does not invalidate its healthy Harklight listener.
     if is_nil(previous_pointer) or previous_pointer.harness_session_id != harness_session_id do
@@ -1957,9 +2006,86 @@ defmodule Tightbeam.Org do
       if before.host != session.host or before.state != session.state,
         do: Txn.handoff(txn, Tightbeam.HarklightWakes, {:origin_changed, session_key})
 
+      placement_fields = [:harness, :host, :model, :archetype, :state]
+
+      if Map.take(before, placement_fields) != Map.take(session, placement_fields),
+        do: Tightbeam.CoordinatorHoldDecisions.changed_in_txn(txn)
+
       {:changed, session, result}
     end
   end
+
+  @doc """
+  Store the model (`%{id:, label:}`) a session's harness reports it is running,
+  or clear it with nil. The harness stored is the session's own at that moment.
+
+  The only writer of the running-model columns. It goes through the same seam as
+  every public session change, so an unchanged value writes nothing, publishes
+  nothing and leaves the row version alone, and a changed one bumps the version
+  and publishes `session.updated` after commit. `current?` runs inside the
+  transaction with the session row and says whether the report still belongs to
+  it (current pointer, harness, host); a stale report is dropped. Gateway-initiated
+  clears use the default and always apply. Returns `:changed`, `:unchanged` or `:stale`.
+  """
+  @spec set_running_model(
+          db(),
+          String.t(),
+          %{id: String.t(), label: String.t() | nil} | nil,
+          (Txn.t(), session() -> boolean())
+        ) ::
+          :changed | :unchanged | :stale | :unknown_session
+  def set_running_model(
+        db \\ Tightbeam.DB,
+        session_key,
+        running_model,
+        current? \\ fn _, _ -> true end
+      ) do
+    transaction!(db, fn txn ->
+      case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
+        [] ->
+          :unknown_session
+
+        [row] ->
+          session = to_session(row)
+
+          cond do
+            not current?.(txn, session) or (running_model && session.state != "active") ->
+              :stale
+
+            true ->
+              {id, label, harness} = running_model_columns(running_model, session)
+
+              {outcome, _session, _} =
+                mutate_session_in_txn(txn, session_key, fn ->
+                  Txn.q(
+                    txn,
+                    """
+                    UPDATE sessions
+                    SET runningModelId=?2, runningModelLabel=?3, runningModelHarness=?4
+                    WHERE sessionKey=?1
+                    """,
+                    [session_key, id, label, harness]
+                  )
+                end)
+
+              outcome
+          end
+      end
+    end)
+  end
+
+  # SET-clause fragment for statements that move a session to another harness or
+  # host: the reported model survives only when the move leaves that placement as
+  # it was (SQLite evaluates the right side against the row before the update), so
+  # the new placement and the emptied model commit as one row change.
+  defp running_model_kept_while(same_placement) do
+    Enum.map_join(@running_model_columns, ", ", fn column ->
+      "#{column} = CASE WHEN #{same_placement} THEN #{column} ELSE NULL END"
+    end)
+  end
+
+  defp running_model_columns(nil, _session), do: {nil, nil, nil}
+  defp running_model_columns(%{id: id, label: label}, session), do: {id, label, session.harness}
 
   defp stamp_session_change_in_txn(txn, session_key, occurred_at) do
     [[current]] =
@@ -1976,6 +2102,9 @@ defmodule Tightbeam.Org do
   end
 
   defp publish_session_in_txn(txn, class, session) do
+    if class in ["session.spawned", "session.retired"],
+      do: Tightbeam.CoordinatorHoldDecisions.changed_in_txn(txn)
+
     Publisher.committed_in_txn(txn, class, session, %{
       "sessionKey" => session.session_key
     })
@@ -1997,7 +2126,8 @@ defmodule Tightbeam.Org do
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
            mechanicalStatus, createdAt, updatedAt, #{current_parent_sql("sessions")},
-           #{topology_parent_sql("sessions")}
+           #{topology_parent_sql("sessions")},
+           runningModelId, runningModelLabel, runningModelHarness
     FROM sessions
     """
   end
@@ -2032,7 +2162,10 @@ defmodule Tightbeam.Org do
          created_at,
          updated_at,
          current_parent,
-         topology_parent
+         topology_parent,
+         running_model_id,
+         running_model_label,
+         running_model_harness
        ]) do
     %{
       session_key: session_key,
@@ -2061,6 +2194,9 @@ defmodule Tightbeam.Org do
       cleared_through_seq: cleared_through_seq,
       state: state,
       mechanical_status: mechanical_status,
+      running_model:
+        running_model_id &&
+          %{id: running_model_id, label: running_model_label, harness: running_model_harness},
       created_at: created_at,
       updated_at: updated_at
     }

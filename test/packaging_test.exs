@@ -170,6 +170,19 @@ defmodule Tightbeam.PackagingTest do
   end
 
   @tag :manifest_finalizer
+  test "a generated credential member prevents finalization before extraction" do
+    temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", distribution_member: true)
+    final = temporary <> ".final.tgz"
+
+    {output, status} =
+      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+
+    assert status != 0
+    assert output =~ "forbidden distribution credential member"
+    refute File.exists?(final)
+  end
+
+  @tag :manifest_finalizer
   test "valid manifested archive passes all finalizer checks without changing archive bytes" do
     temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", payload: true)
     original = File.read!(temporary)
@@ -204,6 +217,10 @@ defmodule Tightbeam.PackagingTest do
 
     if manifest_version do
       File.write!(Path.join(package, "package.json"), ~s({"version":"#{manifest_version}"}))
+    end
+
+    if opts[:distribution_member] do
+      File.touch!(Path.join(package, "release/releases/COOKIE"))
     end
 
     if opts[:apple_double] do

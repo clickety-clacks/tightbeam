@@ -24,8 +24,7 @@ REL="$DIR/release/bin/tightbeam_gateway"
 # it. The mix release resolves `stop`/`rpc` by NODE NAME, an inherited
 # RELEASE_NODE wins, and the shared Erlang cookie let the test's `stop` reach and
 # halt PRODUCTION. So the incident verb no longer resolves a node at all: `stop`
-# SIGTERMs the OS pid the descriptor records, identity-gated. `rpc`/`remote`
-# still use distribution but take their node from the descriptor, never ambient.
+# SIGTERMs the OS pid the descriptor records, identity-gated.
 #
 # There is NO TIGHTBEAM_HOME fallback, NO ~/.tightbeam default, NO port-derived
 # guess: an absent TIGHTBEAM_BASE_DIR or descriptor is a REFUSAL, so reaching an
@@ -158,31 +157,6 @@ do_pid() {
   exit 0
 }
 
-do_debug() { # $@: the full argv (rpc <expr> | remote)
-  # rpc/remote still use Erlang distribution, but the node is read from the
-  # descriptor the instance wrote at boot (R1/R4), NEVER from an ambient
-  # RELEASE_NODE/TIGHTBEAM_NODE. Setting RELEASE_NODE from the descriptor makes
-  # the descriptor node WIN over any inherited one — the same incident-safety
-  # property `stop` has, now for the debug verbs too, and it preserves custom
-  # `TIGHTBEAM_NODE` instances (their real node is in the descriptor).
-  require_descriptor "$1"
-  _json="$(cat "$DESC_PATH")"
-  _node="$(printf '%s' "$_json" | json_string node)"
-  if [ -z "$_node" ]; then
-    refuse "refusing to $1: descriptor has no node (pre-upgrade or malformed)."
-  fi
-  RELEASE_NODE="$_node"
-  export RELEASE_NODE
-  # R4: rpc/remote use this install's BAKED releases/COOKIE for Phase 1 (the
-  # per-instance cookie is Phase 2). The release runtime PREFERS an inherited
-  # RELEASE_COOKIE over the baked file, so drop it — the release then reads
-  # releases/COOKIE. This carries the incident-safety property onto the cookie
-  # dimension: an inherited/prod RELEASE_COOKIE cannot authenticate rpc/remote
-  # against anything but this install's own baked cookie.
-  unset RELEASE_COOKIE
-  exec "$REL" "$@"
-}
-
 verb="${1:-}"
 case "$verb" in
   "" | -*)
@@ -211,27 +185,9 @@ case "$verb" in
     exit 64
     ;;
   rpc | remote)
-    do_debug "$@"
+    refuse "refusing to $verb: this release runs without Erlang distribution."
     ;;
   *)
-    # start and every other release verb (version, eval, daemon, ...) keep the
-    # per-instance node name derived from the port.
-    #
-    # ONE ERLANG NODE NAME PER INSTANCE, DERIVED FROM THE PORT. A mix release
-    # names its node after the RELEASE, so every instance on a machine claimed
-    # `tightbeam_gateway@<host>` and the second refused to boot ("name ... seems
-    # to be in use by another Erlang node"). The port is the right discriminator
-    # because two instances need different ports anyway. `TIGHTBEAM_NODE`
-    # overrides it; an explicit `RELEASE_NODE` still wins, since that is the
-    # release runtime's own knob and this script has no business overruling it.
-    if [ -z "${RELEASE_NODE:-}" ]; then
-      if [ -n "${TIGHTBEAM_NODE:-}" ]; then
-        RELEASE_NODE="$TIGHTBEAM_NODE"
-      else
-        RELEASE_NODE="tightbeam_gateway_${TIGHTBEAM_PORT:-11373}"
-      fi
-      export RELEASE_NODE
-    fi
     case "${1:-}" in
       "" | -*) set -- start "$@" ;;
     esac

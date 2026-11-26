@@ -332,7 +332,7 @@ defmodule Tightbeam.IdentityTest do
 
     manual = File.read!(Application.app_dir(:tightbeam, "priv/guidance/operating-manual.md"))
     assert model =~ "The operating manual explains your served identity, durable workdir"
-    assert manual =~ "a path you cite as evidence must be an artifact first"
+    assert manual =~ "a path need not be a recorded artifact solely to be cited as evidence."
     assert manual =~ "a record of a remote path is a pointer, not a copy"
     assert manual =~ "only recorded artifacts are in tracked custody"
   end

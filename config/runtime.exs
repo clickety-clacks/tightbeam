@@ -1,6 +1,13 @@
 import Config
 
 if config_env() != :test do
+  case System.get_env("TIGHTBEAM_COORDINATOR_HOLD_DECISIONS") do
+    nil -> :ok
+    "true" -> config :tightbeam, :coordinator_hold_decisions_enabled, true
+    "false" -> config :tightbeam, :coordinator_hold_decisions_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end

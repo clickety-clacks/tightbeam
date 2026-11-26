@@ -103,10 +103,13 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: test ${{ matrix.platform }}
-    # Candidate jobs run on the self-hosted pools, which carry only release
-    # work, so a candidate never waits behind pull request suites on the
-    # shared hosted macOS runners.
-    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || fromJSON('["self-hosted", "tb-macos"]') }}
+    # Linux candidate tests run on the self-hosted pool, which carries only
+    # release work. The macOS candidate tests run on a hosted arm64 runner, the
+    # same macos-latest image pull request CI uses for its macOS suite: the
+    # shared self-hosted Macs can be loaded heavily enough by other work that
+    # the suite times out. The package and proof jobs below still build and
+    # check the shipped archives on the self-hosted pools.
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -151,6 +154,10 @@ jobs:
           elixir-version: "1.19.5"
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Put the in-repo harness CLI on PATH
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
@@ -325,6 +332,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install Mix dependencies
         run: mix deps.get
 
@@ -336,10 +347,15 @@ jobs:
           package=$(find _build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz')
           [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
           mkdir -p "stage/packages/$PLATFORM" stage/toolchains
+          python3 packaging/gateway-smoke.py "$package" > package-smoke.txt
+          cat package-smoke.txt
           cp "$package" "stage/packages/$PLATFORM/"
+          digest=$(shasum -a 256 "stage/packages/$PLATFORM/$(basename "$package")" | awk '{print $1}')
+          grep -F "package smoke: OK sha256=$digest " package-smoke.txt > /dev/null
           {
             elixir --version
             rustc --version
+            cat package-smoke.txt
           } > "stage/toolchains/$PLATFORM.txt"
 
       # Staging is short-lived job transport. Only the proof job publishes candidate proof.

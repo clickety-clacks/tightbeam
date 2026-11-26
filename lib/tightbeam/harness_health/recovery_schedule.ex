@@ -154,55 +154,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   def retry_now(db, incident_id) when is_binary(incident_id) do
     now = System.system_time(:millisecond)
 
-    result =
-      DB.transaction(db, fn txn ->
-        case Snapshot.harness_health_hold(txn, incident_id) do
-          %{
-            "state" => "open",
-            "failureClass" => "rate-limit-dead",
-            "routesComplete" => true,
-            "routes" => [_ | _]
-          } = hold ->
-            source = "harness-health-hold:#{incident_id}:opened"
-            reconcile_hold_in_txn(txn, hold, source, now)
-
-            case Txn.q(
-                   txn,
-                   "SELECT cycleId,status FROM harness_health_recovery_schedules WHERE holdId=?1",
-                   [incident_id]
-                 ) do
-              [[cycle_id, "pending"]] ->
-                Txn.q(
-                  txn,
-                  "UPDATE harness_health_recovery_schedules SET dueAt=?2,updatedAt=?2,sourceEventId=?4 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
-                  [incident_id, now, cycle_id, "operator-retry:" <> cycle_id]
-                )
-
-                {:ok, cycle_id}
-
-              [[cycle_id, "due"]] ->
-                Txn.q(
-                  txn,
-                  "UPDATE harness_health_recovery_schedules SET sourceEventId=?3,updatedAt=?2 WHERE holdId=?1 AND cycleId=?4 AND status='due'",
-                  [incident_id, now, "operator-retry:" <> cycle_id, cycle_id]
-                )
-
-                {:already_running, cycle_id}
-
-              _ ->
-                {:error, "rate-limit recovery is not available for this incident"}
-            end
-
-          %{"state" => "open", "failureClass" => "rate-limit-dead"} ->
-            {:error, "the affected harness routes are incomplete"}
-
-          %{"state" => "open"} ->
-            {:error, "only a usage-limit incident can be retried"}
-
-          _ ->
-            {:error, "no open incident has that ID"}
-        end
-      end)
+    result = DB.transaction(db, &retry_now_in_txn(&1, incident_id, now, :operator))
 
     case result do
       {:ok, {:ok, cycle_id}} ->
@@ -215,6 +167,85 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
       {:error, error} ->
         {:error, inspect(error)}
     end
+  end
+
+  @doc false
+  def retryable_hold_in_txn?(txn, incident_id) do
+    with %{
+           "state" => "open",
+           "failureClass" => "rate-limit-dead",
+           "routesComplete" => true,
+           "routes" => [_ | _] = routes
+         } = hold <- Snapshot.harness_health_hold(txn, incident_id),
+         {:ok, settings, _digest} <- policy() do
+      eligible?(hold, settings) and
+        Enum.all?(routes, fn route ->
+          Tightbeam.Harness.RecoveryProbe.supported_route?(route) and
+            not is_nil(Tightbeam.Placement.host_in_txn(txn, "", route["host"]))
+        end)
+    else
+      _ -> false
+    end
+  end
+
+  @doc false
+  def retry_now_in_txn(txn, incident_id, now, caller) when caller in [:operator, :coordinator] do
+    case Snapshot.harness_health_hold(txn, incident_id) do
+      %{
+        "state" => "open",
+        "failureClass" => "rate-limit-dead",
+        "routesComplete" => true,
+        "routes" => [_ | _]
+      } = hold ->
+        source = "harness-health-hold:#{incident_id}:opened"
+        reconcile_hold_in_txn(txn, hold, source, now)
+
+        case Txn.q(
+               txn,
+               "SELECT cycleId,status FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [incident_id]
+             ) do
+          [[cycle_id, "pending"]] ->
+            if caller == :operator do
+              mark_operator_retry_in_txn(txn, incident_id, cycle_id, now)
+            end
+
+            Txn.q(
+              txn,
+              "UPDATE harness_health_recovery_schedules SET dueAt=?2,updatedAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
+              [incident_id, now, cycle_id]
+            )
+
+            {:ok, cycle_id}
+
+          [[cycle_id, "due"]] ->
+            if caller == :operator do
+              mark_operator_retry_in_txn(txn, incident_id, cycle_id, now)
+            end
+
+            {:already_running, cycle_id}
+
+          _ ->
+            {:error, "rate-limit recovery is not available for this incident"}
+        end
+
+      %{"state" => "open", "failureClass" => "rate-limit-dead"} ->
+        {:error, "the affected harness routes are incomplete"}
+
+      %{"state" => "open"} ->
+        {:error, "only a usage-limit incident can be retried"}
+
+      _ ->
+        {:error, "no open incident has that ID"}
+    end
+  end
+
+  defp mark_operator_retry_in_txn(txn, incident_id, cycle_id, now) do
+    Txn.q(
+      txn,
+      "UPDATE harness_health_recovery_schedules SET sourceEventId=?3,updatedAt=?2 WHERE holdId=?1 AND cycleId=?4",
+      [incident_id, now, "operator-retry:" <> cycle_id, cycle_id]
+    )
   end
 
   @doc "Recheck open usage-limit holds after the harness credential changes."
