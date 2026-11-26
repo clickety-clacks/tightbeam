@@ -48,7 +48,9 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
     if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
     sleep 1
   done
-  "$CHROME_BIN" --no-sandbox --disable-dev-shm-usage --remote-debugging-port=0 \
+  mkdir "$RUNNER_TEMP/onboarding-chrome"
+  touch "$RUNNER_TEMP/onboarding-chrome/First Run"
+  "$CHROME_BIN" --no-sandbox --no-first-run --no-default-browser-check --disable-dev-shm-usage --remote-debugging-port=0 \
     --user-data-dir="$RUNNER_TEMP/onboarding-chrome" about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
   for i in $(seq 1 20); do
     if [ -s "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort" ]; then break; fi
@@ -61,10 +63,17 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
     exit 1
   fi
   BROWSER_DEBUG_PORT=$(head -1 "$RUNNER_TEMP/onboarding-chrome/DevToolsActivePort")
+  for i in $(seq 1 10); do
+    if curl --silent --fail "http://127.0.0.1:$BROWSER_DEBUG_PORT/json/list" | jq -e 'any(.[]; .url == "about:blank")' >/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  curl --silent --fail "http://127.0.0.1:$BROWSER_DEBUG_PORT/json/list" | jq -e 'any(.[]; .url == "about:blank")' >/dev/null
   cat > "$RUNNER_TEMP/browser-bin/xdg-open" <<'SHIM'
 #!/bin/sh
 printf '%s\n' "$1" >> "$RUNNER_TEMP/installer-browser-launches.log"
-exec "$CHROME_BIN" --no-sandbox --disable-dev-shm-usage --new-tab \
+exec "$CHROME_BIN" --no-sandbox --no-first-run --no-default-browser-check --disable-dev-shm-usage --new-tab \
   --user-data-dir="$RUNNER_TEMP/onboarding-chrome" "$1" >>"$RUNNER_TEMP/installer-browser-output.log" 2>&1
 SHIM
   chmod +x "$RUNNER_TEMP/browser-bin/xdg-open"
