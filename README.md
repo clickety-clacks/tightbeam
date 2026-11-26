@@ -44,6 +44,8 @@ Setup shows its plan and asks for confirmation before proceeding. If your coding
 
 For releases without `tightbeam setup`, follow the [install instructions for your release](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#from-a-release-package).
 
+After either install, we recommend learning [Uncle Enzo](docs/AGENTS-AND-SETTINGS.md#archetypes-and-kungfu), Tightbeam’s primary kungfu bundle.
+
 ## Documentation
 
 - [Agents, archetypes, and settings](docs/AGENTS-AND-SETTINGS.md)
