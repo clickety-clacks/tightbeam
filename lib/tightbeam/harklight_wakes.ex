@@ -12,7 +12,6 @@ defmodule Tightbeam.HarklightWakes do
     ErrorDiagnostic,
     HarklightFailures,
     HarklightItemIds,
-    HarklightSend,
     HarklightLifecycle,
     Org,
     Placement,
@@ -3440,13 +3439,7 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp hydrate_feed_items(db, handle) do
-    if HarklightItemIds.enabled?() do
-      with {:ok, runner} <- HarklightSend.runner([]) do
-        HarklightItemIds.ensure_handle(db, handle, runner)
-      end
-    else
-      :ok
-    end
+    if HarklightItemIds.enabled?(), do: HarklightItemIds.ensure_handle(db, handle), else: :ok
   end
 
   defp record_feed_ready(manager, handle, delays) do
@@ -4571,7 +4564,9 @@ defmodule Tightbeam.HarklightWakes do
            "SELECT senderId FROM harklight_wake_requests WHERE handle=?1 AND messageId=?2",
            [handle, item_id]
          ) do
-      [[sender]] -> {:ok, sender, item_id}
+      [[sender]] ->
+        {:ok, sender, item_id}
+
       [] ->
         if HarklightItemIds.enabled?() do
           case HarklightItemIds.migrated_in_txn(txn, item_id) do

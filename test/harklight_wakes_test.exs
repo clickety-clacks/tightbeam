@@ -5,6 +5,7 @@ defmodule Tightbeam.HarklightWakesTest do
     DB,
     Ephemeral,
     HarklightAgentActions,
+    HarklightBounces,
     HarklightFollows,
     HarklightItemIds,
     HarklightLifecycle,
@@ -1271,8 +1272,10 @@ defmodule Tightbeam.HarklightWakesTest do
 
   test "opaque matching persists bindings from markless pages and captures replies and answers without aliases",
        %{db: db} do
-    enable_item_id_matching!(db)
+    enable_item_id_capture!(db)
     migrated_from_01!(db)
+    refute HarklightItemIds.enabled?()
+    assert {:ok, 1} = HarklightItemIds.capture_status(db)
 
     item = %{
       "item_id" => "opaque-item",
@@ -1297,8 +1300,11 @@ defmodule Tightbeam.HarklightWakesTest do
         {JSON.encode!(%{"messages" => [migration_row]}), 0}
     end
 
-    assert :ok = HarklightItemIds.ensure_handle(db, @handle, runner)
-    assert :ok = HarklightItemIds.ensure_handle(db, @handle, fn _ -> flunk("unexpected rescan") end)
+    assert {:ok, _} = HarklightBounces.read_pass(db, runner: runner)
+    assert {:ok, 0} = HarklightItemIds.capture_status(db)
+    Application.delete_env(:tightbeam, :harklight_item_id_capture)
+    enable_item_id_matching!(db)
+    assert :ok = HarklightItemIds.ensure_handle(db, @handle)
 
     assert {:ok, [[@handle, "sender", "request", "opaque-item"]]} =
              DB.query(db, "SELECT handle,senderId,messageId,itemId FROM harklight_item_ids")
@@ -1336,9 +1342,11 @@ defmodule Tightbeam.HarklightWakesTest do
     db: db,
     call: call
   } do
-    enable_item_id_matching!(db)
+    enable_item_id_capture!(db)
     migrated_from_01!(db)
     import_item_id!(db)
+    Application.delete_env(:tightbeam, :harklight_item_id_capture)
+    enable_item_id_matching!(db)
     call = %{call | params: %{message_id: "request", title: "Revised", base_revision: 1}}
 
     runner = fn
@@ -1376,6 +1384,31 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightSend.change_request(db, wrong_session, "revise",
                runner: fn _ -> flunk("query after wrong session") end
              )
+  end
+
+  test "an uncaptured old message refuses before querying an Agent", %{db: db, call: call} do
+    enable_item_id_matching!(db)
+    migrated_from_01!(db)
+    call = %{call | params: %{message_id: "request"}}
+
+    assert %{
+             code: "harklight_item_id_unmapped",
+             outcome: "refused",
+             message_id: "request",
+             reason: reason
+           } =
+             HarklightSend.change_request(db, call, "retract",
+               runner: fn _ -> flunk("uncaptured ID must not reach the Agent") end
+             )
+
+    assert reason =~ "message request"
+    assert HarklightLifecycle.lookup_change(db, "request") == nil
+  end
+
+  defp enable_item_id_capture!(db) do
+    Application.put_env(:tightbeam, :harklight_item_id_capture, true)
+    on_exit(fn -> Application.delete_env(:tightbeam, :harklight_item_id_capture) end)
+    assert :ok = HarklightItemIds.ensure_schema(db)
   end
 
   defp enable_item_id_matching!(db) do

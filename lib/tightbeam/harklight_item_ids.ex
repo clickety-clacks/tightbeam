@@ -17,8 +17,10 @@ defmodule Tightbeam.HarklightItemIds do
 
   def enabled?, do: Application.get_env(:tightbeam, :harklight_item_id_matching, false)
 
+  def capture_enabled?, do: Application.get_env(:tightbeam, :harklight_item_id_capture, false)
+
   def ensure_schema(db) do
-    if enabled?() do
+    if enabled?() or capture_enabled?() do
       DB.execute(db, """
       CREATE TABLE IF NOT EXISTS harklight_item_ids (
         handle TEXT NOT NULL REFERENCES harklight_wake_handles(handle),
@@ -44,19 +46,11 @@ defmodule Tightbeam.HarklightItemIds do
     end
   end
 
-  def resolve(db, record, runner) do
-    with {:ok, item_id} <- lookup(db, record) do
-      if item_id do
-        {:ok, item_id}
-      else
-        with :ok <- hydrate(db, runner),
-             {:ok, item_id} when is_binary(item_id) <- lookup(db, record) do
-          {:ok, item_id}
-        else
-          {:ok, nil} -> {:error, {:refused, "harklight_item_id_unmapped"}}
-          error -> error
-        end
-      end
+  def resolve(db, record) do
+    case lookup(db, record) do
+      {:ok, nil} -> {:error, {:unmapped_item_id, record.message_id}}
+      {:ok, item_id} -> {:ok, item_id}
+      error -> error
     end
   end
 
@@ -72,55 +66,31 @@ defmodule Tightbeam.HarklightItemIds do
     end
   end
 
-  def ensure_handle(db, handle, runner) do
-    with {:ok, true} <- handle_complete?(db, handle) do
-      :ok
-    else
-      {:ok, false} ->
-        with :ok <- hydrate(db, runner),
-             {:ok, true} <- handle_complete?(db, handle) do
-          :ok
-        else
-          {:ok, false} -> {:error, "harklight_item_id_unmapped"}
-          error -> error
-        end
-
-      error -> error
-    end
-  end
-
-  defp handle_complete?(db, handle) do
+  def ensure_handle(db, handle) do
     case DB.query(db, "SELECT 1 " <> @legacy_requests <> " AND r.handle=?1 LIMIT 1", [handle]) do
-      {:ok, rows} -> {:ok, rows == []}
+      {:ok, []} -> :ok
+      {:ok, [[1]]} -> {:error, "harklight_item_id_unmapped"}
       {:error, _} -> {:error, "harklight_item_id_unavailable"}
     end
   end
 
-  def hydrate(db, runner) do
-    :global.trans({{__MODULE__, db}, self()}, fn ->
-      case DB.query(db, "SELECT 1 " <> @legacy_requests <> " LIMIT 1") do
-        {:ok, []} -> :ok
-        {:ok, [[1]]} ->
-          with {:ok, candidates} <- read_sent(runner, [], &collect_legacy/2),
-               {:ok, :ok} <- DB.transaction(db, &import_in_txn(&1, candidates)) do
-            :ok
-          else
-            {:error, code} when is_binary(code) -> {:error, code}
-            {:error, _} -> {:error, "harklight_item_id_unavailable"}
-          end
+  def capture_status(db) do
+    if capture_enabled?() do
+      case DB.query(db, "SELECT COUNT(*) " <> @legacy_requests) do
+        {:ok, [[remaining]]} -> {:ok, remaining}
         {:error, _} -> {:error, "harklight_item_id_unavailable"}
       end
-    end)
+    else
+      {:ok, 0}
+    end
   end
 
   def collect_legacy(messages, acc) do
-    if enabled?(),
-      do: Enum.filter(messages, &(is_map(&1) and is_binary(&1["legacy_message_id"]))) ++ acc,
-      else: acc
+    Enum.filter(messages, &(is_map(&1) and is_binary(&1["legacy_message_id"]))) ++ acc
   end
 
   def import_in_txn(txn, messages) do
-    if enabled?() do
+    if capture_enabled?() do
       for %{
             "item_id" => item,
             "legacy_message_id" => legacy,
@@ -133,10 +103,12 @@ defmodule Tightbeam.HarklightItemIds do
           """
           INSERT INTO harklight_item_ids(handle,senderId,messageId,itemId)
           SELECT r.handle,r.senderId,r.messageId,?4
-          """ <> @legacy_requests <> """
-          AND r.handle=?1 AND r.senderId=?2 AND r.messageId=?3
-          ON CONFLICT DO NOTHING
-          """,
+          """ <>
+            @legacy_requests <>
+            """
+            AND r.handle=?1 AND r.senderId=?2 AND r.messageId=?3
+            ON CONFLICT DO NOTHING
+            """,
           [handle, sender, legacy, item]
         )
       end

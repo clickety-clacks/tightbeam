@@ -254,12 +254,18 @@ defmodule Tightbeam.HarklightBounces do
       if HarklightItemIds.enabled?() do
         case {direct, HarklightItemIds.migrated_in_txn(txn, candidate.item_id)} do
           {[], {:ok, handle, sender, message_id}} ->
-            Txn.q(txn, @registration_sql <> " WHERE r.handle=?1 AND r.senderId=?2 AND r.messageId=?3", [
-              handle,
-              sender,
-              message_id
-            ])
-            |> Enum.filter(fn [_, sender | _] -> is_nil(item["sender"]) or sender == item["sender"] end)
+            Txn.q(
+              txn,
+              @registration_sql <> " WHERE r.handle=?1 AND r.senderId=?2 AND r.messageId=?3",
+              [
+                handle,
+                sender,
+                message_id
+              ]
+            )
+            |> Enum.filter(fn [_, sender | _] ->
+              is_nil(item["sender"]) or sender == item["sender"]
+            end)
 
           {rows, _} ->
             rows
@@ -491,9 +497,24 @@ defmodule Tightbeam.HarklightBounces do
   transaction. Marks nothing Delivered, reopens nothing.
   """
   def read_pass(db, opts \\ []) do
+    with {:ok, remaining} <- HarklightItemIds.capture_status(db),
+         {:ok, result} <- read_registered(db, opts, remaining),
+         {:ok, after_read} <- HarklightItemIds.capture_status(db) do
+      if HarklightItemIds.capture_enabled?() do
+        Logger.info("Harklight item ID capture remaining=#{after_read}")
+      end
+
+      {:ok, result}
+    end
+  end
+
+  defp read_registered(db, opts, remaining) do
     with true <- registered_requests?(db) || :idle,
          {:ok, runner} <- HarklightSend.runner(opts),
-         {:ok, {candidates, legacy}} <- HarklightItemIds.read_sent(runner, {[], []}, &collect_messages/2) do
+         {:ok, {candidates, legacy}} <-
+           HarklightItemIds.read_sent(runner, {[], []}, fn messages, acc ->
+             collect_messages(messages, acc, remaining > 0)
+           end) do
       DB.transaction(db, fn txn ->
         :ok = HarklightItemIds.import_in_txn(txn, legacy)
         process_in_txn(txn, candidates, :read)
@@ -508,9 +529,9 @@ defmodule Tightbeam.HarklightBounces do
     match?({:ok, [[1]]}, DB.query(db, "SELECT 1 FROM harklight_wake_requests LIMIT 1"))
   end
 
-  defp collect_messages(messages, {candidates, legacy}) do
-    {Enum.reduce(messages, candidates, &message_candidates/2),
-     HarklightItemIds.collect_legacy(messages, legacy)}
+  defp collect_messages(messages, {candidates, legacy}, capture?) do
+    legacy = if capture?, do: HarklightItemIds.collect_legacy(messages, legacy), else: legacy
+    {Enum.reduce(messages, candidates, &message_candidates/2), legacy}
   end
 
   defp message_candidates(%{"item_id" => id, "advisories" => advisories} = message, acc)

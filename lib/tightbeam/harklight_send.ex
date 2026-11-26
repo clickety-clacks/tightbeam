@@ -145,6 +145,9 @@ defmodule Tightbeam.HarklightSend do
       {:error, code, reason, outcome} ->
         failure("send", code, "The message was not sent. " <> reason, outcome, %{op_id: op_id})
 
+      {:error, {:unmapped_item_id, id}} ->
+        unmapped_item("send", id)
+
       {:error, {:refused, code}} ->
         failure("send", code, early_reason(code), "refused", %{op_id: op_id})
 
@@ -701,12 +704,25 @@ defmodule Tightbeam.HarklightSend do
       {:error, {:refused, code}} ->
         failure(command, code, early_reason(code), "refused", %{message_id: message})
 
+      {:error, {:unmapped_item_id, id}} ->
+        unmapped_item(command, id)
+
       {:error, {:unresolved, id}} ->
         unresolved_result(command, id)
 
       {:error, code} ->
         failure(command, code, early_reason(code), "failed", %{message_id: message})
     end
+  end
+
+  defp unmapped_item(command, id) do
+    failure(
+      command,
+      "harklight_item_id_unmapped",
+      "No opaque Harklight item ID was captured for message #{id}. The command did not run.",
+      "refused",
+      %{message_id: id}
+    )
   end
 
   defp unresolved_change_result(command, message, send_record, change) do
@@ -903,12 +919,12 @@ defmodule Tightbeam.HarklightSend do
 
   defp change_item_id(db, runner, %{request: %{"message" => %{"message_id" => _}}} = record) do
     if HarklightItemIds.enabled?() do
-      with {:ok, item_id} <- HarklightItemIds.resolve(db, record, runner),
+      with {:ok, item_id} <- HarklightItemIds.resolve(db, record),
            {:ok, message} <- read_change_item(runner, ["message-get", "--item-id", item_id]) do
         if message["item_id"] == item_id and message["sender"] == record.sender_id and
              message["session"] in [nil, record.handle],
-          do: {:ok, item_id},
-          else: {:error, {:refused, "harklight_result_mismatch"}}
+           do: {:ok, item_id},
+           else: {:error, {:refused, "harklight_result_mismatch"}}
       end
     else
       legacy_change_item_id(runner, record)
