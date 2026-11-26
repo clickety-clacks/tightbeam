@@ -147,6 +147,15 @@ defmodule Tightbeam.SubtreeRulesFactsTest do
                  "artifact_kinds" => ["doc"]
                } = facts["work_item"]
 
+        assert facts["people"] == %{
+                 "holder" => %{"session_key" => "sample-holder", "name" => "Holder Name"},
+                 "opener" => %{"session_key" => "sample-opener", "name" => "Opener Name"},
+                 "delivery_owner" => %{
+                   "session_key" => "sample-delivery",
+                   "name" => "Delivery Name"
+                 }
+               }
+
         assert facts["names"] == %{
                  "holder" => "Holder Name",
                  "opener" => "Opener Name",
@@ -160,6 +169,15 @@ defmodule Tightbeam.SubtreeRulesFactsTest do
       assert observation["work_item"]["artifact_titles"] == ["design notes"]
       assert observation["names"]["delivery_owner"] == "Delivery Name"
       assert observation["names"]["holder"] == nil
+
+      assert observation["people"] == %{
+               "delivery_owner" => %{
+                 "session_key" => "sample-delivery",
+                 "name" => "Delivery Name"
+               },
+               "holder" => nil,
+               "opener" => nil
+             }
     end
 
     test "review work reports its kind and verdicts", ctx do
@@ -212,7 +230,7 @@ defmodule Tightbeam.SubtreeRulesFactsTest do
       slot = "opener"
       kind = "notice"
       when = true
-      value = { wake_id = { op = "concat", args = ["w_marker_", { op = "sha256", args = [{ ref = "event.id" }] }] }, session_key = { ref = "facts.assignment.currentOpenerSessionKey" }, owner_user_id = "#{@owner}", origin = "process:tightbeam", creator_session_key = { ref = "facts.assignment.holderKey" }, assignment_id = { ref = "facts.assignment.id" }, work_item_id = { ref = "facts.assignment.workItemId" }, prompt = { op = "concat", args = [{ ref = "facts.names.holder" }, " finished without a check on record."] }, due_at = { op = "add", args = [{ ref = "event.at" }, #{3 * @hour}] }, on_unavailable = "schedule" }
+      value = { wake_id = { op = "concat", args = ["w_marker_", { op = "sha256", args = [{ ref = "event.id" }] }] }, session_key = { ref = "facts.people.opener.session_key" }, owner_user_id = "#{@owner}", origin = "process:tightbeam", creator_session_key = { ref = "facts.assignment.holderKey" }, assignment_id = { ref = "facts.assignment.id" }, work_item_id = { ref = "facts.assignment.workItemId" }, prompt = { op = "concat", args = [{ ref = "facts.people.holder.name" }, " finished without a check on record."] }, due_at = { op = "add", args = [{ ref = "event.at" }, #{3 * @hour}] }, on_unavailable = "schedule" }
       """)
 
       Application.put_env(:tightbeam, :subtree_rules, false)

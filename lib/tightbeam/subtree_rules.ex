@@ -1,11 +1,6 @@
 defmodule Tightbeam.SubtreeRules do
   @moduledoc false
 
-  # One default-off switch for role-scoped rules: scope and role filters,
-  # the extra reaction facts, the `contains` operator and the reminder form.
-  # With it off, loading, evaluation and stored rows are exactly as before.
-  def enabled?, do: Application.get_env(:tightbeam, :subtree_rules, false) == true
-
   @doc """
   Plain-text `contains`, shared by statutes and reactions.
 

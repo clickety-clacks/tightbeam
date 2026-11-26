@@ -33,7 +33,7 @@ defmodule Tightbeam.RowReactions.Expression do
 
   def validate!(%{"op" => op, "args" => args} = value) do
     # `contains` exists only while role-scoped rules are switched on.
-    if op in @subtree_binary and not Tightbeam.SubtreeRules.enabled?(),
+    if op in @subtree_binary and not Tightbeam.FeatureFlags.subtree_rules?(),
       do: raise(ArgumentError, "unsupported reaction operation or arity: #{inspect(op)}")
 
     unless map_size(value) == 2 and is_list(args) and

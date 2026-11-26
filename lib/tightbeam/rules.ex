@@ -2868,8 +2868,9 @@ defmodule Tightbeam.Rules do
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
 
-    unless op in @operators or (op in @subtree_operators and Tightbeam.SubtreeRules.enabled?()),
-      do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+    unless op in @operators or
+             (op in @subtree_operators and Tightbeam.FeatureFlags.subtree_rules?()),
+           do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
 
     validate_value!(type, op, value, index, fail)
     %{fact: fact, op: op, value: value}

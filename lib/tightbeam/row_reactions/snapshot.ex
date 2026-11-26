@@ -512,7 +512,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
   @subtree_text_limit 2000
 
   def subtree_facts(txn, event, facts) do
-    if Tightbeam.SubtreeRules.enabled?() do
+    if Tightbeam.FeatureFlags.subtree_rules?() do
       case subtree_subject(event) do
         nil ->
           facts
@@ -540,7 +540,16 @@ defmodule Tightbeam.RowReactions.Snapshot do
     work_item_id = (assignment && assignment.work_item_id) || work_item_id
     work_item = subtree_work_item(txn, work_item_id)
     delivery_owner = subtree_delivery_owner(txn, work_item_id)
-    names = Map.get(facts, "names") || %{}
+
+    people = %{
+      "holder" => subtree_person(txn, assignment && assignment.holder),
+      "opener" => subtree_person(txn, assignment && assignment.opener),
+      "delivery_owner" => subtree_person(txn, delivery_owner)
+    }
+
+    names = Map.new(people, fn {role, person} -> {role, person && person["name"]} end)
+    # The anchor depends on each rule's scope, so the scope check supplies it.
+    names = Map.put(names, "anchor", get_in(facts, ["names", "anchor"]))
 
     facts =
       if assignment,
@@ -552,14 +561,14 @@ defmodule Tightbeam.RowReactions.Snapshot do
         do: Map.put(facts, "work_item", Map.merge(facts["work_item"] || %{}, work_item)),
         else: facts
 
-    Map.put(facts, "names", %{
-      "holder" => session_name(txn, assignment && assignment.holder),
-      "opener" => session_name(txn, assignment && assignment.opener),
-      "delivery_owner" => session_name(txn, delivery_owner),
-      # The anchor depends on each rule's scope, so the scope check supplies it.
-      "anchor" => Map.get(names, "anchor")
-    })
+    facts
+    |> Map.put("names", names)
+    |> Map.put("people", people)
   end
+
+  defp subtree_person(_txn, nil), do: nil
+
+  defp subtree_person(txn, key), do: %{"session_key" => key, "name" => session_name(txn, key)}
 
   defp subtree_assignment(_txn, nil), do: nil
 
