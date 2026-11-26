@@ -361,10 +361,10 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
          # R8: retain listener evidence across Wakes and Bandit restarts.
          {Tightbeam.ListenerLifecycle, []},
+         # Off by default: each check reads every open assignment's holder
+         # wakes on the database writer, at every turn end.
          {Tightbeam.Wakes,
           db: db,
-          # Off by default: each check reads every open assignment's holder
-          # wakes on the database writer, at every turn end.
           holder_prod: false,
           deliver: deliver,
           delivery_opts: delivery_config,
@@ -420,7 +420,8 @@ defmodule Tightbeam.Gateway do
          Tightbeam.ListenerLifecycle.listener_spec(
            plug: {Tightbeam.Wire.Router, router_deps},
            port: config.port
-         )
+         ),
+         Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
        ])
     |> Enum.reject(&is_nil/1)
   end
@@ -5999,7 +6000,8 @@ defmodule Tightbeam.Gateway do
   end
 
   defp append_transcript_self_inspection(guidance, session_key) do
-    transcript_command = "tightbeam transcript --session #{inspect(session_key)} --limit 50"
+    transcript_command =
+      "tightbeam transcript --session #{inspect(session_key)} --limit 50 --no-notices --format text"
 
     guidance <>
       "\n\n## Inspect recent Tightbeam transcript\n\n" <>

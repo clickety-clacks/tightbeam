@@ -41,16 +41,22 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
     path
   end
 
-  defp fake_ssh!(dir, warning \\ "") do
+  defp fake_ssh!(dir, warning \\ "", login_env \\ []) do
     # Like ssh: skip the options and host, give the rest to a shell, keep stdin open.
     path = Path.join(dir, "ssh")
     warning = if warning == "", do: "", else: warning <> "\n"
+
+    login_env =
+      Enum.map_join(login_env, "\n", fn {name, value} ->
+        "export #{name}=#{Support.shell_quote(value)}"
+      end)
 
     File.write!(path, """
     #!/bin/sh
     printf %s #{Support.shell_quote(warning)} >&2
     while [ "$1" = "-o" ]; do shift 2; done
     shift
+    #{login_env}
     exec sh -c "$*"
     """)
 
@@ -81,10 +87,77 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   end
 
   @tag :tmp_dir
-  test "a Codex check finishes although the CLI waits for end of input", ctx do
+  test "a Codex check uses real Node and finishes when the CLI waits for end of input", ctx do
+    File.ln_s!(real_node!(), Path.join(ctx.tmp_dir, "node"))
+    with_fixture_path(ctx.tmp_dir)
+
     binary = fake_cli!(ctx.tmp_dir, "codex", @codex_help, @codex_features)
     assert {{:succeeded, nil}, elapsed} = run(ctx, "codex", binary, nil, 20_000)
     assert elapsed < 15_000
+  end
+
+  @tag :tmp_dir
+  test "SSH recovery resolves Node with the target host's login PATH and HOME", ctx do
+    remote_bin = Path.join(ctx.tmp_dir, "remote-bin")
+    remote_home = Path.join(ctx.tmp_dir, "remote-home")
+    File.mkdir_p!(remote_bin)
+    File.mkdir_p!(remote_home)
+    shim = Path.join(remote_bin, "node")
+    marker = Path.join(ctx.tmp_dir, "shim-ran")
+
+    File.write!(shim, """
+    #!/bin/sh
+    [ "$HOME" = #{Support.shell_quote(remote_home)} ] || exit 1
+    printf '%s\\n' "$1" >> #{Support.shell_quote(marker)}
+    exec #{Support.shell_quote(real_node!())} "$@"
+    """)
+
+    File.chmod!(shim, 0o755)
+
+    fake_ssh!(ctx.tmp_dir, "", [
+      {"HOME", remote_home},
+      {"PATH", remote_bin <> ":" <> System.fetch_env!("PATH")}
+    ])
+
+    with_fixture_path(ctx.tmp_dir)
+
+    fake_claude_adapter!(ctx.tmp_dir)
+    binary = fake_cli!(ctx.tmp_dir, "claude", @claude_help, [])
+    assert {{:succeeded, nil}, _} = run(ctx, "claude", binary, "fixture@remote", 20_000)
+    assert File.read!(marker) == "-p\n"
+    assert File.exists?(binary <> ".called")
+  end
+
+  @tag :tmp_dir
+  test "recovery distinguishes missing Node from an unavailable harness CLI", ctx do
+    binary = fake_cli!(ctx.tmp_dir, "codex", @codex_help, @codex_features)
+    with_path(ctx.tmp_dir)
+
+    assert {{:uncheckable, "Node.js is unavailable for the recovery check"}, _} =
+             run(ctx, "codex", binary, nil, 20_000)
+
+    refute File.exists?(binary <> ".called")
+  end
+
+  @tag :tmp_dir
+  test "recovery rejects a Node executable that cannot run under the probe HOME", ctx do
+    shim = Path.join(ctx.tmp_dir, "node")
+
+    File.write!(shim, """
+    #!/bin/sh
+    [ "$HOME" = #{Support.shell_quote(System.fetch_env!("HOME"))} ] || exit 1
+    printf '%s\\n' #{Support.shell_quote(shim)}
+    """)
+
+    File.chmod!(shim, 0o755)
+    with_fixture_path(ctx.tmp_dir)
+
+    binary = fake_cli!(ctx.tmp_dir, "codex", @codex_help, @codex_features)
+
+    assert {{:uncheckable, "Node.js is unavailable for the recovery check"}, _} =
+             run(ctx, "codex", binary, nil, 20_000)
+
+    refute File.exists?(binary <> ".called")
   end
 
   @tag :tmp_dir
@@ -181,13 +254,17 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
     assert {:ok, _} =
              Placement.register_host(ctx.db, "stdinhost", %{ssh: nil, base_dir: ctx.tmp_dir})
 
-    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
-    node_dir = node |> String.trim() |> Path.dirname()
+    node_dir = Path.dirname(real_node!())
 
     assert {:ok, _} =
              Placement.set_toolchain_dirs(ctx.db, "stdinhost", [ctx.tmp_dir, node_dir], "test")
 
     with_claude_override(nil)
+  end
+
+  defp real_node! do
+    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
+    String.trim(node)
   end
 
   defp launch_executable!(ctx) do
@@ -205,8 +282,12 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   end
 
   defp with_fixture_path(dir) do
+    with_path(dir <> ":" <> System.fetch_env!("PATH"))
+  end
+
+  defp with_path(fixture_path) do
     path = System.fetch_env!("PATH")
-    System.put_env("PATH", dir <> ":" <> path)
+    System.put_env("PATH", fixture_path)
     on_exit(fn -> System.put_env("PATH", path) end)
   end
 

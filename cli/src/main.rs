@@ -24,6 +24,7 @@ mod rail_action;
 mod session_connect;
 mod session_rail_scope;
 mod skills;
+mod transcript;
 mod transport_receipt;
 mod users;
 

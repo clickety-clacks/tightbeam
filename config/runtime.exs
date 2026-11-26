@@ -1,6 +1,13 @@
 import Config
 
 if config_env() != :test do
+  case System.get_env("TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL") do
+    nil -> :ok
+    "true" -> config :tightbeam, :execution_map_turn_backfill_enabled, true
+    "false" -> config :tightbeam, :execution_map_turn_backfill_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL must be true or false"
+  end
+
   if System.get_env("TIGHTBEAM_PI_TYPED_TURN_FAILURES") == "1" do
     config :tightbeam, :pi_typed_turn_failures_enabled, true
   end

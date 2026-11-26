@@ -742,6 +742,90 @@ defmodule Tightbeam.RestExecutionMapTest do
     assert unlisted_changed["dependencyVersion"] == hidden_changed["dependencyVersion"]
   end
 
+  test "visible turns outside the page still invalidate the dependency token", ctx do
+    older = insert_work_item!(ctx.db, "wi_off_page", "owner", 42_000)
+    newest = insert_work_item!(ctx.db, "wi_on_page", "owner", 43_000)
+    path = "/api/execution-map?limit=1"
+
+    baseline = get(ctx, path, ctx.token) |> decode_success()
+    assert Enum.map(baseline["items"], & &1["id"]) == [newest]
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.owner_session.session_key,
+        message_id: "off-page-dependency",
+        origin: "user:owner",
+        prompt: "off-page turn",
+        job_ref: older
+      })
+
+    inserted = get(ctx, path, ctx.token) |> decode_success()
+    refute inserted["dependencyVersion"] == baseline["dependencyVersion"]
+
+    assert Enum.map(inserted["items"], &Map.delete(&1, "sinceProgressMs")) ==
+             Enum.map(baseline["items"], &Map.delete(&1, "sinceProgressMs"))
+
+    assert {:ok, _} = DB.query(ctx.db, "DELETE FROM turns WHERE seq=?1", [seq])
+    deleted = get(ctx, path, ctx.token) |> decode_success()
+    assert deleted["dependencyVersion"] == baseline["dependencyVersion"]
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.owner_session.session_key,
+        message_id: "off-page-dependency-recreated",
+        origin: "user:owner",
+        prompt: "new turn in the same source group",
+        job_ref: older
+      })
+
+    recreated = get(ctx, path, ctx.token) |> decode_success()
+    refute recreated["dependencyVersion"] == inserted["dependencyVersion"]
+  end
+
+  test "REST uses visible turn dependencies while the index backfills", ctx do
+    visible = insert_work_item!(ctx.db, "wi_backfill_visible", "owner", 42_000)
+    hidden = insert_work_item!(ctx.db, "wi_backfill_hidden", "other", 43_000)
+
+    for {ref, session} <- [{visible, ctx.owner_session}, {hidden, ctx.other_session}] do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: session.session_key,
+                 message_id: "backfill-" <> ref,
+                 origin: "process:test",
+                 prompt: "Turn before index activation",
+                 job_ref: ref
+               })
+    end
+
+    # Model an upgrade before any historical batches have committed.
+    assert :ok =
+             DB.execute(ctx.db, """
+             DELETE FROM execution_map_turn_versions;
+             UPDATE execution_map_turn_version_activation
+             SET lastSeq = 0, throughSeq = (SELECT MAX(seq) FROM turns);
+             """)
+
+    path = "/api/execution-map"
+    before = get(ctx, path, ctx.token) |> decode_success()
+    assert [%{"turns" => %{"total" => 1}}] = before["items"]
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET createdAt=createdAt+1 WHERE jobRef=?1", [hidden])
+
+    hidden_change = get(ctx, path, ctx.token) |> decode_success()
+    assert hidden_change["dependencyVersion"] == before["dependencyVersion"]
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET createdAt=createdAt+1 WHERE jobRef=?1", [visible])
+
+    visible_change = get(ctx, path, ctx.token) |> decode_success()
+    refute visible_change["dependencyVersion"] == before["dependencyVersion"]
+
+    assert :ok = Tightbeam.ExecutionMapTurnVersions.backfill(ctx.db)
+    ready = get(ctx, path, ctx.token) |> decode_success()
+    assert [%{"turns" => %{"total" => 1}}] = ready["items"]
+  end
+
   test "all unpaged routes reject each page parameter before the resource query", ctx do
     item = insert_work_item!(ctx.db, "wi_unpaged", "owner", 44_000)
 
