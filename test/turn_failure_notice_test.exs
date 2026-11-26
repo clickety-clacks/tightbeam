@@ -154,7 +154,10 @@ defmodule Tightbeam.TurnFailureNoticeTest do
       {"wrong reason suffix", 106, ctx.lane.session_key, "process:tightbeam",
        "wake-undelivered:106", "notice\nReason: something else", false},
       {"a longer sequence sharing the prefix", 107, ctx.lane.session_key, "process:tightbeam",
-       "wake-undelivered:1070", "notice" <> suffix, false}
+       "wake-undelivered:1070", "notice" <> suffix, false},
+      {"assignment range id with a wrong reason suffix", 108, ctx.lane.session_key,
+       "process:tightbeam", "wake-undelivered:108:asg_review", "notice\nReason: something else",
+       false}
     ]
 
     for {label, seq, session_key, device_id, client_message_id, content, expected} <- cases do
