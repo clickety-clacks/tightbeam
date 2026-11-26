@@ -1,0 +1,41 @@
+name: Setup install evidence
+on:
+  push:
+    branches: [evidence/setup-install]
+permissions:
+  contents: read
+jobs:
+  fresh:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+        scenario: [quick-upgrade, full]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Keep the test program and check out the exact implementation
+        run: |
+          cp scripts/setup-install-evidence.sh "$RUNNER_TEMP/"
+          cp scripts/setup-model-evidence.mjs "$RUNNER_TEMP/"
+          git checkout --detach HEAD^
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build the package and exercise real service managers
+        env:
+          SETUP_SCENARIO: ${{ matrix.scenario }}
+        run: bash "$RUNNER_TEMP/setup-install-evidence.sh" 2>&1 | tee "$RUNNER_TEMP/setup-install.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-install-${{ matrix.os }}-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/setup-install.log
