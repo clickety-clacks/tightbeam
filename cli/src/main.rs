@@ -41,6 +41,10 @@ fn main() {
         std::process::exit(1);
     }
 
+    if args == ["onboard", "--first-run", "--check"] {
+        std::process::exit(if first_run::pending() { 0 } else { 1 });
+    }
+
     if args == ["onboard", "--first-run"] {
         if let Err(error) = first_run::run() {
             eprintln!("First-run onboarding: {error}");

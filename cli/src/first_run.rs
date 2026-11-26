@@ -1,7 +1,9 @@
 //! The installer invokes this after the Gateway and Chat are ready.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,15 +17,27 @@ use crate::session_connect::SessionSignalGuard;
 
 const PROMPT: &str = include_str!("first_run_prompt.md");
 const PROJECT_WAIT: Duration = Duration::from_secs(30 * 60);
-const DEFAULT_CHAT_ORIGIN: &str = "http://127.0.0.1:4178";
+const DONE_MARKER: &str = "first-run-onboarding.done";
+
+fn enabled() -> bool {
+    std::env::var("TIGHTBEAM_FIRST_RUN_ONBOARDING").as_deref() == Ok("true")
+}
+
+pub(crate) fn pending() -> bool {
+    enabled()
+        && crate::base_dir::resolve()
+            .join(DONE_MARKER)
+            .try_exists()
+            .is_ok_and(|exists| !exists)
+}
 
 pub(crate) fn run() -> Result<(), String> {
-    if std::env::var("TIGHTBEAM_FIRST_RUN_ONBOARDING").as_deref() != Ok("true") {
+    if !enabled() {
         return Ok(());
     }
 
     let base = crate::base_dir::resolve();
-    let done = base.join("first-run-onboarding.done");
+    let done = base.join(DONE_MARKER);
     let lock = File::options()
         .create(true)
         .truncate(false)
@@ -45,7 +59,7 @@ pub(crate) fn run() -> Result<(), String> {
     let chat = origin(
         &std::env::var("TIGHTBEAM_CHAT_URL")
             .or_else(|_| std::env::var("CHAT_PUBLIC_ORIGIN"))
-            .unwrap_or_else(|_| DEFAULT_CHAT_ORIGIN.into()),
+            .map_err(|_| "setup must supply the configured Chat public origin")?,
     )?;
     let config_url = chat
         .join("chat-config.json")
@@ -69,8 +83,19 @@ pub(crate) fn run() -> Result<(), String> {
             .ok_or_else(|| format!("Chat's configuration is missing {key}"))
     };
     let gateway = origin(get("gateway")?)?;
-    if gateway != origin(&endpoint.base)? {
-        return Err("Chat points to a different Gateway than this installation".into());
+    let provisioned = origin(&endpoint.base)?;
+    let mapped = match std::env::var_os("CHAT_GATEWAY_MAP_FILE") {
+        Some(path) => {
+            let file = File::open(path)
+                .map_err(|error| format!("could not open Chat Gateway map: {error}"))?;
+            let map = serde_json::from_reader(file)
+                .map_err(|_| "Chat Gateway map contains invalid JSON")?;
+            gateway_maps_to_installation(&map, &gateway, &provisioned, &base)
+        }
+        None => gateway == provisioned,
+    };
+    if !mapped {
+        return Err("Chat's configured Gateway does not map to this installation".into());
     }
     let session = get("sessionKey")?;
     let principal = get("principalKey")?;
@@ -81,7 +106,15 @@ pub(crate) fn run() -> Result<(), String> {
     );
     let fact_read = dispatch::facts_read_request(&identity, &fact_kind);
     let signal = SessionSignalGuard::install()?;
-    show_chat("Main", &chat, &gateway, session);
+    let main_link = chat_link(&chat, &gateway, session);
+    let opened = base.join("first-run-onboarding.opened");
+    if !opened.try_exists().map_err(|error| error.to_string())? {
+        // Save the launch before dispatch so a refused wake can be retried without a second tab.
+        fs::write(opened, b"")
+            .map_err(|error| format!("could not record Main Chat launch: {error}"))?;
+        open_browser(&main_link);
+    }
+    println!("Open Tightbeam Chat (Main): {main_link}");
 
     let prompt = PROMPT
         .trim_end()
@@ -127,6 +160,64 @@ pub(crate) fn run() -> Result<(), String> {
         show_chat("project exec", &chat, &gateway, &project);
     }
     Ok(())
+}
+
+fn gateway_maps_to_installation(
+    map: &Value,
+    selected: &Url,
+    provisioned: &Url,
+    base: &Path,
+) -> bool {
+    if map["version"].as_u64() != Some(1) {
+        return false;
+    }
+    let Some(entries) = map["gateways"].as_array() else {
+        return false;
+    };
+    let Ok(base) = base.canonicalize() else {
+        return false;
+    };
+    let mut mapped = HashSet::new();
+    for entry in entries {
+        let Some(directory) = entry["baseDir"]
+            .as_str()
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+        else {
+            continue;
+        };
+        let Some(primary) = entry["origin"]
+            .as_str()
+            .and_then(|value| origin(value).ok())
+        else {
+            continue;
+        };
+        let mut keys = HashSet::from([primary]);
+        if let Some(aliases) = entry.get("aliases") {
+            let Some(aliases) = aliases.as_array() else {
+                continue;
+            };
+            if !aliases.iter().all(|alias| {
+                alias
+                    .as_str()
+                    .and_then(|value| origin(value).ok())
+                    .is_some_and(|alias| keys.insert(alias))
+            }) {
+                continue;
+            }
+        }
+        if !keys.is_disjoint(&mapped) {
+            continue;
+        }
+        if keys.contains(selected) {
+            return keys.contains(provisioned)
+                && directory
+                    .canonicalize()
+                    .is_ok_and(|directory| directory == base);
+        }
+        mapped.extend(keys);
+    }
+    false
 }
 
 fn wait_for_project(
@@ -242,6 +333,27 @@ mod tests {
                 ("session".into(), session.into())
             ]
         );
+    }
+
+    #[test]
+    fn an_alias_must_map_to_the_provisioned_origin_and_installation() {
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        let alias = origin("https://gateway.example").unwrap();
+        let local = origin("http://127.0.0.1:4321").unwrap();
+        let other = origin("http://127.0.0.1:4322").unwrap();
+        let map = json!({"version": 1, "gateways": [{
+            "origin": "https://gateway.example",
+            "baseDir": base,
+            "aliases": ["http://127.0.0.1:4321"]
+        }]});
+        assert!(gateway_maps_to_installation(&map, &alias, &local, &base));
+        assert!(!gateway_maps_to_installation(&map, &alias, &other, &base));
+        assert!(!gateway_maps_to_installation(
+            &map,
+            &alias,
+            &local,
+            Path::new("/")
+        ));
     }
 
     #[test]

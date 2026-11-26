@@ -1429,10 +1429,11 @@ COMMANDS:
       what a step applied is kept if the run is interrupted. A busy session is
       reported and passed over. Run it again to continue or to pick those up;
       sessions that are already current are passed quickly.
-  onboard --first-run
+  onboard --first-run [--check]
       Open Chat to Main and start the welcome conversation once per installation.
       When TIGHTBEAM_FIRST_RUN_ONBOARDING=true, wait up to 30 minutes to open the
       new project's Chat tab. Ctrl-C leaves the welcome marked complete.
+      --check exits 0 when enabled and pending, without changing anything.
   onboard openai|anthropic [--api-key] [--owner <user>]
       Run this machine's model-provider credential onboarding flow. Without
       --api-key this is the interactive subscription ceremony. With it the flow is
