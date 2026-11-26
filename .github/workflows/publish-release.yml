@@ -312,7 +312,13 @@ jobs:
           fi
           status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' https://registry.npmjs.org/tightbeam)
           case "$status" in
-            200) ;; # Existing packages can authenticate via npm Trusted Publishing.
+            200)
+              if [ -z "$NODE_AUTH_TOKEN" ] &&
+                 { [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; }; then
+                echo "Set NPM_TOKEN or enable npm Trusted Publishing with GitHub Actions OIDC" >&2
+                exit 1
+              fi
+              ;;
             404) test -n "$NODE_AUTH_TOKEN" || {
                    echo "Set NPM_TOKEN to bootstrap the unclaimed tightbeam package" >&2
                    exit 1
