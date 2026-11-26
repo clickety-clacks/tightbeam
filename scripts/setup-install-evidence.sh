@@ -38,7 +38,12 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
   export DISPLAY=:99
   mkdir "$RUNNER_TEMP/browser-bin"
   export PATH="$RUNNER_TEMP/browser-bin:$PATH"
-  google-chrome --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 \
+  Xvfb "$DISPLAY" -screen 0 1280x900x24 >"$RUNNER_TEMP/xvfb.log" 2>&1 &
+  for i in $(seq 1 20); do
+    if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
+  google-chrome --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 \
     --user-data-dir="$RUNNER_TEMP/onboarding-chrome" about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
   for i in $(seq 1 20); do
     if curl --silent --fail http://127.0.0.1:9222/json/version >/dev/null; then break; fi
@@ -46,27 +51,11 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
   done
   cat > "$RUNNER_TEMP/browser-bin/xdg-open" <<'SHIM'
 #!/bin/sh
-exec node "$RUNNER_TEMP/setup-open-tab.mjs" "$1"
+printf '%s\n' "$1" >> "$RUNNER_TEMP/installer-browser-launches.log"
+exec google-chrome --no-sandbox --disable-dev-shm-usage --new-tab \
+  --user-data-dir="$RUNNER_TEMP/onboarding-chrome" "$1" >>"$RUNNER_TEMP/installer-browser-output.log" 2>&1
 SHIM
   chmod +x "$RUNNER_TEMP/browser-bin/xdg-open"
-  cat > "$RUNNER_TEMP/setup-open-tab.mjs" <<'OPENER'
-const version = await (await fetch('http://127.0.0.1:9222/json/version')).json();
-const socket = new WebSocket(version.webSocketDebuggerUrl);
-await new Promise((resolve, reject) => {
-  socket.onopen = () => socket.send(JSON.stringify({
-    id: 1, method: 'Target.createTarget', params: { url: process.argv[2] },
-  }));
-  socket.onmessage = ({ data }) => {
-    const reply = JSON.parse(data);
-    if (reply.id === 1) {
-      socket.close();
-      if (reply.error) reject(new Error(reply.error.message));
-      else resolve();
-    }
-  };
-  socket.onerror = reject;
-});
-OPENER
 fi
 node "$RUNNER_TEMP/setup-model-evidence.mjs" &
 model_pid=$!
@@ -128,6 +117,7 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
   timeout 180 "$build/bin/tightbeam" setup --mode full --yes | tee "$RUNNER_TEMP/first-turn.log"
   wait "$browser_driver"
   cat "$RUNNER_TEMP/browser-evidence.log"
+  test "$(wc -l < "$RUNNER_TEMP/installer-browser-launches.log")" -eq 2
   grep -F 'Open Tightbeam Chat (Main):' "$RUNNER_TEMP/first-turn.log"
   grep -F 'Open Tightbeam Chat (project exec):' "$RUNNER_TEMP/first-turn.log"
   curl --silent --fail http://127.0.0.1:9222/json/list | node -e '

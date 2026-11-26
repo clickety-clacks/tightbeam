@@ -47,3 +47,5 @@ jobs:
           path: |
             ${{ runner.temp }}/setup-install.log
             ${{ runner.temp }}/browser-evidence.log
+            ${{ runner.temp }}/installer-browser-launches.log
+            ${{ runner.temp }}/installer-browser-output.log

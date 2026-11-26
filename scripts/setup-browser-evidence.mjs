@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
 
 const endpoint = 'http://127.0.0.1:9222/json/list';
@@ -32,19 +35,38 @@ const call = (method, params) => new Promise((resolve) => {
   socket.send(JSON.stringify({ id, method, params }));
 });
 const evaluate = async (expression) => (await call('Runtime.evaluate', { expression, returnByValue: true })).result?.result?.value;
-async function type(text) {
-  await find(() => evaluate("Boolean(document.querySelector('textarea'))"), 'the Chat composer');
-  await evaluate("document.querySelector('textarea').focus()");
-  await call('Input.insertText', { text });
-  for (const type of ['rawKeyDown', 'char', 'keyUp']) {
-    await call('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+const base = process.env.TIGHTBEAM_BASE_DIR;
+const setup = JSON.parse(fs.readFileSync(path.join(base, 'setup.json'), 'utf8'));
+const token = fs.readFileSync(path.join(base, 'setup-device-token'), 'utf8');
+async function sendUserReply(content) {
+  const gateway = new WebSocket('ws://127.0.0.1:11373/ws');
+  const messageId = `c_${randomUUID()}`;
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('User test reply was not accepted')), 10000);
+      gateway.onopen = () => gateway.send(JSON.stringify({
+        type: 'auth', protocolVersion: 1, deviceId: setup.deviceId, token, subscriptions: ['chat'],
+      }));
+      gateway.onmessage = ({ data }) => {
+        const frame = JSON.parse(data);
+        if (frame.type === 'auth_result' && frame.success) {
+          gateway.send(JSON.stringify({ type: 'message', id: messageId, sessionKey: mainKey, content }));
+        } else if (frame.type === 'ack' && frame.id === messageId) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+    });
+  } finally {
+    gateway.close();
   }
 }
+
 try {
   await find(async () => (await evaluate('document.body.innerText')).includes('I recommend Uncle Enzo'), 'the welcome turn recommending Enzo');
-  await type('Skip Enzo for now');
+  await sendUserReply('Skip Enzo for now');
   await find(async () => (await evaluate('document.body.innerText')).includes('Would you like to set up a project?'), 'the project offer');
-  await type('Please create my fixture project');
+  await sendUserReply('Please create my fixture project');
   await find(async () => (await tabs()).find(({ url, id }) => {
     const target = new URL(url);
     return id !== mainTab.id && target.origin === 'http://127.0.0.1:4178' &&
