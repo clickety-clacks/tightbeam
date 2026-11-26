@@ -382,7 +382,7 @@ defmodule Tightbeam.RowReactions.Plan do
 
       role ->
         subtree = Map.fetch!(facts, @subtree_facts)
-        holder = get_in(subtree, ["active_role_holders", role])
+        holder = get_in(subtree, ["anchors", role, "session_key"])
         is_binary(holder) and holder in Map.get(subtree, "owner_lineage", [])
     end
   end
@@ -430,15 +430,15 @@ defmodule Tightbeam.RowReactions.Plan do
         Map.put(context, binding["name"], Expression.evaluate(binding["value"], context))
       end)
 
-  # `anchor`: the anchor role and its current active holder, so an effect can
-  # address `{ ref = "anchor.session_key" }`. Present only on anchored rails.
-  defp base_context(%{scope_role: role}, event, facts) when is_binary(role) do
-    holder = get_in(facts, [@subtree_facts, "active_role_holders", role])
+  # Bind the live anchor separately for each rule, preserving other names.
+  defp base_context(%{scope_role: role}, event, facts) do
+    anchor = get_in(facts, [@subtree_facts, "anchors", role]) || %{}
+    names = Map.put(Map.get(facts, "names", %{}), "anchor", anchor["name"])
 
     %{
       "event" => event,
-      "facts" => facts,
-      "anchor" => %{"role" => role, "session_key" => holder}
+      "facts" => Map.put(facts, "names", names),
+      "anchor" => %{"role" => role, "session_key" => anchor["session_key"]}
     }
   end
 

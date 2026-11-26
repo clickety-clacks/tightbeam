@@ -761,11 +761,17 @@ defmodule Tightbeam.RowReactions do
   # stored with the event.
   defp put_subtree_facts(facts, txn, event, participant_keys) do
     if Tightbeam.FeatureFlags.subtree_rules?() do
+      main = Tightbeam.Org.personal_session_key(event["org"])
+      anchors = active_anchors(txn, main)
+
       Map.put(facts, Tightbeam.RowReactions.Plan.subtree_facts_key(), %{
         "participants" => participant_keys,
         "role_bindings" => Tightbeam.SubtreeScope.role_bindings(txn),
-        "active_role_holders" => active_role_holders(txn),
-        "holder_archetypes" => holder_archetypes(txn),
+        "anchors" => anchors,
+        "holder_archetypes" =>
+          Map.new(anchors, fn {_, anchor} ->
+            {anchor["session_key"], anchor["archetype"]}
+          end),
         "owner_lineage" =>
           case Tightbeam.SubtreeScope.work_owner(txn, subtree_refs(event)) do
             key when is_binary(key) -> Tightbeam.SubtreeScope.lineage(txn, key)
@@ -777,32 +783,22 @@ defmodule Tightbeam.RowReactions do
     end
   end
 
-  # Agent types of active role holders, so an effect addressed to one (the
-  # `anchor`) is judged by the same who-filter as any other recipient.
-  defp holder_archetypes(txn) do
+  defp active_anchors(txn, main) do
     Txn.q(
       txn,
       """
-      SELECT DISTINCT s.sessionKey, s.archetype FROM roles r
+      SELECT r.name, s.sessionKey, s.displayName, s.archetype FROM roles r
       JOIN sessions s ON s.sessionKey = r.boundSessionKey
       WHERE s.state = 'active'
+      UNION ALL
+      SELECT NULL, sessionKey, displayName, archetype FROM sessions
+      WHERE sessionKey = ?1 AND state = 'active'
       """,
-      []
+      [main]
     )
-    |> Map.new(fn [key, archetype] -> {key, archetype} end)
-  end
-
-  defp active_role_holders(txn) do
-    Txn.q(
-      txn,
-      """
-      SELECT r.name, r.boundSessionKey FROM roles r
-      JOIN sessions s ON s.sessionKey = r.boundSessionKey
-      WHERE s.state = 'active'
-      """,
-      []
-    )
-    |> Map.new(fn [name, key] -> {name, key} end)
+    |> Map.new(fn [role, key, name, archetype] ->
+      {role, %{"session_key" => key, "name" => name, "archetype" => archetype}}
+    end)
   end
 
   defp subtree_refs(event) do

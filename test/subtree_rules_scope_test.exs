@@ -336,6 +336,16 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
                |> elem(1)
     end
 
+    test "{anchor_session} addresses Main when scope is omitted", ctx do
+      write_org_rules!(ctx.base_dir, notice_rule(""))
+      [rule] = load!(ctx.base_dir)
+
+      assert {:ok, {:ok, %{bound_session: @main}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Rules.resolve_notice_in_txn(txn, rule, session_call("work-item-fail", "member"))
+               end)
+    end
+
     test "scope declarations are validated at load", ctx do
       write_org_rules!(ctx.base_dir, """
       [[rule]]
@@ -579,7 +589,7 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
           "scope_subtree" => %{
             "participants" => [],
             "role_bindings" => %{"team:alpha" => "lead"},
-            "active_role_holders" => holders,
+            "anchors" => holders,
             "holder_archetypes" => %{"lead" => "default"},
             "owner_lineage" => lineage
           }
@@ -588,14 +598,17 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
 
       event = %{"kind" => "work_item_observation", "org" => @owner, "id" => "e1"}
 
+      anchors = %{"team:alpha" => %{"session_key" => "lead", "name" => "Team Lead"}}
+
       [plan] =
-        Plan.evaluate([rail], event, facts.(["member", "lead", @main], %{"team:alpha" => "lead"}))
+        Plan.evaluate([rail], event, facts.(["member", "lead", @main], anchors))
 
       assert plan.selected
       assert plan.value["session_key"] == "lead"
+      assert plan.value["anchor_name"] == "Team Lead"
 
       [plan] =
-        Plan.evaluate([rail], event, facts.(["outsider", @main], %{"team:alpha" => "lead"}))
+        Plan.evaluate([rail], event, facts.(["outsider", @main], anchors))
 
       refute plan.selected
 
@@ -620,7 +633,6 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
           "scope_subtree" => %{
             "participants" => [key],
             "role_bindings" => %{"review:alpha" => "reviewer"},
-            "active_role_holders" => %{"review:alpha" => "reviewer"},
             "owner_lineage" => []
           }
         }
@@ -628,6 +640,33 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
 
       assert [%{selected: true}] = Plan.evaluate([rail], event, facts.("reviewer"))
       assert [%{selected: false}] = Plan.evaluate([rail], event, facts.("member"))
+    end
+
+    test "an unscoped reaction uses Main as its anchor", ctx do
+      rule =
+        scoped_reaction_toml()
+        |> String.replace(~s(scope = { subtree_of = "role:team:alpha" }), "")
+        |> String.replace(
+          ~s(prompt = "scoped notice"),
+          ~s(prompt = { ref = "facts.names.anchor" })
+        )
+
+      write_org_rules!(ctx.base_dir, rule)
+      load!(ctx.base_dir)
+      seed_work_item!(ctx.db, "wi-root", "outsider", nil)
+
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.RowReactions.observe_work_item_in_txn(
+          txn,
+          "wi-root",
+          "created",
+          %{kind: "fixture", id: "wi-root", at: 1_000, principal: {:user, @owner}},
+          %{}
+        )
+      end)
+
+      assert {:ok, [[@main, @main]]} =
+               DB.query(ctx.db, "SELECT sessionKey,prompt FROM wakes WHERE state='pending'")
     end
 
     test "a pending scoped notice is withdrawn at delivery once the role moves", ctx do
@@ -776,7 +815,10 @@ defmodule Tightbeam.SubtreeRulesScopeTest do
             "slot" => "notice",
             "kind" => "notice",
             "when" => true,
-            "value" => %{"session_key" => %{"ref" => "anchor.session_key"}}
+            "value" => %{
+              "session_key" => %{"ref" => "anchor.session_key"},
+              "anchor_name" => %{"ref" => "facts.names.anchor"}
+            }
           }
         ]
       },

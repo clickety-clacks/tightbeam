@@ -1288,15 +1288,40 @@ defmodule Tightbeam.Rules do
           _ -> nil
         end
     }
-    |> put_anchor_binding(db, rule)
+    |> put_anchor_binding(db, rule, call)
   end
 
-  # `{anchor_session}`: the current active holder of the rule's anchor role.
-  defp put_anchor_binding(bindings, db, rule) do
-    if FeatureFlags.subtree_rules?(),
-      do: Map.put(bindings, :anchor_session, SubtreeScope.anchor_holder(db, rule[:scope_role])),
-      else: bindings
+  # `{anchor_session}`: the active holder, or Main for an omitted scope.
+  defp put_anchor_binding(bindings, db, rule, call) do
+    if FeatureFlags.subtree_rules?() do
+      target =
+        case rule[:scope_role] do
+          nil ->
+            with owner when is_binary(owner) <- notice_org_owner(db, call) do
+              active_notice_session(db, Org.personal_session_key(owner))
+            end
+
+          role ->
+            SubtreeScope.anchor_holder(db, role)
+        end
+
+      Map.put(bindings, :anchor_session, target)
+    else
+      bindings
+    end
   end
+
+  defp notice_org_owner(_db, %{predicate_owner_user_id: owner}), do: owner
+  defp notice_org_owner(_db, %{principal: {:user, owner}}), do: owner
+
+  defp notice_org_owner(db, %{principal: {:session, key}}) do
+    case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [key]) do
+      {:ok, [[owner]]} -> owner
+      _ -> nil
+    end
+  end
+
+  defp notice_org_owner(_db, _call), do: nil
 
   # Row-commit notices already execute in the DB owner transaction.
   defp current_delivery_owner(%DB.Txn{} = txn, work_item_id),
