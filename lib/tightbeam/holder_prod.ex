@@ -447,7 +447,13 @@ defmodule Tightbeam.HolderProd do
     query = if is_nil(assignment_id), do: @candidates, else: @single_candidate
 
     txn
-    |> Txn.q(query, [assignment_id, @marker, at, if(report_only, do: 1, else: 0), if(Tightbeam.WorkItemWaits.enabled?(), do: 1, else: 0)])
+    |> Txn.q(query, [
+      assignment_id,
+      @marker,
+      at,
+      if(report_only, do: 1, else: 0),
+      if(Tightbeam.WorkItemWaits.enabled?(), do: 1, else: 0)
+    ])
     |> Enum.map(fn [
                      id,
                      holder,

@@ -180,11 +180,13 @@ defmodule Tightbeam.HolderProdTest do
   setup do
     previous_item_wait_flag = Application.get_env(:tightbeam, :work_item_waits_enabled)
     Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+
     on_exit(fn ->
       if is_nil(previous_item_wait_flag),
         do: Application.delete_env(:tightbeam, :work_item_waits_enabled),
         else: Application.put_env(:tightbeam, :work_item_waits_enabled, previous_item_wait_flag)
     end)
+
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
     sql!(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('fixture-owner',0,1)")
