@@ -224,7 +224,7 @@ defmodule Tightbeam.ListenerLifecycleTest do
   test "production lifecycle owner is before Wakes and bound listener" do
     source = File.read!("lib/tightbeam/gateway.ex")
     [{owner, _}] = :binary.matches(source, "{Tightbeam.ListenerLifecycle, []}")
-    [{wakes, _}] = :binary.matches(source, "{Tightbeam.Wakes,")
+    [[{wakes, _}]] = Regex.scan(~r/\{\s*Tightbeam\.Wakes,/, source, return: :index)
     [{listener, _}] = :binary.matches(source, "Tightbeam.ListenerLifecycle.listener_spec(")
     assert owner < wakes and wakes < listener
   end
