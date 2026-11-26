@@ -2641,8 +2641,8 @@ defmodule Tightbeam.StateResources do
     resource = Map.get(@item_resource_aliases, resource, resource)
 
     case Map.fetch(@item_field_order, resource) do
-      {:ok, fields} ->
-        fields = conditional_fields!(resource, fields, item)
+      {:ok, _fields} ->
+        fields = conditional_fields!(resource, item_fields(resource), item)
         Enum.sort(Map.keys(item)) == Enum.sort(fields)
 
       :error ->

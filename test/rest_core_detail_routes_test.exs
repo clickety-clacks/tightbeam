@@ -2732,62 +2732,66 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     :ok = WS.close(ws)
   end
 
-  test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes",
-       ctx do
-    {:ok, queued_turn} =
-      Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
+  for enabled <- [false, true] do
+    test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes (wait links #{enabled})",
+         ctx do
+      Application.put_env(:tightbeam, :wait_links_enabled, unquote(enabled))
 
-    :ok =
-      Ledger.finish(ctx.db, queued_turn.seq, "delivered", nil,
-        owner_lease: queued_turn.owner_lease
-      )
+      {:ok, queued_turn} =
+        Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
 
-    {port, ws} = start_change_server(ctx)
-    {frames, ws} = committed_core_frames(ctx, port, ws)
+      :ok =
+        Ledger.finish(ctx.db, queued_turn.seq, "delivered", nil,
+          owner_lease: queued_turn.owner_lease
+        )
 
-    for %{
-          class: class,
-          resource: resource,
-          path: path,
-          raw: raw,
-          http_status: http_status,
-          http_headers: headers,
-          http_body: body,
-          source_refs: source_refs
-        } <-
-          frames do
-      notice = JSON.decode!(raw)
-      {:ok, registry} = Registry.fetch(class)
+      {port, ws} = start_change_server(ctx)
+      {frames, ws} = committed_core_frames(ctx, port, ws)
 
-      assert http_status == 200, path
-      assert notice["class"] == class
-      assert notice["op"] == "upsert"
-      assert notice["resource"] == registry.resource
+      for %{
+            class: class,
+            resource: resource,
+            path: path,
+            raw: raw,
+            http_status: http_status,
+            http_headers: headers,
+            http_body: body,
+            source_refs: source_refs
+          } <-
+            frames do
+        notice = JSON.decode!(raw)
+        {:ok, registry} = Registry.fetch(class)
 
-      assert Map.take(notice["refs"], registry.primary_refs) ==
-               Map.take(source_refs, registry.primary_refs)
+        assert http_status == 200, path
+        assert notice["class"] == class
+        assert notice["op"] == "upsert"
+        assert notice["resource"] == registry.resource
 
-      assert_source_ref_values(resource, notice["payload"], source_refs)
-      assert is_integer(notice["payload"]["rowVersion"])
-      assert application_header(headers, "content-type") == "application/json; charset=utf-8"
-      assert application_header(headers, "cache-control") == "no-store"
-      payload_bytes = raw_json_value(raw, "payload")
-      item_bytes = raw_json_value(body, "item")
+        assert Map.take(notice["refs"], registry.primary_refs) ==
+                 Map.take(source_refs, registry.primary_refs)
 
-      assert payload_bytes == item_bytes,
-             "#{class}\npayload=#{payload_bytes}\nitem=#{item_bytes}"
+        assert_source_ref_values(resource, notice["payload"], source_refs)
+        assert is_integer(notice["payload"]["rowVersion"])
+        assert application_header(headers, "content-type") == "application/json; charset=utf-8"
+        assert application_header(headers, "cache-control") == "no-store"
+        payload_bytes = raw_json_value(raw, "payload")
+        item_bytes = raw_json_value(body, "item")
 
-      assert item_bytes == StateResources.encode_item(resource, notice["payload"], ctx.catalog)
+        assert payload_bytes == item_bytes,
+               "#{class}\npayload=#{payload_bytes}\nitem=#{item_bytes}"
+
+        assert item_bytes == StateResources.encode_item(resource, notice["payload"], ctx.catalog)
+      end
+
+      turn = Enum.find(frames, &(&1.resource == "turns")) |> then(&JSON.decode!(&1.raw))
+      device = Enum.find(frames, &(&1.resource == "devices")) |> then(&JSON.decode!(&1.raw))
+
+      assert turn["payload"]["seq"] == turn["refs"]["turnSeq"]
+      refute Map.has_key?(turn["payload"], "turnSeq")
+      assert device["payload"]["deviceId"] == device["refs"]["deviceId"]
+      refute Map.has_key?(device["payload"], "id")
+      :ok = WS.close(ws)
     end
-
-    turn = Enum.find(frames, &(&1.resource == "turns")) |> then(&JSON.decode!(&1.raw))
-    device = Enum.find(frames, &(&1.resource == "devices")) |> then(&JSON.decode!(&1.raw))
-
-    assert turn["payload"]["seq"] == turn["refs"]["turnSeq"]
-    refute Map.has_key?(turn["payload"], "turnSeq")
-    assert device["payload"]["deviceId"] == device["refs"]["deviceId"]
-    refute Map.has_key?(device["payload"], "id")
-    :ok = WS.close(ws)
   end
 
   test "AC4 rejects every alternate string and numeric key spelling with the closed 404", ctx do
