@@ -29,13 +29,14 @@ if [ "$platform" = linux-x86_64 ]; then
 fi
 export TIGHTBEAM_BASE_DIR="$RUNNER_TEMP/setup-org"
 export TIGHTBEAM_LOCAL_OPENAI_ENDPOINT=http://127.0.0.1:25502/v1
+export TIGHTBEAM_DEFAULT_HARNESS=pi
 export TIGHTBEAM_DEFAULT_MODEL=local/compat-fixture
 export TIGHTBEAM_DEFAULT_EFFORT=off
 node "$RUNNER_TEMP/setup-model-evidence.mjs" &
 trap 'kill "$!" 2>/dev/null || true' EXIT
 
 snapshot() {
-  for target in "$TIGHTBEAM_BASE_DIR/setup.json" "$HOME/.local/share/tightbeam-chat/current" \
+  for target in "$HOME/.local/bin/tightbeam" "$HOME/.local/share/tightbeam/current" "$TIGHTBEAM_BASE_DIR/setup.json" "$HOME/.local/share/tightbeam-chat/current" \
       "$HOME/.config/systemd/user/tightbeam.service" "$HOME/.config/systemd/user/tightbeam-chat.service" \
       "$HOME/Library/LaunchAgents/com.tightbeam.gateway.plist" "$HOME/Library/LaunchAgents/com.tightbeam.chat.plist" \
       /opt/tightbeam/current /etc/systemd/system/tightbeam.service /Library/LaunchDaemons/com.tightbeam.gateway.plist; do
@@ -70,7 +71,9 @@ printf 'no\n' | setup --mode "$initial"
 snapshot > "$RUNNER_TEMP/after"
 diff -u "$RUNNER_TEMP/before" "$RUNNER_TEMP/after"
 echo 'Decline filesystem and service diff: empty'
-setup --mode "$initial" --yes
+setup --mode "$initial" --yes | tee "$RUNNER_TEMP/first-turn.log"
+grep -F "Main completed a turn" "$RUNNER_TEMP/first-turn.log"
+"$HOME/.local/bin/tightbeam" --version
 curl --fail --silent http://127.0.0.1:4178/chat-config.json
 test -f "$TIGHTBEAM_BASE_DIR/state.db"
 if [ "$initial" = quick ]; then

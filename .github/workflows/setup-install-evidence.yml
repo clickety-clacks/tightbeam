@@ -21,7 +21,7 @@ jobs:
         run: |
           cp scripts/setup-install-evidence.sh "$RUNNER_TEMP/"
           cp scripts/setup-model-evidence.mjs "$RUNNER_TEMP/"
-          git checkout --detach HEAD^
+          git checkout --detach "$(cat scripts/setup-evidence-sha.txt)"
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "28"
@@ -31,6 +31,7 @@ jobs:
         with:
           node-version: "24"
       - name: Build the package and exercise real service managers
+        shell: bash
         env:
           SETUP_SCENARIO: ${{ matrix.scenario }}
         run: bash "$RUNNER_TEMP/setup-install-evidence.sh" 2>&1 | tee "$RUNNER_TEMP/setup-install.log"
