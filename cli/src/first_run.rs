@@ -116,14 +116,7 @@ pub(crate) fn run() -> Result<(), String> {
     }
     println!("Open Tightbeam Chat (Main): {main_link}");
 
-    let prompt = PROMPT
-        .trim_end()
-        .replace("{{chat_root}}", chat.as_str())
-        .replace(
-            "{{gateway_origin}}",
-            &gateway.origin().ascii_serialization(),
-        )
-        .replace("{{project_ready_kind}}", &fact_kind);
+    let prompt = welcome_prompt(&chat, &gateway, &fact_kind);
     let wake = dispatch::build_request(&CliCommand::Wake {
         identity,
         target: Target::Session(session.into()),
@@ -142,7 +135,15 @@ pub(crate) fn run() -> Result<(), String> {
         idempotency_key: Some("installer-first-run-welcome".into()),
         class: None,
     })?;
-    let receipt = dispatch::send_to(&endpoint, &wake)?;
+    let receipt = dispatch::send_to_with_deadline(
+        &endpoint,
+        &wake,
+        Some(Instant::now() + Duration::from_secs(5)),
+    );
+    if signal.interrupted() {
+        return Ok(());
+    }
+    let receipt = receipt?;
     if receipt
         .as_ref()
         .and_then(|value| value.get("wakeId"))
@@ -160,6 +161,17 @@ pub(crate) fn run() -> Result<(), String> {
         show_chat("project exec", &chat, &gateway, &project);
     }
     Ok(())
+}
+
+fn welcome_prompt(chat: &Url, gateway: &Url, fact_kind: &str) -> String {
+    PROMPT
+        .trim_end()
+        .replace("{{chat_root}}", chat.as_str())
+        .replace(
+            "{{gateway_origin}}",
+            &gateway.origin().ascii_serialization(),
+        )
+        .replace("{{project_ready_kind}}", fact_kind)
 }
 
 fn gateway_maps_to_installation(
@@ -333,6 +345,19 @@ mod tests {
                 ("session".into(), session.into())
             ]
         );
+    }
+
+    #[test]
+    fn welcome_renders_every_placeholder_and_allows_fact_correction() {
+        let chat = origin("https://chat.example").unwrap();
+        let gateway = origin("http://127.0.0.1:4321").unwrap();
+        let kind = "installer.first-run-project-ready.example";
+        let prompt = welcome_prompt(&chat, &gateway, kind);
+        assert!(!prompt.contains("{{"));
+        assert!(prompt.contains(chat.as_str()));
+        assert!(prompt.contains(&gateway.origin().ascii_serialization()));
+        assert!(prompt.contains(&format!("tightbeam condition --kind {kind} --scope")));
+        assert!(!prompt.contains("--key"));
     }
 
     #[test]
