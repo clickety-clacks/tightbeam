@@ -1416,8 +1416,7 @@ defmodule Tightbeam.Placement do
 
     projected_home = Homes.home_path(host_config.base_dir, host, module.id())
 
-    with :ok <- setup_sandbox_available(harness, host),
-         {:ok, _} <- cursor_locality_before_kind(module, target, projected_home),
+    with {:ok, _} <- cursor_locality_before_kind(module, target, projected_home),
          kind = credential_kind(config, module.credential_provider(), host, module.wire_name()),
          {:ok, checked_opts} <-
            Harness.preflight_launch(module, target, projected_home, credential_kind: kind) do
@@ -1434,20 +1433,6 @@ defmodule Tightbeam.Placement do
       )
     end
   end
-
-  defp setup_sandbox_available(:codex, host) do
-    if host == local_host_name() and Application.get_env(:tightbeam, :disable_local_codex, false) do
-      {:error,
-       %{
-         code: "codex_sandbox_unavailable",
-         message: "Codex is disabled on this machine until Tightbeam setup can verify its sandbox."
-       }}
-    else
-      :ok
-    end
-  end
-
-  defp setup_sandbox_available(_harness, _host), do: :ok
 
   defp build_adapter_opts(
          config,

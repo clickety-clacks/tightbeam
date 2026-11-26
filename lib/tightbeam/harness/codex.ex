@@ -97,6 +97,19 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
+  def preflight_launch(target, _home, opts) do
+    if Support.local?(target) and Application.get_env(:tightbeam, :disable_local_codex, false) do
+      {:error,
+       %{
+         code: "codex_sandbox_unavailable",
+         message: "Codex is disabled on this machine until Tightbeam setup can verify its sandbox."
+       }}
+    else
+      {:ok, opts}
+    end
+  end
+
+  @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
     # The SessionStart identity carrier is required even in an org with no
