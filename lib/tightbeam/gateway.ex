@@ -11212,6 +11212,14 @@ defmodule Tightbeam.Gateway do
           |> model_change_readback(applies)
           |> ErrorDiagnostic.put(ErrorDiagnostic.of(boundary))
 
+        {:ok, :next_turn} ->
+          runtime_success(db, session.session_key, "preserved", true, "not_applicable")
+          |> Map.merge(%{
+            accepted: true,
+            applies: "next_turn",
+            message: "Configuration saved; applies on the next turn."
+          })
+
         {:ok, {:runtime_projection_failed, %Model{} = actual}} ->
           tune_error(
             "runtime_projection_failed",
@@ -11438,72 +11446,106 @@ defmodule Tightbeam.Gateway do
         with true <- is_pid(coordinator),
              {:ok, adapter, _generation} <-
                adapter_for_session(coordinator, session, false) do
-          case Adapter.knows_session?(adapter, pointer.harness_session_id) do
-            # Claude moves the conversation to a fresh fork; harnesses with a
-            # live model set update in place. The caller holds the turn
-            # boundary, so no switch can land mid-turn. The old Claude session
-            # remains resident until the replacement pointer commits below.
-            true ->
+          sid = pointer.harness_session_id
+          case Adapter.knows_session?(adapter, sid) do
+            resident? when is_boolean(resident?) ->
               cwd = Placement.holder_workdir(config, session)
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
               snapshot = served_snapshot(config, session, harness, revision)
+              mcp = mcp_servers_for_archetype(session.archetype)
 
               with_home_pin_lock(harness, session.host, fn ->
                 pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
 
-                with {:ok, switched_sid} <-
-                       AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
-                         Adapter.switch_model_session(
-                           adapter,
-                           pointer.harness_session_id,
-                           new_ref,
-                           cwd,
-                           mcp_servers_for_archetype(session.archetype),
-                           snapshot.guidance
-                         )
-                       end) do
-                  project_tuned_model(
-                    config,
-                    db,
-                    session,
-                    adapter,
-                    pointer.harness_session_id,
-                    switched_sid,
-                    new_ref,
-                    provider
-                  )
-                end
-              end)
+                result =
+                  AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
+                    if resident? do
+                      case Adapter.switch_model_session(
+                             adapter,
+                             sid,
+                             new_ref,
+                             cwd,
+                             mcp,
+                             snapshot.guidance
+                           ) do
+                        {:error, :fork_requires_prompted_session} ->
+                          # The local guard knows no prompt was dispatched. Vendor fork
+                          # errors carry diagnostics and must preserve the old runtime.
+                          with {:ok, fresh_sid} <-
+                                 Adapter.new_candidate_session(
+                                   adapter,
+                                   new_ref,
+                                   cwd,
+                                   mcp,
+                                   snapshot.guidance
+                                 ),
+                               do: {:ok, fresh_sid, "created"}
 
-            false ->
-              cwd = Placement.holder_workdir(config, session)
-              revision = session.identity_revision || Identity.live_revision!(config.base_dir)
-              snapshot = served_snapshot(config, session, harness, revision)
+                        {:ok, switched_sid} ->
+                          {:ok, switched_sid, "loaded"}
 
-              with_home_pin_lock(harness, session.host, fn ->
-                pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
+                        {:error, _reason} = error ->
+                          error
+                      end
+                    else
+                      case Adapter.load_session(
+                             adapter,
+                             sid,
+                             new_ref,
+                             cwd,
+                             mcp,
+                             snapshot.guidance
+                           ) do
+                        {:ok, _reported} -> {:ok, sid, "loaded"}
+                        {:error, reason} -> defer_missing_tune_session(harness, reason)
+                      end
+                    end
+                  end)
 
-                with {:ok, _reported} <-
-                       AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
-                         Adapter.load_session(
-                           adapter,
-                           pointer.harness_session_id,
-                           new_ref,
-                           cwd,
-                           mcp_servers_for_archetype(session.archetype),
-                           snapshot.guidance
-                         )
-                       end) do
-                  project_tuned_model(
-                    config,
-                    db,
-                    session,
-                    adapter,
-                    pointer.harness_session_id,
-                    pointer.harness_session_id,
-                    new_ref,
-                    provider
-                  )
+                case result do
+                  {:ok, switched_sid, pointer_reason} ->
+                    project_tuned_model(
+                      config,
+                      db,
+                      session,
+                      adapter,
+                      sid,
+                      switched_sid,
+                      new_ref,
+                      provider,
+                      pointer_reason
+                    )
+
+                  :next_turn ->
+                    with :ok <-
+                           project_tuned_model(
+                             config,
+                             db,
+                             session,
+                             adapter,
+                             sid,
+                             sid,
+                             new_ref,
+                             provider,
+                             nil
+                           ),
+                         do: :next_turn
+
+                  {:error, {:session_prepare_failed, reason, candidate_sid, cleanup}} ->
+                    cleanup =
+                      report_candidate_cleanup(db, candidate_sid, reason, principal, cleanup)
+
+                    {:error,
+                     ErrorDiagnostic.diagnosed(
+                       ErrorDiagnostic.classified(reason),
+                       ErrorDiagnostic.with_facts(reason,
+                         phase: "prepare",
+                         cleanup: {:node, cleanup_node(cleanup, candidate_sid)}
+                       )
+                     )}
+
+                  {:error, _reason} = error ->
+                    error
                 end
               end)
 
@@ -11514,6 +11556,20 @@ defmodule Tightbeam.Gateway do
           false -> {:error, :adapter_unavailable}
           {:error, reason} -> {:error, reason}
         end
+    end
+  end
+
+  defp defer_missing_tune_session(harness, reason) do
+    preset = Harness.module!(harness).session_config(%{}, "")
+
+    case {preset.resident_model_switch, ErrorDiagnostic.of(reason)} do
+      {:fork, %{"operation" => "session/load", "reason" => %{"code" => -32002}}} ->
+        # The same refusal can mean an empty or lost transcript, or a failed
+        # resume. Keep the pointer so the next turn can recover any history.
+        :next_turn
+
+      _ ->
+        {:error, reason}
     end
   end
 
@@ -11663,7 +11719,8 @@ defmodule Tightbeam.Gateway do
          prior_sid,
          switched_sid,
          new_ref,
-         provider
+         provider,
+         pointer_reason \\ "loaded"
        ) do
     result =
       DB.transaction(db, fn txn ->
@@ -11677,7 +11734,7 @@ defmodule Tightbeam.Gateway do
              ) do
           {:ok, _updated} ->
             if switched_sid != prior_sid do
-              Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
+              Org.append_pointer_in_txn(txn, session.session_key, switched_sid, pointer_reason)
             end
 
             {:appended, marker} =
@@ -11698,7 +11755,7 @@ defmodule Tightbeam.Gateway do
 
           {:duplicate, _current} ->
             if switched_sid != prior_sid do
-              Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
+              Org.append_pointer_in_txn(txn, session.session_key, switched_sid, pointer_reason)
             end
 
             :duplicate
@@ -11719,6 +11776,9 @@ defmodule Tightbeam.Gateway do
       {:ok, :duplicate} ->
         close_superseded_model_session(session, adapter, prior_sid, switched_sid)
         |> then(&ErrorDiagnostic.diagnosed(:ok, &1))
+
+      {:error, error} when is_nil(pointer_reason) ->
+        {:error, {:runtime_config_not_sent, error}}
 
       {:error, error} ->
         if switched_sid == prior_sid do

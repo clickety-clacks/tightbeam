@@ -1533,6 +1533,24 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
 
+  test "a dispatched Claude prompt can leave history even if it returns an error" do
+    {adapter, capture_path} = start_adapter(harness: :claude)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+    assert {:error, _} = Adapter.prompt(adapter, sid, "fail after dispatch")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               sid,
+               Model.new("claude-sonnet-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
   test "Codex model switch updates the resident session without forking" do
     {adapter, capture_path} = start_adapter(harness: :codex)
 
