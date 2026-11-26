@@ -174,15 +174,6 @@ WantedBy=${system ? 'multi-user.target' : 'default.target'}
 `;
 }
 
-function fileMatches(file, contents) {
-  try {
-    return fs.readFileSync(file, 'utf8') === contents;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    return false;
-  }
-}
-
 async function download(url, destination) {
   run('curl', ['--fail', '--silent', '--show-error', '--location', '--max-time', '300', '--output', destination, url]);
 }
@@ -304,13 +295,11 @@ function gatewayFrame(origin, request, type) {
 }
 
 async function pairFirstUser(localOrigin, deviceId, claimedName) {
-  const pair = () => gatewayFrame(localOrigin, { type: 'pair_request', deviceId, claimedName }, 'pair_result');
-  let result = await pair();
+  const result = await gatewayFrame(localOrigin, { type: 'pair_request', deviceId, claimedName }, 'pair_result');
   if (result.reason === 'pair_pending') {
-    run(cli, ['approve-device', deviceId, '--as-user', claimedName], { cwd: home });
-    result = await pair();
+    throw new Error('An administrator already exists. Approve the local Chat device and rerun setup.');
   }
-  if (!result.success || !result.token) throw new Error('Could not pair the local Chat client.');
+  if (!result.success || !result.token || !result.userId) throw new Error('Could not pair the local Chat client.');
   return result;
 }
 
@@ -350,7 +339,8 @@ async function setup() {
     const chat = service('chat', 'quick');
     const release = jsonFile(path.join(path.dirname(cli), '../setup-build.json'));
     const tag = release?.tag;
-    const stage = mode === 'full' && (receipt?.mode !== 'full' || receipt.tag !== tag);
+    const stage = mode === 'full' && (receipt?.mode !== 'full' || receipt.tag !== tag ||
+      !fs.existsSync(path.join(root, 'current/tightbeam/bin/tightbeam-gateway')));
     const credentials = path.join(base, 'setup-device-token');
     const needsPair = !fs.existsSync(credentials);
     const needsMain = !receipt?.main;
@@ -373,7 +363,8 @@ async function setup() {
     }
 
     const gatewayFile = serviceContents('gateway', mode, binary, [], variables, home);
-    const writeGateway = !fs.existsSync(gateway.file) || (upgrade && !fileMatches(gateway.file, gatewayFile));
+    const writeGateway = !fs.existsSync(gateway.file) || upgrade || receipt?.advertised !== advertised ||
+      (mode === 'quick' && receipt?.tag !== tag);
     const gatewayActive = gateway.active();
     const startGateway = !gatewayActive || !gateway.enabled();
     const installChatPackage = !fs.existsSync(path.join(chatCurrent, 'server/chat-server.mjs'));
@@ -385,7 +376,7 @@ async function setup() {
         CHAT_DEFAULT_GATEWAY_ORIGIN: chatOrigin, CHAT_DEFAULT_SESSION_KEY: main,
         CHAT_DEFAULT_PRINCIPAL_KEY: admin, CHAT_READ_MARKER_DEVICE_CREDENTIAL_FILE: credentials,
       }, chatCurrent);
-    const writeChat = chatConfigChanged || !fs.existsSync(chat.file);
+    const writeChat = chatConfigChanged || !fs.existsSync(chat.file) || receipt?.chatOrigin !== chatOrigin;
     const startChat = !chatActive || !chat.enabled();
     const providers = providerActions(host);
     const pending = providers.filter(({ needed }) => needed);
@@ -410,7 +401,7 @@ async function setup() {
     if (!stage && !fs.existsSync(binary)) missing.push('the bundled tightbeam-gateway binary');
     if (!mac && command('systemctl', ['--user', 'show-environment']).status !== 0) missing.push('a running systemd user manager');
     if (mac && command('launchctl', ['print', `gui/${account.uid}`]).status !== 0) missing.push('a logged-in macOS desktop session');
-    add(missing.length, `Check missing prerequisites: ${missing.join(', ')}.`);
+    add(missing.length, `Missing prerequisites: ${missing.join(', ')}.`);
     add(stage, 'Verify and stage the Tightbeam release under /opt/tightbeam and select it for the system service.');
     add(appArmor, 'Grant bubblewrap access to user namespaces through its AppArmor profile.');
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
@@ -491,7 +482,8 @@ async function setup() {
 
       if (needsPair) {
         const result = await pairFirstUser(localOrigin, state.deviceId, state.admin);
-        if (result.userId !== state.admin) throw new Error('The local Chat client paired with an unexpected account.');
+        state.admin = result.userId;
+        save();
         fs.writeFileSync(credentials, result.token, { flag: 'wx', mode: 0o600 });
       }
       for (const { provider, key } of pending) {
@@ -519,10 +511,15 @@ async function setup() {
       }
       if (writeChat || (mac && startChat)) {
         chat.install(chatFile(state.main, state.admin), scratch, chatActive);
+        state.chatOrigin = chatOrigin;
+        save();
       } else if (startChat) {
         chat.start();
       }
-      await waitFor(() => getJson('http://127.0.0.1:4178/chat-config.json'), 'Chat did not become ready. Check its service log.');
+      await waitFor(async () => {
+        const target = await getJson('http://127.0.0.1:4178/chat-config.json');
+        return target?.sessionKey === state.main && target?.gateway === chatOrigin;
+      }, 'Chat did not serve the installed Main conversation. Check its service log.');
       console.log('Tightbeam Chat is ready at http://127.0.0.1:4178');
       if (command(cli, ['onboard', '--first-run', '--check'], { cwd: home }).status === 0) {
         run(cli, ['onboard', '--first-run'], { cwd: home });
