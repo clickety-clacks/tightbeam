@@ -252,6 +252,14 @@ function installQuick(payload, release) {
   selectLink(path.join(quickRoot, 'current'), target);
 }
 
+function appArmorProfile(bwrap) {
+  return `abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap ${JSON.stringify(bwrap)} flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n`;
+}
+
+function shellQuote(value) {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
 function primaryAddress() {
   return Object.values(os.networkInterfaces()).flat().find(
     (item) => item.family === 'IPv4' && !item.internal,
@@ -427,6 +435,7 @@ async function setup() {
       TIGHTBEAM_ADVERTISED_URL: advertised,
     };
     if (mode === 'quick') variables.TIGHTBEAM_LOOPBACK_ONLY = 'true';
+    if (receipt?.defaultHarness) variables.TIGHTBEAM_DEFAULT_HARNESS = receipt.defaultHarness;
     for (const key of ['TIGHTBEAM_DEFAULT_HARNESS', 'TIGHTBEAM_DEFAULT_MODEL', 'TIGHTBEAM_DEFAULT_EFFORT',
       'TIGHTBEAM_DEFAULT_CONTEXT', 'TIGHTBEAM_CREDENTIALS_DIRECTORY', 'CODEX_PATH']) {
       if (env[key]) variables[key] = env[key];
@@ -479,7 +488,8 @@ async function setup() {
     const sysctlKey = namespaceFix && usernsLimit;
     const lingering = !mac && command('loginctl', ['show-user', account.username, '--property=Linger', '--value']).stdout?.trim() === 'yes';
     const enableLinger = !mac && !lingering && !receipt?.lingerUnavailable;
-    const endsAtLogout = mac || !lingering;
+    const logoutNote = enableLinger ? ' It stops when you sign out unless lingering can be enabled.'
+      : mac || !lingering ? ' It stops when you sign out.' : '';
     const install = [];
     const notes = [];
     const add = (when, text) => { if (when) install.push(text); };
@@ -498,16 +508,25 @@ async function setup() {
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
     if (sandboxUnavailable && !appArmor && !sysctlKey) {
       const installBubblewrap = !bwrap ? ' An administrator also needs to install bubblewrap.' : '';
-      let fix = 'tightbeam setup --mode full';
-      if (needsAppArmor && fs.existsSync('/etc/apparmor.d/bwrap')) fix = 'sudo apparmor_parser -r /etc/apparmor.d/bwrap';
-      else if (usernsLimit) fix = `sudo sysctl -w ${usernsLimit}=${usernsLimit === 'user.max_user_namespaces' ? 15000 : 1}`;
+      let fix;
+      if (needsAppArmor) {
+        const load = 'sudo apparmor_parser -r /etc/apparmor.d/bwrap';
+        const profile = shellQuote(appArmorProfile(bwrap).replaceAll('\n', '\\n'));
+        fix = fs.existsSync('/etc/apparmor.d/bwrap') ? load
+          : `printf '%b' ${profile} | sudo tee /etc/apparmor.d/bwrap >/dev/null && ${load}`;
+      } else if (usernsLimit) {
+        const value = usernsLimit === 'user.max_user_namespaces' ? 15000 : 1;
+        const conf = '/etc/sysctl.d/70-tightbeam-userns.conf';
+        fix = `printf '%s\\n' '${usernsLimit} = ${value}' | sudo tee ${conf} >/dev/null && sudo sysctl -p ${conf}`;
+      }
+      const commandNote = fix ? ` Have an administrator run: ${fix}` : '';
       notes.push(mode === 'quick'
-        ? `Codex agents cannot run commands until an administrator repairs the sandbox.${installBubblewrap} Have an administrator run ${fix}.`
+        ? `Codex agents cannot run commands until an administrator repairs the sandbox.${installBubblewrap}${commandNote}`
         : `Disable Codex on this machine because its sandbox is unavailable.${installBubblewrap} Claude and Pi can run if configured.`);
     }
     add(upgrade, `Replace the user gateway service with a system service while keeping all data in ${base}.`);
     add(writeGateway || startGateway, mode === 'quick'
-      ? `${versionChanged ? 'Restart' : 'Start'} a local-only Tightbeam user service with lighter isolation. It runs the release from your home directory and skips administrator sandbox changes.${endsAtLogout ? ' It stops when you sign out.' : ''}`
+      ? `${versionChanged ? 'Restart' : 'Start'} a local-only Tightbeam user service with lighter isolation. It runs the release from your home directory and skips administrator sandbox changes.${logoutNote}`
       : `Start the Tightbeam system service under your ordinary user account, advertising ${advertisedOrigin}.`);
     add(linkCli, `Expose the Tightbeam command at ${commandLink}.`);
     add(needsPair, `Pair this computer and create the first Tightbeam administrator for ${account.username}.`);
@@ -517,7 +536,7 @@ async function setup() {
     add(installChatPackage, 'Download and verify the published Tightbeam Chat package.');
     add(enableLinger, 'Try to keep your Tightbeam user services running after sign-out with loginctl enable-linger.');
     add(writeChatMap, 'Connect local Chat over loopback and recognize the advertised gateway address as an alias.');
-    add(writeChat || startChat, `Start local Tightbeam Chat as a user service.${endsAtLogout ? ' It stops when you sign out.' : ''}`);
+    add(writeChat || startChat, `Start local Tightbeam Chat as a user service.${logoutNote}`);
     add(readiness || pending.length, 'Check whether this installation can run a turn.');
     add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
     for (const line of [...install, ...notes]) console.log(`- ${line}`);
@@ -557,7 +576,7 @@ async function setup() {
           const profile = '/etc/apparmor.d/bwrap';
           if (!fs.existsSync(profile)) {
             const source = path.join(scratch, 'bwrap');
-            fs.writeFileSync(source, `abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap ${JSON.stringify(bwrap)} flags=(unconfined) {\n  userns,\n  include if exists <local/bwrap>\n}\n`);
+            fs.writeFileSync(source, appArmorProfile(bwrap));
             run('sudo', ['apparmor_parser', '-Q', source]);
             run('sudo', ['install', '-m', '0644', source, profile]);
           }
@@ -609,7 +628,10 @@ async function setup() {
       if (versionChanged) {
         state.ready = false;
       }
-      Object.assign(state, { mode, version, advertised, tag, codexDisabled: disableCodex });
+      Object.assign(state, {
+        mode, version, advertised, tag, codexDisabled: disableCodex,
+        defaultHarness: variables.TIGHTBEAM_DEFAULT_HARNESS,
+      });
       save();
       removedQuick = false;
 
@@ -703,7 +725,7 @@ async function setup() {
           cwd: home, env: onboardingEnv,
         });
       } else {
-        console.log(`Open Main in Chat: ${mainLink}`);
+        console.log(`Open Main in Chat to get started with Uncle Enzo, the recommended kungfu: ${mainLink}`);
       }
     } catch (error) {
       if (removedQuick && state.gatewayFile) {
