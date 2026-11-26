@@ -5,7 +5,7 @@ defmodule Tightbeam.PeopleMessages do
   alias Tightbeam.DB.Txn
 
   @mutations ~w(send update reply withdraw)
-  @relay_commands ~w(collect report event)
+  @relay_commands ~w(collect report event lookup)
   @availability_refusals ~w(no_recipients decider_unreachable)
   @event_kinds ~w(chat answer seen reminder_not_seen reminder_not_acted joined left unreachable closed)
 
@@ -42,6 +42,13 @@ defmodule Tightbeam.PeopleMessages do
         CREATE INDEX IF NOT EXISTS people_operations_waiting ON people_operations(conversation, seq)
           WHERE report IS NULL;
         CREATE INDEX IF NOT EXISTS people_operations_wake ON people_operations(wakeId) WHERE wakeId IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS people_published_revisions (
+          conversation TEXT NOT NULL REFERENCES people_conversations(id),
+          remoteRevision INTEGER NOT NULL CHECK(remoteRevision > 0),
+          revision INTEGER NOT NULL CHECK(revision > 0),
+          operation TEXT NOT NULL UNIQUE REFERENCES people_operations(id),
+          PRIMARY KEY (conversation, remoteRevision)
+        );
         CREATE TABLE IF NOT EXISTS people_events (
           conversation TEXT NOT NULL REFERENCES people_conversations(id),
           kind TEXT NOT NULL,
@@ -81,6 +88,9 @@ defmodule Tightbeam.PeopleMessages do
 
               "report" ->
                 report(txn, session, params)
+
+              "lookup" ->
+                lookup(txn, session, params)
 
               "event" ->
                 receive_event(txn, session, params)
@@ -403,8 +413,11 @@ defmodule Tightbeam.PeopleMessages do
                  "SELECT 1 FROM people_operations WHERE conversation=?1 AND seq<?2 AND report IS NULL LIMIT 1",
                  [conversation_id, seq]
                ),
-             :ok <- validate_report(JSON.decode!(record), params),
-             :ok <- bind_remote(txn, relay, conversation, JSON.decode!(record), params) do
+             record = JSON.decode!(record),
+             :ok <- validate_report(record, params),
+             :ok <- validate_publication(txn, record, params),
+             :ok <- bind_remote(txn, relay, conversation, record, params) do
+          record_publication(txn, record, params["remote_revision"])
           wake = notify(txn, conversation, "People message delivery", params)
 
           Txn.q(txn, "UPDATE people_operations SET report=?2, wakeId=?3 WHERE id=?1", [
@@ -528,22 +541,118 @@ defmodule Tightbeam.PeopleMessages do
 
   defp bind_remote(_txn, _relay, _conversation, _record, _params), do: :ok
 
+  defp validate_publication(txn, record, params) do
+    remote = params["remote_revision"]
+
+    publishes =
+      is_nil(params["refusal"]) and
+        (record["kind"] == "update" or
+           (record["kind"] == "send" and present?(params["remote_conversation_id"])))
+
+    if publishes do
+      [[current]] =
+        Txn.q(
+          txn,
+          """
+          SELECT COALESCE(MAX(remoteRevision),0) FROM people_published_revisions WHERE conversation=?1
+          """,
+          [record["conversation_id"]]
+        )
+
+      check(
+        is_integer(remote) and remote > current,
+        "remote_revision must advance the delivered revision"
+      )
+    else
+      check(is_nil(remote), "remote_revision is only accepted for successful sends and updates")
+    end
+  end
+
+  defp record_publication(_txn, _record, nil), do: :ok
+
+  defp record_publication(txn, record, remote) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO people_published_revisions(conversation,remoteRevision,revision,operation)
+      VALUES(?1,?2,?3,?4)
+      """,
+      [record["conversation_id"], remote, record["revision"], record["id"]]
+    )
+  end
+
+  defp lookup(txn, relay, params) do
+    with {:ok, id} <- remote_conversation(txn, relay, params) do
+      revisions =
+        Txn.q(
+          txn,
+          """
+          SELECT remoteRevision,revision FROM people_published_revisions
+          WHERE conversation=?1 ORDER BY remoteRevision
+          """,
+          [id]
+        )
+
+      %{
+        "conversation_id" => id,
+        "revisions" =>
+          Enum.map(revisions, fn [remote, revision] ->
+            %{"remote_revision" => remote, "revision" => revision}
+          end)
+      }
+    end
+  end
+
+  defp remote_conversation(txn, relay, params) do
+    with :ok <-
+           check(
+             present?(params["server_id"]) and present?(params["remote_conversation_id"]),
+             "remote conversation identifiers required"
+           ),
+         [[id]] <-
+           Txn.q(
+             txn,
+             """
+             SELECT id FROM people_conversations WHERE relay=?1 AND server=?2 AND remote=?3
+             """,
+             [relay, params["server_id"], params["remote_conversation_id"]]
+           ) do
+      {:ok, id}
+    else
+      [] -> error("not_found", "remote conversation not yet bound")
+      failure -> failure
+    end
+  end
+
+  defp published_revision(txn, id, remote) when is_integer(remote) and remote > 0 do
+    case Txn.q(
+           txn,
+           """
+           SELECT p.revision,o.record,
+             p.remoteRevision=(SELECT MAX(latest.remoteRevision) FROM people_published_revisions latest WHERE latest.conversation=?1)
+           FROM people_published_revisions p JOIN people_operations o ON o.id=p.operation
+           WHERE p.conversation=?1 AND p.remoteRevision=?2
+           """,
+           [id, remote]
+         ) do
+      [[revision, record, current]] -> {:ok, revision, JSON.decode!(record), current == 1}
+      [] -> error("revision_unbound", "remote revision has no accepted delivery report")
+    end
+  end
+
+  defp published_revision(_txn, _id, _remote),
+    do: error("invalid", "remote_revision must be a positive integer")
+
   defp receive_event(txn, relay, params) do
     kind = params["kind"]
     event = params["event_id"]
 
     with :ok <-
            check(
-             kind in @event_kinds and present?(event) and present?(params["server_id"]) and
-               present?(params["remote_conversation_id"]),
+             kind in @event_kinds and present?(event),
              "invalid event identity"
            ),
-         [[id]] <-
-           Txn.q(
-             txn,
-             "SELECT id FROM people_conversations WHERE relay=?1 AND server=?2 AND remote=?3",
-             [relay, params["server_id"], params["remote_conversation_id"]]
-           ),
+         {:ok, id} <- remote_conversation(txn, relay, params),
          {:ok, conversation} <- conversation(txn, id) do
       case Txn.q(
              txn,
@@ -553,23 +662,15 @@ defmodule Tightbeam.PeopleMessages do
         [[1]] -> %{accepted: true, duplicate: true}
         [] -> accept_new_event(txn, conversation, kind, event, params)
       end
-    else
-      [] -> error("not_found", "remote conversation not yet bound")
-      failure -> failure
     end
   end
 
   defp accept_new_event(txn, conversation, kind, event, params) do
-    revision = params["revision"]
     speaker = params["speaker"]
     content = params["content"]
 
-    with :ok <-
-           check(
-             is_integer(revision) and revision > 0 and
-               revision <= conversation.message["revision"],
-             "invalid event revision"
-           ),
+    with {:ok, revision, message, current?} <-
+           published_revision(txn, conversation.id, params["remote_revision"]),
          :ok <-
            check(
              valid_speaker?(speaker, params["server_id"]) and (kind != "chat" or is_map(speaker)),
@@ -582,9 +683,9 @@ defmodule Tightbeam.PeopleMessages do
              "invalid event content"
            ) do
       {disposition, ruling_wake, ruling_fact} =
-        answer_disposition(txn, conversation, kind, params)
+        answer_disposition(txn, conversation, message, current?, kind, params)
 
-      payload = Map.put(params, "answer_disposition", disposition)
+      payload = Map.merge(params, %{"revision" => revision, "answer_disposition" => disposition})
       wake = ruling_wake || notify_event(txn, conversation, payload)
 
       Txn.q(
@@ -607,14 +708,12 @@ defmodule Tightbeam.PeopleMessages do
     end
   end
 
-  defp answer_disposition(_txn, _conversation, kind, _params) when kind != "answer",
-    do: {nil, nil, nil}
+  defp answer_disposition(_txn, _conversation, _message, _current?, kind, _params)
+       when kind != "answer",
+       do: {nil, nil, nil}
 
-  defp answer_disposition(txn, conversation, "answer", params) do
-    message = conversation.message
-
-    if conversation.state == "open" and not conversation.answered and
-         message["revision"] == params["revision"] do
+  defp answer_disposition(txn, conversation, message, current?, "answer", params) do
+    if conversation.state == "open" and not conversation.answered and current? do
       case message["answer_rule"] do
         %{"kind" => "first"} ->
           mark_answered(txn, conversation.id)

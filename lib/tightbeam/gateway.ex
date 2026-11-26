@@ -1144,6 +1144,7 @@ defmodule Tightbeam.Gateway do
       {"people-collect", []} => people_dispatch,
       {"people-report", []} => people_dispatch,
       {"people-event", []} => people_dispatch,
+      {"people-lookup", []} => people_dispatch,
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,

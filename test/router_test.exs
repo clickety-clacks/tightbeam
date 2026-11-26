@@ -1038,7 +1038,8 @@ defmodule Tightbeam.Wire.RouterTest do
           %{address: hd(record["addresses"]), status: "reached"}
         ],
         server_id: "service",
-        remote_conversation_id: "conversation"
+        remote_conversation_id: "conversation",
+        remote_revision: 1
       }
     }
 

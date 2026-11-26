@@ -126,6 +126,76 @@ defmodule Tightbeam.PeopleMessagesTest do
     assert chat_prompt =~ "Follow-up"
   end
 
+  test "refused updates leave durable revision gaps and replay uses the delivered revision", %{
+    db: db
+  } do
+    id = send_request(db, %{"answer_rule" => %{"kind" => "first"}})
+    bind_remote(db, id)
+
+    assert %{"record" => %{"id" => rejected}} =
+             call(db, @sender, "update", %{
+               "conversation_id" => id,
+               "revision" => 1,
+               "title" => "Revision 2",
+               "body" => "Rejected"
+             })
+
+    assert %{accepted: true} =
+             call(db, @relay, "report", %{
+               "id" => rejected,
+               "outcomes" => [],
+               "refusal" => %{"code" => "update_refused", "message" => "Update was refused"}
+             })
+
+    scope = %{"server_id" => "service", "remote_conversation_id" => "thread"}
+
+    assert %{
+             "conversation_id" => ^id,
+             "revisions" => [%{"remote_revision" => 1, "revision" => 1}]
+           } = call(db, @relay, "lookup", scope)
+
+    assert %{code: "forbidden"} = call(db, @sender, "lookup", scope)
+
+    assert %{"record" => %{"id" => accepted}} =
+             call(db, @sender, "update", %{
+               "conversation_id" => id,
+               "revision" => 2,
+               "title" => "Revision 3",
+               "body" => "Delivered"
+             })
+
+    current_answer =
+      event("answer", "current", %{"answer" => "yes"}) |> Map.put("remote_revision", 2)
+
+    assert %{code: "revision_unbound"} = call(db, @relay, "event", current_answer)
+
+    assert %{accepted: true} =
+             call(db, @relay, "report", %{
+               "id" => accepted,
+               "outcomes" => [],
+               "remote_revision" => 2
+             })
+
+    assert %{
+             "revisions" => [
+               %{"remote_revision" => 1, "revision" => 1},
+               %{"remote_revision" => 2, "revision" => 3}
+             ]
+           } =
+             call(db, @relay, "lookup", scope)
+
+    assert %{accepted: true} =
+             call(db, @relay, "event", event("answer", "old", %{"answer" => "no"}))
+
+    assert %{accepted: true} = call(db, @relay, "event", current_answer)
+
+    assert {:ok, [[current], [old]]} =
+             DB.query(db, "SELECT payload FROM people_events ORDER BY event")
+
+    assert %{"answer_disposition" => "settled", "revision" => 3} = JSON.decode!(current)
+    assert %{"answer_disposition" => "advice", "revision" => 1} = JSON.decode!(old)
+  end
+
   test "decision advice leaves the request open until its named decider answers", %{db: db} do
     request =
       Escalation.operator_ask(db, %{
@@ -259,6 +329,7 @@ defmodule Tightbeam.PeopleMessagesTest do
                "id" => id,
                "server_id" => "service",
                "remote_conversation_id" => "thread",
+               "remote_revision" => 1,
                "outcomes" => [%{"address" => "user:" <> @owner, "status" => "reached"}]
              })
   end
@@ -269,7 +340,7 @@ defmodule Tightbeam.PeopleMessagesTest do
       "event_id" => id,
       "server_id" => "service",
       "remote_conversation_id" => "thread",
-      "revision" => 1,
+      "remote_revision" => 1,
       "content" => content,
       "speaker" => %{"address" => "user:another-person", "display_name" => "Fixture Person"}
     }
