@@ -32,6 +32,25 @@ export TIGHTBEAM_LOCAL_OPENAI_ENDPOINT=http://127.0.0.1:25502/v1
 export TIGHTBEAM_DEFAULT_HARNESS=pi
 export TIGHTBEAM_DEFAULT_MODEL=local/compat-fixture
 export TIGHTBEAM_DEFAULT_EFFORT=off
+if [ "$SETUP_SCENARIO" = full-onboarding ]; then
+  export SETUP_PROJECT_TOOL=1
+  export TIGHTBEAM_FIRST_RUN_ONBOARDING=true
+  export DISPLAY=:99
+  mkdir "$RUNNER_TEMP/browser-bin"
+  export PATH="$RUNNER_TEMP/browser-bin:$PATH"
+  google-chrome --headless --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 \
+    --user-data-dir="$RUNNER_TEMP/onboarding-chrome" about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
+  for i in $(seq 1 20); do
+    if curl --silent --fail http://127.0.0.1:9222/json/version >/dev/null; then break; fi
+    sleep 1
+  done
+  cat > "$RUNNER_TEMP/browser-bin/xdg-open" <<'SHIM'
+#!/bin/sh
+encoded=$(node -p 'encodeURIComponent(process.argv[1])' "$1")
+curl --silent --fail --request PUT "http://127.0.0.1:9222/json/new?$encoded" >/dev/null
+SHIM
+  chmod +x "$RUNNER_TEMP/browser-bin/xdg-open"
+fi
 node "$RUNNER_TEMP/setup-model-evidence.mjs" &
 model_pid=$!
 collect_logs() {
@@ -77,7 +96,7 @@ setup() {
   "$build/bin/tightbeam" setup "$@"
 }
 snapshot > "$RUNNER_TEMP/before"
-if [ "$SETUP_SCENARIO" = full ]; then
+if [ "$SETUP_SCENARIO" != quick-upgrade ]; then
   initial=full
 else
   initial=quick
@@ -86,9 +105,23 @@ printf 'no\n' | setup --mode "$initial"
 snapshot > "$RUNNER_TEMP/after"
 diff -u "$RUNNER_TEMP/before" "$RUNNER_TEMP/after"
 echo 'Decline filesystem and service diff: empty'
-setup --mode "$initial" --yes | tee "$RUNNER_TEMP/first-turn.log"
+if [ "$SETUP_SCENARIO" = full-onboarding ]; then
+  timeout 150 "$build/bin/tightbeam" setup --mode full --yes | tee "$RUNNER_TEMP/first-turn.log"
+  grep -F 'Open Tightbeam Chat (Main):' "$RUNNER_TEMP/first-turn.log"
+  grep -F 'Open Tightbeam Chat (project exec):' "$RUNNER_TEMP/first-turn.log"
+  curl --silent --fail http://127.0.0.1:9222/json/list | node -e '
+    const tabs = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    const routes = tabs.filter(({url}) => url.startsWith("http://127.0.0.1:4178/")).map(({url}) => new URL(url));
+    const sessions = routes.map(({searchParams}) => searchParams.get("session"));
+    if (routes.length !== 2 || new Set(sessions).size !== 2 || !sessions.some((key) => key?.startsWith("agent:main:"))) process.exit(1);
+    if (routes.some(({searchParams}) => searchParams.get("gateway") !== "http://127.0.0.1:11373")) process.exit(1);
+    console.log("Two distinct Chromium tabs selected separately addressed Main and project sessions over loopback.");
+  '
+else
+  setup --mode "$initial" --yes | tee "$RUNNER_TEMP/first-turn.log"
+fi
 grep -E "^READY:" "$RUNNER_TEMP/first-turn.log"
-node "$RUNNER_TEMP/setup-turn-evidence.mjs"
+if [ "$SETUP_SCENARIO" != full-onboarding ]; then node "$RUNNER_TEMP/setup-turn-evidence.mjs"; fi
 "$HOME/.local/bin/tightbeam" --version
 curl --fail --silent http://127.0.0.1:4178/chat-config.json
 test -f "$TIGHTBEAM_BASE_DIR/state.db"
