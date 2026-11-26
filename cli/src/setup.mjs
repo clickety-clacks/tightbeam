@@ -380,6 +380,9 @@ async function setup() {
     const payload = path.resolve(path.dirname(cli), '..');
     const release = jsonFile(path.join(payload, 'setup-build.json'));
     const tag = release?.tag;
+    if (upgrade && receipt.tag !== tag) {
+      throw new Error('Run quick setup with this release before converting your installation to full mode.');
+    }
     if (receipt?.mode === 'full' && receipt.tag && receipt.tag !== tag) {
       throw new Error('Use the Tightbeam release upgrade procedure to back up and upgrade an existing full installation.');
     }
@@ -426,7 +429,7 @@ async function setup() {
     const chatConfigChanged = !receipt?.main || receipt.advertised !== advertised;
     const chatActive = chat.active();
     const chatFile = (main, admin) => serviceContents('chat', 'quick', process.execPath,
-      [path.join(chatCurrent, 'server/chat-server.mjs')], {
+      ['--preserve-symlinks-main', path.join(chatCurrent, 'server/chat-server.mjs')], {
         HOME: home, PATH: env.PATH, TIGHTBEAM_BASE_DIR: base,
         CHAT_PUBLIC_ORIGIN: chatUrl, CHAT_DEFAULT_GATEWAY_ORIGIN: chatOrigin, CHAT_DEFAULT_SESSION_KEY: main,
         CHAT_DEFAULT_PRINCIPAL_KEY: admin, CHAT_READ_MARKER_DEVICE_CREDENTIAL_FILE: credentials,
@@ -452,6 +455,7 @@ async function setup() {
       'kernel.unprivileged_userns_clone', 'user.max_user_namespaces',
     ].find((key) => readSysctl(key) === '0');
     const install = [];
+    const notes = [];
     const add = (when, text) => { if (when) install.push(text); };
     const missing = ['git', 'npm', 'curl', 'tar'].filter((name) => !available(name));
     if (!providers.length) missing.push('at least one supported harness CLI (claude, codex, pi, or cursor)');
@@ -466,7 +470,7 @@ async function setup() {
     add(stage, 'Verify and stage the Tightbeam release under /opt/tightbeam and select it for the system service.');
     add(appArmor, 'Grant bubblewrap access to user namespaces through its AppArmor profile.');
     add(namespaceFix && !appArmor && sysctlKey, `Enable Linux user namespaces through ${sysctlKey} for the Codex sandbox.`);
-    add(sandboxUnavailable && !appArmor && !sysctlKey, mode === 'quick'
+    if (sandboxUnavailable && !appArmor && !sysctlKey) notes.push(mode === 'quick'
       ? 'Codex cannot use its sandbox here. Use full mode to repair it, or use Claude or Pi.'
       : 'Codex cannot use its sandbox here. Claude and Pi can run if configured.');
     add(upgrade, `Replace the user gateway service with a system service while keeping all data in ${base}.`);
@@ -476,13 +480,13 @@ async function setup() {
     add(linkCli, `Expose the Tightbeam command at ${commandLink}.`);
     add(needsPair, `Pair this computer and create the first Tightbeam administrator for ${account.username}.`);
     for (const { provider } of pending) add(true, `Set up your ${provider} credential for agent turns.`);
-    for (const { provider, key } of withoutKeys) add(true, `Skip ${provider} credential setup until you provide ${key}.`);
+    for (const { provider, key } of withoutKeys) notes.push(`Skip ${provider} credential setup until you provide ${key}.`);
     add(needsMain, 'Create your main Tightbeam conversation.');
     add(installChatPackage, 'Download and verify the published Tightbeam Chat package.');
     add(writeChat || startChat, 'Start local Tightbeam Chat as a user service that can stop when you sign out.');
     add(readiness, 'Ask your main agent for a short reply to verify it can run a turn.');
     add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
-    for (const line of install) console.log(`- ${line}`);
+    for (const line of [...install, ...notes]) console.log(`- ${line}`);
     if (flags.dryRun || !install.length) return;
     if (!flags.yes && await ask(answers, 'Install yes or no') !== 'yes') return;
     reader.close();
@@ -492,8 +496,9 @@ async function setup() {
         !/^[0-9a-f]{40}$/.test(release?.commit ?? ''))) {
       throw new Error('Setup needs the complete, verified Tightbeam release package.');
     }
-    if (!receipt && (gatewayActive || fs.existsSync(gateway.file) || quickGateway.active() || fs.existsSync(quickGateway.file))) {
-      throw new Error('A Tightbeam service already exists outside setup. Use its existing installation procedure.');
+    if (!receipt && (gatewayActive || fs.existsSync(gateway.file) || quickGateway.active() || fs.existsSync(quickGateway.file) ||
+      chatActive || fs.existsSync(chat.file))) {
+      throw new Error('A Tightbeam or Chat service already exists outside setup. Use its existing installation procedure.');
     }
 
     fs.mkdirSync(base, { recursive: true, mode: 0o700 });
