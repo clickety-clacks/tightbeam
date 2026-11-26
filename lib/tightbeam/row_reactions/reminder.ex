@@ -358,11 +358,11 @@ defmodule Tightbeam.RowReactions.Reminder do
   defp placeholder(_subject, _kind, "assignment_id"), do: ref("event.after.assignment.id")
   defp placeholder(_subject, _kind, "work_item_id"), do: ref("event.after.assignment.workItemId")
   defp placeholder(_subject, _kind, "work_item_title"), do: ref("facts.work_item.title")
-  defp placeholder(_subject, _kind, "anchor_name"), do: ref("anchor.name")
+  defp placeholder(_subject, _kind, "anchor_name"), do: ref("facts.names.anchor")
 
   defp placeholder(_subject, _kind, name) do
     who = String.replace_suffix(name, "_name", "")
-    ref("facts.people.#{who}.name")
+    ref("facts.names.#{who}")
   end
 
   defp recipient("anchor"), do: ref("anchor.session_key")

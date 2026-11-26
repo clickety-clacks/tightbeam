@@ -48,7 +48,7 @@ defmodule Tightbeam.RowReactions.Loader do
       end
 
     reminders =
-      case {Tightbeam.SubtreeRules.enabled?(), Map.fetch(manifest, "reminder")} do
+      case {Tightbeam.FeatureFlags.subtree_rules?(), Map.fetch(manifest, "reminder")} do
         {false, _} ->
           []
 

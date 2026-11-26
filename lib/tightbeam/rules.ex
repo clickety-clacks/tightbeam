@@ -1996,7 +1996,7 @@ defmodule Tightbeam.Rules do
       end
 
     root_keys =
-      if Tightbeam.SubtreeRules.enabled?(),
+      if Tightbeam.FeatureFlags.subtree_rules?(),
         do: ["rule", "policy", "reaction", "reminder"],
         else: ["rule", "policy", "reaction"]
 

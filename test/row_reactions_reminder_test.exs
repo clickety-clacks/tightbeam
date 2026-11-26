@@ -214,7 +214,7 @@ defmodule Tightbeam.RowReactionsReminderTest do
 
     test "a missing placeholder value is shown as unknown rather than failing", _ctx do
       load_plain()
-      facts = put_in(facts(), ["people", "holder"], nil)
+      facts = put_in(facts(), ["names", "holder"], nil)
 
       assert %{value: %{"prompt" => "(unknown) finished asg_1."}} =
                Rules.reaction_plans(completed_event(), facts)
@@ -432,13 +432,14 @@ defmodule Tightbeam.RowReactionsReminderTest do
       "assignment" => %{"effect_kind" => "code", "is_review" => false, "notes" => ["done"]},
       "work_item" => %{"title" => "Widget", "state" => "open", "artifact_titles" => []},
       "people" => %{
-        "holder" => %{"session_key" => "s-holder", "name" => "Holder"},
-        "opener" => %{"session_key" => "s-opener", "name" => "Opener"}
+        "holder" => %{"session_key" => "s-holder"},
+        "opener" => %{"session_key" => "s-opener"}
       },
       "sessions" => [
         %{"sessionKey" => "s-holder", "archetype" => "worker", "state" => "active"},
         %{"sessionKey" => "s-opener", "archetype" => "lead", "state" => "active"}
       ],
+      "names" => %{"holder" => "Holder", "opener" => "Opener"},
       "scope_participant_archetypes" => ["worker"],
       "scope_record_session_groups" => [["s-opener", "s-holder"]]
     }
