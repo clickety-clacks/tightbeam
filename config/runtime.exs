@@ -8,6 +8,13 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
   end
 
+  case System.get_env("TIGHTBEAM_SUBTREE_RULES") do
+    nil -> :ok
+    "true" -> config :tightbeam, :subtree_rules, true
+    "false" -> config :tightbeam, :subtree_rules, false
+    _ -> raise ArgumentError, "TIGHTBEAM_SUBTREE_RULES must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end

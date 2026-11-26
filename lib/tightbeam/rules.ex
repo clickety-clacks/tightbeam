@@ -1995,7 +1995,12 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy", "reaction"]))
+    root_keys =
+      if Tightbeam.SubtreeRules.enabled?(),
+        do: ["rule", "policy", "reaction", "reminder"],
+        else: ["rule", "policy", "reaction"]
+
+    unknown = unknown_keys(manifest, MapSet.new(root_keys))
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
