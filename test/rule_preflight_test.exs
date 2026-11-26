@@ -1,7 +1,7 @@
 defmodule Tightbeam.RulePreflightTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Gateway, RulePreflight, Rules}
+  alias Tightbeam.{Gateway, Identity, RulePreflight, RuleReferences, Rules}
 
   setup do
     base = Path.join(System.tmp_dir!(), "rule-preflight-#{System.unique_integer([:positive])}")
@@ -111,6 +111,161 @@ defmodule Tightbeam.RulePreflightTest do
       refute Enum.any?(report.unavailable_verbs, &(&1.name == "valid-owned"))
       assert File.read!(rule_path) == bytes
     end)
+  end
+
+  test "a pending upgrade checks the converted engineering rule and preserves its source", %{
+    base: base
+  } do
+    dir = Path.join(base, "identity")
+    default = File.read!(Path.join(dir, "archetypes/default.toml"))
+
+    write!(
+      dir,
+      "archetypes/coder.toml",
+      String.replace(default, ~s(name = "default"), ~s(name = "coder"))
+    )
+
+    write!(
+      dir,
+      "archetypes/exec.toml",
+      String.replace(default, ~s(name = "default"), ~s(name = "exec"))
+    )
+
+    write!(dir, "kungfu/agentic-engineering/manifest.toml", ~s(name = "agentic-engineering"
+))
+
+    write!(dir, "kungfu/agentic-engineering/installed.toml", """
+    name = "agentic-engineering"
+    paths = ["archetypes/coder.toml", "rules/legacy.toml"]
+    """)
+
+    rule = """
+    [[rule]]
+    name = "legacy-staffing"
+    verb = "spawn"
+    deny_when = [
+      { fact = "spawn.archetype", op = "not_in", value = ["coder", "exec"] },
+      { fact = "work_item.reference_state", op = "ne", value = "known" },
+    ]
+    text = "Worker staffing needs a work item"
+    """
+
+    path = write!(dir, "rules/legacy.toml", rule)
+    revision = commit_live!(dir)
+    report = RulePreflight.run(base, :pending_upgrade)
+    assert report.recording_available, inspect(report.warnings)
+    assert report.unavailable_verbs == []
+    assert File.read!(path) == rule
+    assert git!(dir, ["rev-parse", "main"]) == revision
+    assert Identity.live_revision!(base) == revision
+
+    File.write!(path, String.replace(rule, ~s("exec"), ~s("missing-exec")))
+    commit_live!(dir)
+
+    assert_raise ArgumentError, ~r/legacy-staffing.*unknown archetype.*missing-exec/, fn ->
+      RulePreflight.run(base, :pending_upgrade)
+    end
+  end
+
+  test "publishing a candidate checks its committed rule references", %{base: base} do
+    dir = Path.join(base, "identity")
+    live = Identity.live_revision!(base)
+    path = write!(dir, "rules/orphan.toml", orphan_rule())
+    git!(dir, ["add", "-A"])
+
+    git!(dir, [
+      "-c",
+      "user.name=test",
+      "-c",
+      "user.email=test@localhost",
+      "commit",
+      "-m",
+      "orphan"
+    ])
+
+    revision = git!(dir, ["rev-parse", "HEAD"])
+    File.rm!(path)
+
+    assert_raise ArgumentError, ~r/orphaned-topology.*unknown kungfu.*removed/, fn ->
+      Identity.publish_live!(base, %{candidate_revision: revision, expected_prior: live})
+    end
+
+    assert Identity.live_revision!(base) == live
+  end
+
+  test "startup law loading warns when an orphan is already installed", %{base: base} do
+    write!(Path.join(base, "identity"), "rules/orphan.toml", orphan_rule())
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        Gateway.load_law!(%{base_dir: base})
+      end)
+
+    assert log =~
+             ~s(Invalid rule reference: rules/orphan.toml: rule "orphaned-topology": unknown kungfu "removed")
+
+    assert log =~ ~s(unknown archetype "removed.worker")
+  end
+
+  test "reference diagnostics name the missing condition fact, secondary verb and remedy archetype" do
+    diagnostics =
+      RuleReferences.diagnostics(%{
+        "rules/references.toml" => """
+        [[rule]]
+        name = "missing-references"
+        verb = "assign"
+        verbs = ["assign", "invented-verb"]
+        deny_when = [{ fact = "missing.fact", op = "eq", value = true }]
+        [rule.remedy]
+        action = "spawn"
+        archetype = "missing-worker"
+        """
+      })
+
+    assert Enum.any?(diagnostics, &(&1 =~ ~s(unknown fact "missing.fact")))
+    assert Enum.any?(diagnostics, &(&1 =~ ~s(unknown verb "invented-verb")))
+    assert Enum.any?(diagnostics, &(&1 =~ ~s(unknown archetype "missing-worker")))
+  end
+
+  defp orphan_rule do
+    """
+    [[rule]]
+    name = "orphaned-topology"
+    archetypes = ["removed.worker"]
+    verb = "spawn"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+    text = "Fixture rule"
+    """
+  end
+
+  defp write!(dir, relative, bytes) do
+    path = Path.join(dir, relative)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, bytes)
+    path
+  end
+
+  defp commit_live!(dir) do
+    git!(dir, ["add", "-A"])
+
+    git!(dir, [
+      "-c",
+      "user.name=test",
+      "-c",
+      "user.email=test@localhost",
+      "commit",
+      "-m",
+      "legacy"
+    ])
+
+    revision = git!(dir, ["rev-parse", "HEAD"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", revision])
+    revision
+  end
+
+  defp git!(dir, args) do
+    {output, 0} = System.cmd("git", args, cd: dir, stderr_to_stdout: true)
+    String.trim(output)
   end
 
   test "a later load clears stale unavailability diagnostics", %{base: base} do

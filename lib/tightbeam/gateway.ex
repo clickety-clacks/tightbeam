@@ -6647,6 +6647,7 @@ defmodule Tightbeam.Gateway do
       Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
         Archetypes.load!(law_base)
         Rails.load!(law_base)
+        Tightbeam.RuleReferences.warn!(Path.join(law_base, "identity"))
 
         Rules.load!(config.base_dir, verbs,
           law_base: law_base,
@@ -11447,6 +11448,7 @@ defmodule Tightbeam.Gateway do
              {:ok, adapter, _generation} <-
                adapter_for_session(coordinator, session, false) do
           sid = pointer.harness_session_id
+
           case Adapter.knows_session?(adapter, sid) do
             resident? when is_boolean(resident?) ->
               cwd = Placement.holder_workdir(config, session)

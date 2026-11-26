@@ -364,21 +364,27 @@ defmodule Tightbeam.Identity do
       # Recovery needs the published law, never a partially merged working tree.
       # Export one pinned revision without touching the index or merge metadata.
       revision = git_output!(dir, ["rev-parse", @live])
-      snapshot = Path.join(base_dir, ".identity-law-#{Tightbeam.Id.uuid4()}")
-      tree = Path.join(snapshot, "identity")
-
-      try do
-        File.mkdir_p!(tree)
-        File.chmod!(snapshot, 0o700)
-        env = [{"GIT_INDEX_FILE", Path.join(snapshot, "index")}]
-        export_law!(dir, ["read-tree", revision], env)
-        export_law!(dir, ["checkout-index", "--all", "--prefix=#{tree}/"], env)
-        load.(snapshot, revision)
-      after
-        File.rm_rf!(snapshot)
-      end
+      with_law_revision!(base_dir, revision, load)
     else
       load.(base_dir, nil)
+    end
+  end
+
+  @doc false
+  def with_law_revision!(base_dir, revision, load) do
+    dir = identity_dir(base_dir)
+    snapshot = Path.join(base_dir, ".identity-law-#{Tightbeam.Id.uuid4()}")
+    tree = Path.join(snapshot, "identity")
+
+    try do
+      File.mkdir_p!(tree)
+      File.chmod!(snapshot, 0o700)
+      env = [{"GIT_INDEX_FILE", Path.join(snapshot, "index")}]
+      export_law!(dir, ["read-tree", revision], env)
+      export_law!(dir, ["checkout-index", "--all", "--prefix=#{tree}/"], env)
+      load.(snapshot, revision)
+    after
+      File.rm_rf!(snapshot)
     end
   end
 
@@ -2793,6 +2799,10 @@ defmodule Tightbeam.Identity do
               "archetype #{archetype.name} elects unknown skills: #{Enum.join(missing, ", ")}"
       end
     end)
+
+    dir
+    |> Tightbeam.RuleReferences.tree_entries!()
+    |> Tightbeam.RuleReferences.validate!()
   end
 
   defp validate_revision_dir!(dir, revision) do
@@ -2828,7 +2838,21 @@ defmodule Tightbeam.Identity do
       end
     end)
 
-    :ok
+    dir
+    |> git_output!([
+      "ls-tree",
+      "-r",
+      "--name-only",
+      revision,
+      "--",
+      "rules",
+      "archetypes",
+      "kungfu"
+    ])
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&Tightbeam.RuleReferences.source_path?/1)
+    |> Map.new(&{&1, git_show!(dir, revision, &1)})
+    |> Tightbeam.RuleReferences.validate!()
   end
 
   defp refuse_reserved_substrate_skills!(dir) do

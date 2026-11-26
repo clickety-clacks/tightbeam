@@ -317,6 +317,52 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     end)
   end
 
+  @doc false
+  def with_preview!(base_dir, load) do
+    plan = plan!(base_dir)
+
+    if plan.stops != [] do
+      raise ArgumentError, "rail scoping migration stopped: #{stop_summary(plan.stops)}"
+    end
+
+    Identity.with_law_revision!(base_dir, plan.source_revision, fn scratch, revision ->
+      write_identity_plan!(Path.join(scratch, "identity"), plan)
+      load.(scratch, revision)
+    end)
+  end
+
+  @doc false
+  def pending_for_database!(path) do
+    table =
+      sqlite_read!(path, """
+      SELECT name FROM sqlite_schema
+      WHERE type = 'table' AND name = 'rail_scope_migrations';
+      """)
+
+    if table == "" do
+      true
+    else
+      path
+      |> sqlite_read!(
+        "SELECT reportJson FROM rail_scope_migrations WHERE migrationId = '#{@migration_id}';"
+      )
+      |> case do
+        "" -> true
+        report -> decode_completed_report!([[report]]) == :not_complete
+      end
+    end
+  end
+
+  defp sqlite_read!(path, query) do
+    case System.cmd("sqlite3", ["-batch", "-readonly", path, query], stderr_to_stdout: true) do
+      {output, 0} ->
+        String.trim(output)
+
+      {_output, status} ->
+        raise ArgumentError, "cannot read the rail migration marker (sqlite3 exit #{status})"
+    end
+  end
+
   # 0.1.16 shipped this org-wide rule in an optional bundle. Preserve its
   # configured bytes as substrate law before applying kungfu scope isolation.
   defp plan_decision_briefing(plan) do
@@ -397,7 +443,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     branch = git_output!(dir, ["branch", "--show-current"])
     main = git_output!(dir, ["rev-parse", "main"])
     live = git_output!(dir, ["rev-parse", "tightbeam/live"])
-    dirty = git_output!(dir, ["status", "--porcelain"])
+    dirty = git_output!(dir, ["--no-optional-locks", "status", "--porcelain"])
 
     cond do
       branch != "main" ->
@@ -484,22 +530,31 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   end
 
   defp build_name_map(archetypes) do
-    Map.new(archetypes, fn {short, items} ->
-      flat =
-        Enum.find(items, fn item -> Path.split(item.path) == ["archetypes", short <> ".toml"] end)
+    bare =
+      Map.new(archetypes, fn {short, items} ->
+        flat =
+          Enum.find(items, fn item ->
+            Path.split(item.path) == ["archetypes", short <> ".toml"]
+          end)
 
-      owners = items |> Enum.map(& &1.owner) |> Enum.uniq()
+        owners = items |> Enum.map(& &1.owner) |> Enum.uniq()
 
-      qualified =
-        cond do
-          flat != nil -> Provenance.qualify(flat.owner, short)
-          length(owners) == 1 -> Provenance.qualify(hd(owners), short)
-          length(owners) > 1 -> :ambiguous
-          true -> short
-        end
+        qualified =
+          cond do
+            flat != nil -> Provenance.qualify(flat.owner, short)
+            length(owners) == 1 -> Provenance.qualify(hd(owners), short)
+            length(owners) > 1 -> :ambiguous
+            true -> short
+          end
 
-      {short, qualified}
-    end)
+        {short, qualified}
+      end)
+
+    for {short, items} <- archetypes,
+        item <- items,
+        name = Provenance.qualify(item.owner, short),
+        into: Map.put_new(bare, "default", "default"),
+        do: {name, name}
   end
 
   defp plan_archetypes(plan) do
@@ -816,6 +871,8 @@ defmodule Tightbeam.Identity.RailScopeMigration do
       values = if op in ["in", "not_in"] and is_list(value), do: value, else: [value]
       mapped = Enum.map(values, &Map.get(name_map, &1, &1))
 
+      unknown = Enum.reject(values, &Map.has_key?(name_map, &1))
+
       if :ambiguous in mapped do
         {:stop,
          "comparison #{fact} #{op} #{inspect(value)} refers to an ambiguous bare archetype name"}
@@ -853,6 +910,9 @@ defmodule Tightbeam.Identity.RailScopeMigration do
           {:kungfu, _} when not participant? ->
             {:stop,
              "comparison #{fact} #{op} #{inspect(value)} is a foreign archetype comparison on a record fact"}
+
+          {:kungfu, _} when unknown != [] ->
+            {:stop, "comparison #{fact} #{op} names unknown archetype(s) #{inspect(unknown)}"}
 
           {:kungfu, _} ->
             preserve_participant_comparison(fact, op, value, mapped, foreign, allowed, rewrites)
