@@ -86,6 +86,19 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end)
 
+    if tags[:grouped_outage_notices] do
+      flag = :harklight_grouped_outage_notices_enabled
+      previous = Application.fetch_env(:tightbeam, flag)
+      Application.put_env(:tightbeam, flag, true)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:tightbeam, flag, value)
+          :error -> Application.delete_env(:tightbeam, flag)
+        end
+      end)
+    end
+
     db = :"harklight_wakes_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
@@ -4438,6 +4451,57 @@ defmodule Tightbeam.HarklightWakesTest do
     assert count.("w_harklight_notice_recovery_%") == 2
   end
 
+  test "default outages are told individually and their recoveries are immediate", %{
+    db: db,
+    session: session
+  } do
+    alias Tightbeam.HarklightListenerOutage, as: Outage
+
+    other = "00000000-0000-4000-8000-000000000001"
+    seed_completion_handle(db, session.session_key, other, "other")
+
+    for handle <- [@handle, other] do
+      assert {:ok, [^handle, _, _, _]} =
+               DB.transaction(db, fn txn ->
+                 Outage.start_in_txn(txn, handle, {"down", nil, nil}, 1_000)
+               end)
+    end
+
+    for handle <- [@handle, other] do
+      assert {:ok, [[episode, nil]]} =
+               DB.query(
+                 db,
+                 "SELECT episode,noticeWakeId FROM harklight_listener_outages WHERE handle=?1",
+                 [
+                   handle
+                 ]
+               )
+
+      assert {:ok, :notified} = Outage.notify(db, handle, episode, 2_000, 1_000)
+      assert {:ok, :ok} = Outage.finish(db, handle, true, 3_000)
+
+      prompt = "Tightbeam is receiving Harklight updates again for conversation #{handle}."
+
+      assert {:ok, [[^prompt]]} =
+               DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [
+                 "w_harklight_listening_" <> episode
+               ])
+    end
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'"
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE name='harklight_outage_recoveries'"
+             )
+  end
+
+  @tag :grouped_outage_notices
   test "outages that fall due together are told together, and later ones on their own", %{
     db: db,
     session: session
@@ -4509,6 +4573,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, []} = DB.query(db, "SELECT handle FROM harklight_outage_recoveries")
   end
 
+  @tag :grouped_outage_notices
   test "a gathered recovery is told after a restart", %{db: db} do
     :ok =
       DB.execute(

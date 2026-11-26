@@ -2953,8 +2953,12 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp arm_recoveries(%{recovery_timer: nil} = state) do
-    timer = Process.send_after(self(), :announce_recoveries, state.recovery_gather_delay)
-    %{state | recovery_timer: timer}
+    if Outage.grouped_notices_enabled?() do
+      timer = Process.send_after(self(), :announce_recoveries, state.recovery_gather_delay)
+      %{state | recovery_timer: timer}
+    else
+      state
+    end
   end
 
   defp arm_recoveries(state), do: state
