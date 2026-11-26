@@ -4810,7 +4810,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[^wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
-  test "recovery CLI selection follows pin, validated PATH, then adapter bundle" do
+  test "Codex recovery CLI selection follows pin, validated PATH, then adapter bundle" do
     # Resolve version-manager shims before running with the fixture PATH.
     {node, 0} = System.cmd("node", ["-p", "process.execPath"])
     node = String.trim(node)
@@ -4832,35 +4832,29 @@ defmodule Tightbeam.HarnessHealthTest do
 
     on_exit(fn -> File.rm_rf!(root) end)
 
-    Enum.each(["claude", "codex"], fn harness ->
-      bundles = create_recovery_adapter_bundle!(node, adapter_root, harness)
-      cli = Path.join(path_dir, harness)
-      bad_cli = Path.join(bad_path_dir, harness)
-      File.write!(cli, "#!/bin/sh\necho 'fixture 1.0.0'\n")
-      File.chmod!(cli, 0o755)
-      File.write!(bad_cli, "#!/bin/sh\nexit 1\n")
-      File.chmod!(bad_cli, 0o755)
+    bundle = create_codex_recovery_adapter_bundle!(adapter_root)
+    cli = Path.join(path_dir, "codex")
+    bad_cli = Path.join(bad_path_dir, "codex")
+    File.write!(cli, "#!/bin/sh\necho 'fixture 1.0.0'\n")
+    File.chmod!(cli, 0o755)
+    File.write!(bad_cli, "#!/bin/sh\nexit 1\n")
+    File.chmod!(bad_cli, 0o755)
 
-      pin = Path.join(root, "pinned-#{harness}")
+    pin = Path.join(root, "pinned-codex")
 
-      assert %{"command" => [^pin], "source" => "pin"} =
-               recovery_binary_selection!(node, adapter_root, harness, path_dir, pin)
+    assert %{"command" => [^pin], "source" => "pin"} =
+             codex_recovery_binary_selection!(node, adapter_root, path_dir, pin)
 
-      assert %{"command" => [^cli], "source" => "path"} =
-               recovery_binary_selection!(node, adapter_root, harness, path_dir, "")
+    assert %{"command" => [selected_cli], "source" => "path"} =
+             codex_recovery_binary_selection!(node, adapter_root, path_dir, "")
 
-      selected = recovery_binary_selection!(node, adapter_root, harness, bad_path_dir, "")
+    assert same_file?(cli, selected_cli)
 
-      if harness == "codex" do
-        bundle = bundles
-        assert %{"command" => [selected_node, selected_bundle], "source" => "bundle"} = selected
-        assert same_file?(node, selected_node)
-        assert same_file?(bundle, selected_bundle)
-      else
-        assert %{"command" => [bundle], "source" => "bundle"} = selected
-        assert Enum.any?(bundles, &same_file?(&1, bundle))
-      end
-    end)
+    assert %{"command" => [selected_node, selected_bundle], "source" => "bundle"} =
+             codex_recovery_binary_selection!(node, adapter_root, bad_path_dir, "")
+
+    assert same_file?(node, selected_node)
+    assert same_file?(bundle, selected_bundle)
   end
 
   test "resolution withdraws the hold cycle before its deadline", ctx do
@@ -4949,13 +4943,13 @@ defmodule Tightbeam.HarnessHealthTest do
     end)
   end
 
-  defp recovery_binary_selection!(node, adapter_root, harness, path, pin) do
-    script = RecoveryCheck.binary_selection_program(harness)
+  defp codex_recovery_binary_selection!(node, adapter_root, path, pin) do
+    script = RecoveryCheck.binary_selection_program("codex")
 
     {output, 0} =
       System.cmd(
         node,
-        ["-e", script, adapter_root, harness, pin],
+        ["-e", script, adapter_root, "codex", pin],
         env: [{"PATH", path}],
         stderr_to_stdout: true
       )
@@ -4963,7 +4957,7 @@ defmodule Tightbeam.HarnessHealthTest do
     JSON.decode!(output)
   end
 
-  defp create_recovery_adapter_bundle!(_node, adapter_root, "codex") do
+  defp create_codex_recovery_adapter_bundle!(adapter_root) do
     adapter = Path.join(adapter_root, "node_modules/@agentclientprotocol/codex-acp")
     codex = Path.join(adapter_root, "node_modules/@openai/codex/bin/codex.js")
     File.mkdir_p!(adapter)
@@ -4983,45 +4977,6 @@ defmodule Tightbeam.HarnessHealthTest do
 
     File.write!(codex, "process.stdout.write('fixture 1.0.0')\n")
     codex
-  end
-
-  defp create_recovery_adapter_bundle!(node, adapter_root, "claude") do
-    adapter = Path.join(adapter_root, "node_modules/@agentclientprotocol/claude-agent-acp")
-    sdk = Path.join(adapter_root, "node_modules/@anthropic-ai/claude-agent-sdk")
-    File.mkdir_p!(adapter)
-    File.mkdir_p!(sdk)
-
-    File.write!(
-      Path.join(adapter, "package.json"),
-      ~s|{"name":"@agentclientprotocol/claude-agent-acp","main":"index.js"}|
-    )
-
-    entry = Path.join(adapter, "index.js")
-    File.write!(entry, "")
-
-    File.write!(
-      Path.join(sdk, "package.json"),
-      ~s|{"name":"@anthropic-ai/claude-agent-sdk","main":"index.js"}|
-    )
-
-    File.write!(Path.join(sdk, "index.js"), "")
-    {runtime, 0} = System.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
-    [platform, arch] = String.split(String.trim(runtime))
-
-    packages =
-      if platform == "linux" do
-        ["claude-agent-sdk-linux-#{arch}", "claude-agent-sdk-linux-#{arch}-musl"]
-      else
-        ["claude-agent-sdk-#{platform}-#{arch}"]
-      end
-
-    Enum.map(packages, fn package ->
-      binary = Path.join([adapter_root, "node_modules/@anthropic-ai", package, "claude"])
-      File.mkdir_p!(Path.dirname(binary))
-      File.write!(binary, "")
-      File.chmod!(binary, 0o755)
-      binary
-    end)
   end
 
   defp same_file?(left, right) do

@@ -34,6 +34,11 @@ defmodule Tightbeam.ModelCatalog do
   }
 
   @default_ttl_ms :timer.minutes(15)
+  @credential_retry_ms :timer.seconds(60)
+
+  defguardp credential_probe_failure?(reason)
+            when is_tuple(reason) and tuple_size(reason) == 2 and
+                   elem(reason, 0) in [:needs_onboarding, :credential_status_unavailable]
 
   @type health :: :fresh | :stale | {:unavailable, term()}
   @type key :: {host :: String.t(), harness :: String.t()}
@@ -602,21 +607,26 @@ defmodule Tightbeam.ModelCatalog do
         end
 
       _ ->
-        unless optional_harness_absence?(harness, reason) do
-          Logger.warning(
-            "model catalog #{harness} on #{host} refresh degraded: #{inspect(reason)}"
-          )
-        end
-
         case state.entries[key] do
           nil ->
             {:noreply, state}
 
           cache ->
+            credential_failure? = credential_probe_failure?(reason)
+
+            unless optional_harness_absence?(harness, reason) or
+                     (credential_failure? and cache.reason == reason) do
+              Logger.warning(
+                "model catalog #{harness} on #{host} refresh degraded: #{inspect(reason)}"
+              )
+            end
+
             recheck? = Map.get(cache, :recheck, false)
+            attempted_at = if credential_failure?, do: now_ms(state), else: cache.attempted_at
 
             cache =
               cache
+              |> Map.put(:attempted_at, attempted_at)
               |> Map.put(:reason, reason)
               |> Map.put(:refreshing, false)
               |> Map.put(:recheck, false)
@@ -1042,14 +1052,11 @@ defmodule Tightbeam.ModelCatalog do
     if now - cache.derived_at < ttl, do: :fresh, else: :stale
   end
 
-  # A needs_onboarding outcome is world-state that can change at any instant (a
-  # credential lands mid-TTL), so it is NEVER cached as durable truth: it stays
-  # eligible to re-derive, so the next refresh pass — a read, or the
-  # credential-present recognition — reaches the new world-state rather than
-  # waiting a full TTL later (O4/I5, the DELETE). The `refreshing` guard still
-  # bounds this to one in-flight derive per key.
-  defp expired?(%{reason: {:needs_onboarding, _}}, _now, _ttl), do: true
-  defp expired?(%{reason: {:credential_status_unavailable, _}}, _now, _ttl), do: true
+  # Reads retry credential failures on a shorter interval than the catalog TTL.
+  # A credential-present event bypasses the interval via a forced refresh.
+  defp expired?(%{reason: reason, attempted_at: attempted_at}, now, _ttl)
+       when credential_probe_failure?(reason),
+       do: now - attempted_at >= @credential_retry_ms
 
   defp expired?(%{derived_at: nil, attempted_at: nil}, _now, _ttl), do: true
 

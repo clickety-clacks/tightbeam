@@ -557,6 +557,10 @@ pub enum Command {
         target_id: String,
     },
     Transcript {
+        roles: Vec<String>,
+        no_notices: bool,
+        since: Option<String>,
+        text: bool,
         identity: Identity,
         session: Option<String>,
         name: Option<String>,
@@ -568,6 +572,8 @@ pub enum Command {
         identity: Identity,
         filters: ToplineFilters,
         tree: bool,
+        limit: Option<u32>,
+        after: Option<String>,
     },
     Topline {
         identity: Identity,
@@ -1217,14 +1223,23 @@ COMMANDS:
       Compute physical breathing from one durable snapshot. Both answers exit 0.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
+             [--role <role,...>] [--no-notices] [--since <time>] [--format json|text]
       Read a session's conversation from the substrate's own rows. --name is a
       LOOKUP: it returns candidate sessions to choose from, never content.
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
+      Recover with --no-notices --format text; --role assistant reads just replies. --role repeats or
+      accepts commas (user, assistant, system, tool). --no-notices hides process
+      user notices and batches with only process-authored included members;
+      mixed agent batches stay. Filters apply before limit and paging.
+      --since accepts ISO 8601 with timezone or durations (30m, 2h, 1d).
+      JSON is the default. Text includes UTC headers and paging cursors.
+      Filters require gateway capability transcript-filters-v1; older gateways
+      fail clearly. Text alone also works with older gateways.
   execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
-           [--session <key>] [--tree]
+           [--session <key>] [--tree | --limit <1..500> [--after <cursor>]]
       The work telemetry the substrate already knows: every work item you can
       see, with its assignment/job/attest/turn counts, who holds it, whether
       anything is running, and how long it has been quiet. --tree renders the
@@ -1232,6 +1247,8 @@ COMMANDS:
       turn that was RUNNING when each item was created, so they record
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
+      --limit pages the flat roster in its existing order. Pass page.nextCursor
+      from the response to --after to get the next page.
       No percentages and no completion estimates: the rows do not support them.
         tightbeam execution-map --origin user --state open --as-user sample-user
         tightbeam execution-map --quiet-over 2h --as-user sample-user
@@ -1592,6 +1609,7 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
+    "no-notices",
     "abort",
     "admin",
     "all",
@@ -1663,6 +1681,7 @@ fn split_args(args: Vec<String>) -> Flags {
                 if matches!(
                     name,
                     "memento"
+                        | "role"
                         | "value"
                         | "kind-prefix"
                         | "kind"
@@ -1935,7 +1954,7 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree | --limit <1..500> [--after <cursor>]]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
 const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
@@ -4150,7 +4169,40 @@ fn parse_with_optional_catalog(
             if before.is_some() && after.is_some() {
                 return Err("transcript takes at most one of --before or --after".to_owned());
             }
+            for flag in ["role", "since", "format"] {
+                if flags.contains_key(flag) && nonempty(flags, flag).is_none() {
+                    return Err(format!("--{flag} requires a value"));
+                }
+            }
+            let roles: Vec<String> = parsed
+                .repeated
+                .get("role")
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.split(','))
+                .map(|role| role.trim().to_owned())
+                .collect();
+            if roles
+                .iter()
+                .any(|role| !["user", "assistant", "system", "tool"].contains(&role.as_str()))
+            {
+                return Err("--role requires user, assistant, system, or tool".to_owned());
+            }
+            let format = nonempty(flags, "format").unwrap_or_else(|| "json".to_owned());
+            if !["json", "text"].contains(&format.as_str()) {
+                return Err("--format requires json or text".to_owned());
+            }
+            if name.is_some() && format == "text" {
+                return Err(
+                    "--format text requires --session; use JSON name lookup to choose a session"
+                        .to_owned(),
+                );
+            }
             Ok(Command::Transcript {
+                roles,
+                no_notices: flags.contains_key("no-notices"),
+                since: nonempty(flags, "since"),
+                text: format == "text",
                 identity: identity(flags)?,
                 session,
                 name,
@@ -4166,10 +4218,31 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
+            let limit = nonempty(flags, "limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|limit| (1..=500).contains(limit))
+                        .ok_or("--limit must be an integer from 1 to 500")
+                })
+                .transpose()?;
+
+            let after = nonempty(flags, "after");
+            let tree = flags.contains_key("tree");
+            if after.is_some() && limit.is_none() {
+                return Err("--after requires --limit".to_owned());
+            }
+            if tree && limit.is_some() {
+                return Err("--limit is supported only for the flat execution map".to_owned());
+            }
+
             Ok(Command::Toplines {
                 identity: identity(flags)?,
                 filters: topline_filters(flags)?,
-                tree: flags.contains_key("tree"),
+                tree,
+                limit,
+                after,
             })
         }
         "execution-map-select" => {
@@ -8073,6 +8146,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execution_map_paging_is_opt_in() {
+        let command = parse(strings(&[
+            "execution-map",
+            "--as-user",
+            "sample-user",
+            "--limit",
+            "25",
+            "--after",
+            "123:wi_example",
+        ]))
+        .unwrap();
+        let body = crate::dispatch::build_request(&command).unwrap().body_json;
+        assert!(body.contains(r#""limit":25"#));
+        assert!(body.contains(r#""after":"123:wi_example""#));
+
+        for args in [
+            vec!["execution-map", "--limit", "0"],
+            vec!["execution-map", "--after", "123:wi_example"],
+            vec!["execution-map", "--tree", "--limit", "25"],
+        ] {
+            assert!(parse(strings(&args)).is_err());
+        }
+    }
+
     // The blocking code-review finding on the first cut: the CLI attached roster
     // filters to BOTH topline modes and sent them, while the reader selects solely
     // by assignment id — so `--assignments X --state closed` could return an OPEN
@@ -10197,5 +10295,48 @@ mod tests {
         assert_eq!(update.flags.get("title"), Some(&"--prefixed".to_owned()));
         assert!(!update.flags.contains_key("prefixed"));
         assert!(!update.missing_values.contains("title"));
+    }
+    #[test]
+    fn transcript_filters_accept_single_repeat_and_comma_roles() {
+        for (roles, expected) in [
+            (vec!["--role", "assistant"], vec!["assistant"]),
+            (
+                vec!["--role", "user", "--role", "assistant"],
+                vec!["user", "assistant"],
+            ),
+            (vec!["--role", "user,assistant"], vec!["user", "assistant"]),
+        ] {
+            let mut argv = vec![
+                "transcript",
+                "--session",
+                "session-key",
+                "--format",
+                "text",
+                "--no-notices",
+                "--since",
+                "30m",
+            ];
+            argv.extend(roles);
+            let command = parse(argv.into_iter().map(str::to_owned).collect()).unwrap();
+            match command {
+                Command::Transcript {
+                    roles,
+                    no_notices,
+                    since,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(roles, expected);
+                    assert!(no_notices && text);
+                    assert_eq!(since.as_deref(), Some("30m"));
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+        for flag in [vec!["--role", "bogus"], vec!["--format", "yaml"]] {
+            let mut argv = vec!["transcript", "--session", "session-key"];
+            argv.extend(flag);
+            assert!(parse(argv.into_iter().map(str::to_owned).collect()).is_err());
+        }
     }
 }
