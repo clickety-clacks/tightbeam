@@ -176,33 +176,33 @@ WantedBy=${system ? 'multi-user.target' : 'default.target'}
 `;
 }
 
-async function download(url, destination) {
-  run('curl', ['--fail', '--silent', '--show-error', '--location', '--max-time', '300', '--output', destination, url]);
-}
-
-async function releaseFiles(repository, tag, dir, selectAsset, sidecars) {
-  const releases = `https://api.github.com/repos/clickety-clacks/${repository}/releases`;
-  const data = path.join(dir, 'release.json');
-  await download(`${releases}/${tag === 'latest' ? tag : `tags/${encodeURIComponent(tag)}`}`, data);
-  const release = jsonFile(data);
-  const asset = release.assets.find(({ name }) => selectAsset(name));
-  if (!asset) throw new Error(`No suitable ${repository} package in ${release.tag_name}.`);
-  for (const name of [asset.name, 'SHA256SUMS', ...sidecars]) {
-    const item = release.assets.find((candidate) => candidate.name === name);
-    if (!item) throw new Error(`${repository} release is missing ${name}.`);
-    await download(item.browser_download_url, path.join(dir, name));
+function download(url, destination) {
+  try {
+    run('curl', ['--fail', '--silent', '--show-error', '--location', '--max-time', '300', '--output', destination, url]);
+  } catch (error) {
+    throw new Error(`Could not download ${url}: ${error.message}`);
   }
-  const file = path.join(dir, asset.name);
-  const sums = fs.readFileSync(path.join(dir, 'SHA256SUMS'), 'utf8').split(/\r?\n/);
-  const entry = sums.map((line) => line.match(/^([0-9a-f]{64})\s+\*?(.+)$/)).find((match) => match?.[2] === asset.name);
-  const actual = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-  if (actual !== entry?.[1]) throw new Error(`${repository} package checksum mismatch.`);
-  return { file, digest: actual, tag: release.tag_name };
 }
 
-async function installChat(scratch) {
-  const { file, digest } = await releaseFiles('tightbeam-chat', 'latest', scratch,
-    (name) => /^tightbeam-chat-v\d+\.\d+\.\d+\.tar\.gz$/.test(name), []);
+function checksumEntries(file) {
+  return fs.readFileSync(file, 'utf8').split(/\r?\n/)
+    .map((line) => line.match(/^([0-9a-f]{64})\s+\*?(.+)$/))
+    .filter(Boolean);
+}
+
+function installChat(scratch) {
+  const releases = 'https://github.com/clickety-clacks/tightbeam-chat/releases';
+  const sums = path.join(scratch, 'chat-SHA256SUMS');
+  download(`${releases}/latest/download/SHA256SUMS`, sums);
+  const packages = checksumEntries(sums).filter((entry) =>
+    /^tightbeam-chat-v\d+\.\d+\.\d+\.tar\.gz$/.test(entry[2]));
+  if (packages.length !== 1) throw new Error('The Chat release must provide one package checksum.');
+  const [, expected, name] = packages[0];
+  const tag = name.slice('tightbeam-chat-'.length, -'.tar.gz'.length);
+  const file = path.join(scratch, name);
+  download(`${releases}/download/${tag}/${name}`, file);
+  const digest = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  if (digest !== expected) throw new Error('Tightbeam Chat package checksum mismatch.');
   const destination = path.join(chatRoot, `sha256-${digest}`);
   if (!fs.existsSync(destination)) {
     fs.mkdirSync(chatRoot, { recursive: true });
@@ -273,12 +273,12 @@ async function stageGateway(scratch, release, activate) {
   const directory = env.TIGHTBEAM_SETUP_RELEASE_DIR ?? scratch;
   const provenance = path.join(directory, 'release-provenance.json');
   const checksums = path.join(directory, 'SHA256SUMS');
-  let file;
+  const file = path.resolve(directory, name);
   if (directory === scratch) {
-    ({ file } = await releaseFiles('tightbeam', release.tag, scratch,
-      (asset) => asset === name, ['release-provenance.json']));
-  } else {
-    file = path.resolve(directory, name);
+    const url = `https://github.com/clickety-clacks/tightbeam/releases/download/${release.tag}`;
+    download(`${url}/SHA256SUMS`, checksums);
+    download(`${url}/release-provenance.json`, provenance);
+    download(`${url}/${name}`, file);
   }
   const identity = jsonFile(provenance);
   if (identity?.commit !== release.commit || identity.tag !== release.tag) {
@@ -669,7 +669,7 @@ async function setup() {
           console.error(`Skipped ${provider} because credential onboarding did not complete: ${error.message}`);
         }
       }
-      if (installChatPackage) await installChat(scratch);
+      if (installChatPackage) installChat(scratch);
       if (needsMain) {
         const auth = await gatewayFrame(localOrigin, {
           type: 'auth', deviceId: state.deviceId, token: fs.readFileSync(credentials, 'utf8'), subscriptions: ['chat'],
