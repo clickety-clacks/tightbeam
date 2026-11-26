@@ -265,8 +265,7 @@ defmodule Tightbeam.RowReactionsReminderTest do
       [delivery_owner, anchor] = reaction["effects"]
       assert %{"op" => "concat", "args" => prompt_parts} = delivery_owner["value"]["prompt"]
 
-      assert %{"op" => "coalesce", "args" => [%{"ref" => "event.workItemId"}, "(unknown)"]} in
-               prompt_parts
+      assert %{"op" => "coalesce", "args" => [%{"ref" => "event.workItemId"}, "(unknown)"]} in prompt_parts
 
       assert anchor["value"]["session_key"] == %{"ref" => "anchor.session_key"}
 
