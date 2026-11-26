@@ -525,6 +525,20 @@ pub enum Command {
         body: Option<String>,
         clear_body: bool,
     },
+    WorkItemWait {
+        identity: Identity,
+        work_item_id: String,
+        assignment: Option<String>,
+        decision: Option<String>,
+        condition_kind: Option<String>,
+        condition_scope: Option<String>,
+        after_ms: Option<String>,
+        wait_reason: String,
+    },
+    WorkItemWaitWithdraw {
+        identity: Identity,
+        work_item_id: String,
+    },
     WorkItemGet {
         identity: Identity,
         work_item_id: String,
@@ -924,6 +938,8 @@ COMMANDS:
       Ready-now continuation:
         tightbeam wake --session <holderSession> --assignment <assignmentId>
           --after-turn --wait-reason "<reason>" --prompt "<continuation>"
+      --wait-reason explains why the wake was scheduled; --prompt says what to do.
+      Other wake forms may also supply the same short, single-line reason.
       --cron uses five numeric fields in gateway local time, such as "*/30 * * * *".
       It repeats until cancel-wake. Lists, ranges and steps are supported.
       --assignment links a recurring wake to that assignment.
@@ -1189,6 +1205,12 @@ COMMANDS:
       inherit priority changes.
       Body-only forms: --body <text>, --body=<text>, or --clear-body. A body
       update replaces the whole text; --clear-body removes it.
+  work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>)
+      [--fallback-after <duration>] --wait-reason "<short reason>"
+      Fallback is required for events and refused for assignment or decision targets.
+      Quiet only bare-item reminders until this recorded dependency ends.
+      Inspect the wait with work-item-get; recording another target replaces it.
+  work-item-wait-withdraw <workItemId>
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -4033,6 +4055,60 @@ fn parse_with_optional_catalog(
                 clear_body: false,
             })
         }
+        "work-item-wait" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>) [--fallback-after <duration>] --wait-reason <reason>".to_owned());
+            }
+            let assignment = nonempty(flags, "assignment");
+            let decision = nonempty(flags, "decision");
+            let condition_kind = nonempty(flags, "when-fact");
+            let condition_scope = nonempty(flags, "when-scope");
+            if [
+                assignment.is_some(),
+                decision.is_some(),
+                condition_kind.is_some(),
+            ]
+            .into_iter()
+            .filter(|v| *v)
+            .count()
+                != 1
+                || condition_kind.is_some() != condition_scope.is_some()
+            {
+                return Err(
+                    "name exactly one --assignment, --decision, or --when-fact with --when-scope"
+                        .to_owned(),
+                );
+            }
+            let wait_reason = nonempty(flags, "wait-reason").ok_or("--wait-reason is required")?;
+            if condition_kind.is_none() && flags.contains_key("fallback-after") {
+                return Err("--fallback-after is only supported for event waits".to_owned());
+            }
+            let fallback = nonempty(flags, "fallback-after")
+                .map(|value| parse_duration("fallback-after", &value))
+                .transpose()?;
+            if condition_kind.is_some() && fallback.is_none() {
+                return Err("event waits require --fallback-after".to_owned());
+            }
+            Ok(Command::WorkItemWait {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                assignment,
+                decision,
+                condition_kind,
+                condition_scope,
+                after_ms: fallback,
+                wait_reason,
+            })
+        }
+        "work-item-wait-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-wait-withdraw <workItemId>".to_owned());
+            }
+            Ok(Command::WorkItemWaitWithdraw {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+            })
+        }
         "work-item-get" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-get <workItemId>".to_owned());
@@ -5290,6 +5366,26 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_wait_rejects_record_fallbacks() {
+        for target in ["--assignment", "--decision"] {
+            assert_eq!(
+                parse(strings(&[
+                    "work-item-wait",
+                    "wi_1",
+                    target,
+                    "target_1",
+                    "--fallback-after",
+                    "3h",
+                    "--wait-reason",
+                    "Waiting for target"
+                ]))
+                .unwrap_err(),
+                "--fallback-after is only supported for event waits"
+            );
+        }
+    }
+
     #[test]
     fn progress_inputs_preserve_values_and_refuse_conflicts() {
         for percent in ["0", "100"] {
@@ -7727,6 +7823,8 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "work-item-wait",
+                "work-item-wait-withdraw",
                 "work-item-handoff",
                 "work-item-update",
                 "attend",

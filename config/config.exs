@@ -6,6 +6,9 @@ config :tightbeam, :escalation_decision_deadline_ms, 86_400_000
 # must be offered in the exact host/harness catalog and cheaper than the source.
 config :tightbeam, :harness_switch_context_enabled, true
 
+# GET /api/work-item-indicators; off means the route answers as if it did not exist.
+config :tightbeam, :work_item_indicators_enabled, false
+
 source = %{
   source_model: "gpt-6-sol",
   source_model_contexts: [nil],

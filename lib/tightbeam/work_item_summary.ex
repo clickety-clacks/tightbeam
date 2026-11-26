@@ -42,6 +42,11 @@ defmodule Tightbeam.WorkItemSummary do
         effectiveCommitRefs: summary.effective_commit_refs,
         landings: summary.landings
       })
+      |> then(fn item ->
+        if Tightbeam.WaitLinks.enabled?(),
+          do: Map.merge(item, %{waiting: summary.waiting, running: summary.running}),
+          else: item
+      end)
     end)
   end
 
@@ -129,7 +134,10 @@ defmodule Tightbeam.WorkItemSummary do
       |> then(&observed_landings(db, &1))
       |> associate_landings(effective_refs_by_item)
 
+    wait_summaries = Tightbeam.WaitLinks.summaries(db, work_item_ids)
+
     summaries
+    |> Map.new(fn {id, fields} -> {id, Map.merge(fields, Map.fetch!(wait_summaries, id))} end)
     |> put_fields(:holders, holders)
     |> put_fields(:started, started)
     |> put_fields(:attest_counts, attest_counts)

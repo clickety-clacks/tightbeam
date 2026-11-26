@@ -425,8 +425,19 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp push(%{"class" => "kungfu.updated"} = payload, state),
     do: {:push, {:text, Publisher.encode_wire_notice(payload)}, state}
 
-  defp push(%{"class" => _class} = payload, state),
+  defp push(%{"class" => _class} = payload, %{principal_kind: :observer} = state),
     do: {:push, {:text, Publisher.encode_wire_notice(payload, model_catalog(state))}, state}
+
+  defp push(%{"class" => _class} = payload, state) do
+    principal =
+      if state.principal_kind == :session,
+        do: %{kind: "session", id: state.principal_id, is_admin: true},
+        else: %{kind: "user", id: state.user_id, is_admin: state.is_admin}
+
+    payload = Tightbeam.WaitLinks.project_notice(db(state), payload, principal)
+
+    {:push, {:text, Publisher.encode_wire_notice(payload, model_catalog(state))}, state}
+  end
 
   defp model_catalog(state) do
     case state.deps[:model_catalog] || Tightbeam.ModelCatalog do

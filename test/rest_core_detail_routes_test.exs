@@ -1,6 +1,19 @@
 defmodule Tightbeam.RestCoreDetailRoutesTest do
   use Tightbeam.TestCase, async: false
 
+  setup do
+    previous = Application.get_env(:tightbeam, :wait_links_enabled)
+    Application.put_env(:tightbeam, :wait_links_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :wait_links_enabled),
+        else: Application.put_env(:tightbeam, :wait_links_enabled, previous)
+    end)
+
+    :ok
+  end
+
   import Plug.Conn
   import Plug.Test
 
@@ -32,11 +45,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @r7_fields %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings waiting running rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "wakes" =>
-      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
+      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion waitOn),
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount rowVersion),
     "decision requests" =>
@@ -85,7 +98,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   }
 
   @boolean_fields %{
-    "work items" => ~w(isBug createdContextKnown started),
+    "work items" => ~w(isBug createdContextKnown started running),
     "assignments" => ~w(holderFallback),
     "wakes" => ~w(rumination digest summon),
     "turns" => [],
@@ -299,6 +312,275 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       artifact: artifact,
       catalog: catalog
     }
+  end
+
+  @tag :wait_links
+  test "wait links use org asUser auth and bounded exact-record pages", ctx do
+    path = "/api/work-items/#{ctx.work_item.id}/wait-links?asUser=flynn&limit=1"
+    response = get(ctx, path, "tbc_core_detail")
+    assert response.status == 200
+    page = JSON.decode!(response.resp_body)
+    assert [edge] = page["items"]
+    assert edge["from"] == %{"kind" => "work-item", "id" => ctx.work_item.id}
+    assert is_integer(page["asOf"])
+    assert is_integer(page["rowVersion"])
+    assert page["truncated"]
+    assert is_binary(page["nextCursor"])
+    second = get(ctx, path <> "&cursor=" <> page["nextCursor"], "tbc_core_detail")
+    assert second.status == 200
+    assert [next] = JSON.decode!(second.resp_body)["items"]
+    refute edge["id"] == next["id"]
+
+    for {kind, id} <- [
+          {"assignments", ctx.assignment.id},
+          {"sessions", ctx.admin_session.session_key},
+          {"decision-requests", ctx.decision_request_id}
+        ] do
+      response =
+        get(
+          ctx,
+          "/api/#{kind}/#{URI.encode_www_form(id)}/wait-links?asUser=flynn",
+          "tbc_core_detail"
+        )
+
+      assert response.status == 200
+      assert is_list(JSON.decode!(response.resp_body)["items"])
+    end
+
+    assert get(ctx, "/api/work-items/missing/wait-links?asUser=flynn", "tbc_core_detail").status ==
+             404
+
+    assert get(ctx, path <> "&includeEnded=wrong", "tbc_core_detail").status == 400
+    assert get(ctx, path <> "&cursor=wrong", "tbc_core_detail").status == 400
+  end
+
+  @tag :wait_links
+  test "wait targets preserve fact scope and distinguish fallback from due time", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.admin_session.session_key,
+        origin: "user:flynn",
+        prompt: "Resume",
+        due_at: System.system_time(:millisecond) + 60_000,
+        condition_kind: "custom-ready",
+        condition_scope: ctx.assignment.id,
+        wait_reason: "Waiting for the recorded event",
+        assignment_id: ctx.assignment.id
+      })
+
+    path = "/api/assignments/#{ctx.assignment.id}/wait-links?asUser=flynn"
+    response = get(ctx, path, "tbc_core_detail")
+    assert response.status == 200
+    edge = Enum.find(JSON.decode!(response.resp_body)["items"], &(&1["wakeId"] == wake.wake_id))
+    assert edge["waitReason"] == "Waiting for the recorded event"
+    assert edge["to"]["kind"] == "event"
+    assert edge["to"]["scope"] == ctx.assignment.id
+    assert [%{"kind" => "event"}, %{"kind" => "time", "role" => "fallback"}] = edge["waitOn"]
+    detail = get(ctx, "/api/wakes/#{wake.wake_id}?asUser=flynn", "tbc_core_detail")
+    assert detail.status == 200
+
+    assert JSON.decode!(detail.resp_body)["item"]["waitOn"] ==
+             Enum.map(edge["waitOn"], &Map.delete(&1, "visible"))
+  end
+
+  @tag :wait_links
+  test "wait links retain cycles and hidden targets and end the page explicitly", ctx do
+    outsider_device(ctx)
+    other = ensure_main_session(ctx.db, "outsider")
+
+    for {session, reason} <- [
+          {ctx.admin_session.session_key, "Waiting on this assignment"},
+          {other.session_key, "Waiting on a record whose visibility changed"}
+        ] do
+      Wakes.schedule(ctx.db, %{
+        session_key: session,
+        origin: "process:tightbeam",
+        prompt: "Resume",
+        due_at: Wakes.no_deadline(),
+        wait_mode: "dependency",
+        wait_reason: reason,
+        assignment_id: if(session == other.session_key, do: nil, else: ctx.assignment.id),
+        resolver_kind: "assignment",
+        resolver_id: ctx.assignment.id,
+        predicate: %{"bindings" => %{"assignmentId" => ctx.assignment.id}}
+      })
+    end
+
+    response =
+      get(ctx, "/api/assignments/#{ctx.assignment.id}/wait-links?asUser=flynn", "tbc_core_detail")
+
+    assert response.status == 200
+    page = JSON.decode!(response.resp_body)
+    cycle = Enum.find(page["items"], &(&1["waitReason"] == "Waiting on this assignment"))
+    assert cycle["to"]["id"] == ctx.assignment.id
+    assert cycle["from"]["id"] == ctx.assignment.id
+    assert page["nextCursor"] == nil
+    refute page["truncated"]
+
+    response =
+      get(ctx, "/api/sessions/#{other.session_key}/wait-links?asUser=outsider", "tbc_core_detail")
+
+    assert response.status == 200
+    assert [hidden] = JSON.decode!(response.resp_body)["items"]
+    assert hidden["to"] == %{"kind" => "assignment", "id" => nil, "visible" => false}
+    assert hidden["waitReason"] == "Waiting on a record whose visibility changed"
+
+    assert {:ok, %{limit: 50}} =
+             Tightbeam.WaitLinks.request(%{"limit" => ["200"]}, "session", other.session_key)
+  end
+
+  @tag :wait_links
+  test "work item summary tracks running turns and wake targets match committed events", ctx do
+    path = "/api/work-items/#{ctx.work_item.id}"
+    initial = JSON.decode!(get(ctx, path).resp_body)["item"]
+    assert initial["waiting"]["time"]
+    refute initial["running"]
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "wait-summary")
+    running = JSON.decode!(get(ctx, path).resp_body)["item"]
+    assert running["running"]
+    assert running["rowVersion"] > initial["rowVersion"]
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    finished = JSON.decode!(get(ctx, path).resp_body)["item"]
+    refute finished["running"]
+    assert finished["rowVersion"] > running["rowVersion"]
+
+    row = StateResources.query_wake(ctx.db, ctx.wake.wake_id)
+    notice = Publisher.committed_notice("wake.scheduled", row, %{"wakeId" => ctx.wake.wake_id})
+    detail = JSON.decode!(get(ctx, "/api/wakes/#{ctx.wake.wake_id}").resp_body)["item"]
+    assert notice["payload"]["waitOn"] == detail["waitOn"]
+    assert [%{"kind" => "time", "role" => "due"}] = detail["waitOn"]
+  end
+
+  @tag :wait_links
+  test "ended wakes require explicit history and standing blocks retain their target", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+    wake_id = ctx.wake.wake_id
+
+    assert {:accepted_in_txn, _, %{canceled: true}} =
+             handlers["wake"].(%{
+               verb: "wake",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{cancel_wake_id: wake_id}
+             })
+
+    path = "/api/assignments/#{ctx.assignment.id}/wait-links?asUser=flynn"
+    active = get(ctx, path, "tbc_core_detail")
+    assert active.status == 200
+    refute Enum.any?(JSON.decode!(active.resp_body)["items"], &(&1["wakeId"] == wake_id))
+    history = get(ctx, path <> "&includeEnded=true", "tbc_core_detail")
+    assert history.status == 200
+
+    assert Enum.any?(
+             JSON.decode!(history.resp_body)["items"],
+             &(&1["wakeId"] == wake_id and &1["state"] == "canceled")
+           )
+
+    result =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "session:" <> ctx.admin_session.session_key,
+        principal: {:session, ctx.admin_session.session_key},
+        session_key: nil,
+        params: %{
+          assignment_id: ctx.assignment.id,
+          kind: "cannot-proceed",
+          note: "Waiting for the opener"
+        }
+      })
+
+    assert %{attest: %{kind: "cannot-proceed"}} = result
+    response = get(ctx, path, "tbc_core_detail")
+    assert response.status == 200
+
+    block =
+      Enum.find(JSON.decode!(response.resp_body)["items"], &(&1["kind"] == "cannot-proceed"))
+
+    assert block["to"] == %{"kind" => "user", "id" => "flynn", "visible" => true}
+    assert block["state"] == "standing"
+    item = JSON.decode!(get(ctx, "/api/work-items/#{ctx.work_item.id}").resp_body)["item"]
+    assert "flynn" in item["waiting"]["userIds"]
+  end
+
+  @tag :wait_links
+  test "exact work item reads seek the primary key and scoped notices carry its id", ctx do
+    {response, trace} =
+      traced_get(ctx, "/api/work-items/#{ctx.work_item.id}?asUser=flynn", "tbc_core_detail")
+
+    assert response.status == 200
+
+    sql =
+      Enum.find_value(trace, fn
+        {:sql_query, sql, _} -> if String.contains?(sql, "FROM work_items AS wi"), do: sql
+        _ -> nil
+      end)
+
+    assert sql =~ "WHERE wi.id = ?1"
+    refute sql =~ "?1 IS NULL OR"
+
+    assert {:ok, plan} =
+             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, [
+               ctx.work_item.id,
+               1,
+               "user",
+               "flynn",
+               nil,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil
+             ])
+
+    assert Enum.any?(plan, fn row -> String.contains?(List.last(row), "SEARCH wi") end)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.admin_session.session_key,
+        origin: "user:flynn",
+        prompt: "Resume",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: ctx.assignment.id,
+        wait_reason: "Waiting for processing"
+      })
+
+    notice = Publisher.state_notice(ctx.db, %{verb: "wake", params: %{}}, wake)
+    assert notice["refs"]["workItemId"] == ctx.work_item.id
+    assert Hub.matches?(notice, %{"workItemId" => ctx.work_item.id})
+
+    assert :ok =
+             Hub.register(Hub, self(), %{
+               mode: :subscribed,
+               db: ctx.db,
+               user_id: "flynn",
+               is_admin: true
+             })
+
+    assert :ok =
+             Hub.subscribe(Hub, self(), "wait-records", %{
+               "workItemId" => ctx.work_item.id,
+               "classes" => ["wake.", "decision_request."]
+             })
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+               decision = Escalation.raw_by_id_in_txn(txn, ctx.decision_request_ids.effort)
+
+               Publisher.committed_in_txn(txn, "decision_request.opened", decision, %{
+                 "decisionRequestId" => decision.id
+               })
+             end)
+
+    item_id = ctx.work_item.id
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "wake.scheduled", "refs" => %{"workItemId" => ^item_id}}}
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "decision_request.opened", "refs" => %{"workItemId" => ^item_id}}}
   end
 
   test "real reopen returns the canonical REST assignment and summary notice", ctx do
@@ -2450,62 +2732,66 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     :ok = WS.close(ws)
   end
 
-  test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes",
-       ctx do
-    {:ok, queued_turn} =
-      Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
+  for enabled <- [false, true] do
+    test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes (wait links #{enabled})",
+         ctx do
+      Application.put_env(:tightbeam, :wait_links_enabled, unquote(enabled))
 
-    :ok =
-      Ledger.finish(ctx.db, queued_turn.seq, "delivered", nil,
-        owner_lease: queued_turn.owner_lease
-      )
+      {:ok, queued_turn} =
+        Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
 
-    {port, ws} = start_change_server(ctx)
-    {frames, ws} = committed_core_frames(ctx, port, ws)
+      :ok =
+        Ledger.finish(ctx.db, queued_turn.seq, "delivered", nil,
+          owner_lease: queued_turn.owner_lease
+        )
 
-    for %{
-          class: class,
-          resource: resource,
-          path: path,
-          raw: raw,
-          http_status: http_status,
-          http_headers: headers,
-          http_body: body,
-          source_refs: source_refs
-        } <-
-          frames do
-      notice = JSON.decode!(raw)
-      {:ok, registry} = Registry.fetch(class)
+      {port, ws} = start_change_server(ctx)
+      {frames, ws} = committed_core_frames(ctx, port, ws)
 
-      assert http_status == 200, path
-      assert notice["class"] == class
-      assert notice["op"] == "upsert"
-      assert notice["resource"] == registry.resource
+      for %{
+            class: class,
+            resource: resource,
+            path: path,
+            raw: raw,
+            http_status: http_status,
+            http_headers: headers,
+            http_body: body,
+            source_refs: source_refs
+          } <-
+            frames do
+        notice = JSON.decode!(raw)
+        {:ok, registry} = Registry.fetch(class)
 
-      assert Map.take(notice["refs"], registry.primary_refs) ==
-               Map.take(source_refs, registry.primary_refs)
+        assert http_status == 200, path
+        assert notice["class"] == class
+        assert notice["op"] == "upsert"
+        assert notice["resource"] == registry.resource
 
-      assert_source_ref_values(resource, notice["payload"], source_refs)
-      assert is_integer(notice["payload"]["rowVersion"])
-      assert application_header(headers, "content-type") == "application/json; charset=utf-8"
-      assert application_header(headers, "cache-control") == "no-store"
-      payload_bytes = raw_json_value(raw, "payload")
-      item_bytes = raw_json_value(body, "item")
+        assert Map.take(notice["refs"], registry.primary_refs) ==
+                 Map.take(source_refs, registry.primary_refs)
 
-      assert payload_bytes == item_bytes,
-             "#{class}\npayload=#{payload_bytes}\nitem=#{item_bytes}"
+        assert_source_ref_values(resource, notice["payload"], source_refs)
+        assert is_integer(notice["payload"]["rowVersion"])
+        assert application_header(headers, "content-type") == "application/json; charset=utf-8"
+        assert application_header(headers, "cache-control") == "no-store"
+        payload_bytes = raw_json_value(raw, "payload")
+        item_bytes = raw_json_value(body, "item")
 
-      assert item_bytes == StateResources.encode_item(resource, notice["payload"], ctx.catalog)
+        assert payload_bytes == item_bytes,
+               "#{class}\npayload=#{payload_bytes}\nitem=#{item_bytes}"
+
+        assert item_bytes == StateResources.encode_item(resource, notice["payload"], ctx.catalog)
+      end
+
+      turn = Enum.find(frames, &(&1.resource == "turns")) |> then(&JSON.decode!(&1.raw))
+      device = Enum.find(frames, &(&1.resource == "devices")) |> then(&JSON.decode!(&1.raw))
+
+      assert turn["payload"]["seq"] == turn["refs"]["turnSeq"]
+      refute Map.has_key?(turn["payload"], "turnSeq")
+      assert device["payload"]["deviceId"] == device["refs"]["deviceId"]
+      refute Map.has_key?(device["payload"], "id")
+      :ok = WS.close(ws)
     end
-
-    turn = Enum.find(frames, &(&1.resource == "turns")) |> then(&JSON.decode!(&1.raw))
-    device = Enum.find(frames, &(&1.resource == "devices")) |> then(&JSON.decode!(&1.raw))
-
-    assert turn["payload"]["seq"] == turn["refs"]["turnSeq"]
-    refute Map.has_key?(turn["payload"], "turnSeq")
-    assert device["payload"]["deviceId"] == device["refs"]["deviceId"]
-    refute Map.has_key?(device["payload"], "id")
-    :ok = WS.close(ws)
   end
 
   test "AC4 rejects every alternate string and numeric key spelling with the closed 404", ctx do
@@ -3690,6 +3976,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
         field in Map.fetch!(@boolean_fields, resource) ->
           assert is_boolean(value), "#{resource}.#{field} is not a boolean"
+
+        {resource, field} == {"work items", "waiting"} ->
+          assert is_boolean(value["agent"]) and is_boolean(value["time"])
+          assert is_boolean(value["event"])
+          assert is_list(value["userIds"])
+
+        {resource, field} == {"wakes", "waitOn"} ->
+          assert is_list(value)
+          assert Enum.all?(value, &is_binary(&1["kind"]))
 
         field == "fyi" ->
           assert is_list(value) and Enum.all?(value, &is_binary/1)

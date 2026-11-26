@@ -138,7 +138,10 @@ defmodule Tightbeam.RowReactions.Notice do
         wake =
           case Wakes.get_in_txn(txn, id) do
             nil ->
-              Wakes.schedule_in_txn(txn, input)
+              # The typed reference is installed below. Do not publish an item
+              # wait before that reference exists (or before the item-created notice).
+              excluded = Tightbeam.WaitLinks.work_item_reminder_reference?(value["reference"])
+              Wakes.schedule_in_txn(txn, Map.put(input, :wait_link_excluded, excluded))
 
             %{state: "pending", delivered_turn_seq: nil} = old ->
               revise(txn, old, input, action["result"])
