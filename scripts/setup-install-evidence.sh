@@ -46,10 +46,27 @@ if [ "$SETUP_SCENARIO" = full-onboarding ]; then
   done
   cat > "$RUNNER_TEMP/browser-bin/xdg-open" <<'SHIM'
 #!/bin/sh
-encoded=$(node -p 'encodeURIComponent(process.argv[1])' "$1")
-curl --silent --fail --request PUT "http://127.0.0.1:9222/json/new?$encoded" >/dev/null
+exec node "$RUNNER_TEMP/setup-open-tab.mjs" "$1"
 SHIM
   chmod +x "$RUNNER_TEMP/browser-bin/xdg-open"
+  cat > "$RUNNER_TEMP/setup-open-tab.mjs" <<'OPENER'
+const version = await (await fetch('http://127.0.0.1:9222/json/version')).json();
+const socket = new WebSocket(version.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+  socket.onopen = () => socket.send(JSON.stringify({
+    id: 1, method: 'Target.createTarget', params: { url: process.argv[2] },
+  }));
+  socket.onmessage = ({ data }) => {
+    const reply = JSON.parse(data);
+    if (reply.id === 1) {
+      socket.close();
+      if (reply.error) reject(new Error(reply.error.message));
+      else resolve();
+    }
+  };
+  socket.onerror = reject;
+});
+OPENER
 fi
 node "$RUNNER_TEMP/setup-model-evidence.mjs" &
 model_pid=$!

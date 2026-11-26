@@ -12,9 +12,10 @@ async function find(check, label) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 const tabs = async () => (await (await fetch(endpoint)).json()).filter((tab) => tab.type === 'page');
+const mainKey = await find(async () => (await (await fetch('http://127.0.0.1:4178/chat-config.json')).json()).sessionKey, 'the configured Main session');
 const mainTab = await find(async () => (await tabs()).find(({ url }) => {
   const target = new URL(url);
-  return target.origin === 'http://127.0.0.1:4178' && target.searchParams.get('session')?.startsWith('agent:main:');
+  return target.origin === 'http://127.0.0.1:4178' && target.searchParams.get('session') === mainKey;
 }), 'the full installer to open Main in Chat');
 console.log('Main opened in Chromium');
 const socket = new WebSocket(mainTab.webSocketDebuggerUrl);
@@ -47,7 +48,7 @@ try {
   await find(async () => (await tabs()).find(({ url, id }) => {
     const target = new URL(url);
     return id !== mainTab.id && target.origin === 'http://127.0.0.1:4178' &&
-      target.searchParams.get('session') && !target.searchParams.get('session').startsWith('agent:main:');
+      target.searchParams.get('session') && target.searchParams.get('session') !== mainKey;
   }), 'an independently addressed project tab');
   console.log('Declined Enzo, accepted the project offer, and observed a new project tab.');
 } finally {
