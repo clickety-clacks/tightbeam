@@ -81,6 +81,8 @@ defmodule Tightbeam.Harness do
   @callback wire_projection() :: binary()
   @callback preflight_launch(target(), String.t(), keyword()) :: preflight_result()
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
+  @callback check_launch(launch_plan(), String.t(), ([String.t()] -> {String.t(), integer()})) ::
+              launch_result()
   @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
   @doc "Optional harness-owned metadata for loading an existing ACP session."
@@ -132,6 +134,7 @@ defmodule Tightbeam.Harness do
   @callback running_model_tuning_supported?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
+                      check_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
@@ -161,6 +164,13 @@ defmodule Tightbeam.Harness do
       plan when is_list(plan) ->
         {:ok, plan}
     end
+  end
+
+  @doc "Check a completed launch plan before the coordinator starts an adapter."
+  def check_launch(module, opts, host, run) do
+    if function_exported?(module, :check_launch, 3),
+      do: module.check_launch(opts, host, run),
+      else: {:ok, opts}
   end
 
   @spec ensure_adapter(module(), target()) :: ensure_result()
