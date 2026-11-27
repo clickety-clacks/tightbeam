@@ -35,19 +35,32 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert Path.wildcard(Path.join(identity_dir, "archetypes/*.toml")) ==
-             [Path.join(identity_dir, "archetypes/default.toml")]
+             [
+               Path.join(identity_dir, "archetypes/default.toml"),
+               Path.join(identity_dir, "archetypes/tour-guide.toml")
+             ]
 
     assert File.regular?(Path.join([identity_dir, "guidance", "operating-model.md"]))
 
     assert Path.wildcard(Path.join(identity_dir, "guidance/*.md")) ==
              [Path.join(identity_dir, "guidance/operating-model.md")]
 
-    assert %{"default" => default} = Archetypes.load!(ctx.base_dir)
-    assert default.skills == ["tightbeam-onboarding"]
+    assert %{"default" => main, "tour-guide" => tour_guide} = Archetypes.load!(ctx.base_dir)
+    assert main.skills == []
+    assert tour_guide.skills == ["tightbeam-onboarding"]
 
-    snapshot = Identity.snapshot!(ctx.base_dir, "default", :codex)
+    main_snapshot = Identity.snapshot!(ctx.base_dir, "default", :codex)
+    assert main_snapshot.guidance =~ "Be Main, the user's root contact"
+    assert main_snapshot.guidance =~ "Harklight over email"
+    assert main_snapshot.guidance =~ "channel availability, recipient consent and send authority"
+    assert main_snapshot.guidance =~ "already authorized fallback"
+    assert main_snapshot.guidance =~ "keep custody"
+    refute main_snapshot.guidance =~ "tightbeam doctor"
+    refute main_snapshot.guidance =~ "Use the elected `tightbeam-onboarding` skill"
+
+    snapshot = Identity.snapshot!(ctx.base_dir, "tour-guide", :codex)
     assert snapshot.skills == %{}
-    assert snapshot.guidance =~ "expert on Tightbeam, setting it up on this machine"
+    assert snapshot.guidance =~ "Main remains their root contact"
     assert snapshot.guidance =~ "tightbeam doctor"
 
     assert snapshot.guidance =~
@@ -56,16 +69,17 @@ defmodule Tightbeam.ArchetypesTest do
     assert snapshot.guidance =~
              "Kung fu (功夫, gōngfu) means skill earned through time and practice"
 
+    onboarding =
+      Application.app_dir(:tightbeam, "priv/skills/tightbeam-onboarding/SKILL.md")
+      |> File.read!()
+
+    profile = "state/users/<userId>/user.md"
+    assert main_snapshot.guidance =~ profile
+    assert onboarding =~ profile
+    assert onboarding =~ "Preserve existing entries"
+    assert onboarding =~ "stated contact preferences under About"
+
     flat_guidance = String.replace(snapshot.guidance, "\n", " ")
-
-    assert flat_guidance =~
-             "You are the org's general agent and the user's front door, and you WANT this user to get everything tightbeam can give them."
-
-    assert flat_guidance =~
-             "Attentiveness is the trait, offers are its expression: notice how this user actually uses tightbeam"
-
-    assert flat_guidance =~
-             "bring ONE concrete offer at a natural pause, do it for them if they say yes, and record the answer. Once per need; a decline closes it."
 
     assert flat_guidance =~
              "WHEN the user's stated goal matches the purpose or phrases of a bundle in the `Available kungfu bundles in this Tightbeam build` section of this composed context, NAME that bundle and OFFER to learn it in one sentence before any other plan."
@@ -118,18 +132,18 @@ defmodule Tightbeam.ArchetypesTest do
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
   end
 
-  test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
-    # Read the SEEDED default, not builtin_default() -- the latter carries skills: [],
+  test "Tour Guide's elected baseline skills prescribe no bundle archetype before learn" do
+    # Read the SEEDED Tour Guide, not builtin_default() -- the latter carries skills: [],
     # so looping over it iterates nothing and the assertion passes unconditionally. That
     # is how bundle content ("spawn a product owner") shipped in an elected skill with
     # this very test green.
-    default =
-      Application.app_dir(:tightbeam, "priv/seed/archetypes/default.toml")
+    tour_guide =
+      Application.app_dir(:tightbeam, "priv/seed/archetypes/tour-guide.toml")
       |> File.read!()
       |> Toml.decode!()
 
-    assert default["skills"] != [],
-           "the seeded default elects no skills, so this test would prove nothing"
+    assert tour_guide["skills"] != [],
+           "the seeded Tour Guide elects no skills, so this test would prove nothing"
 
     bundle_archetypes =
       Application.app_dir(:tightbeam, "priv/kungfu/*/archetypes/*.toml")
@@ -141,7 +155,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert bundle_archetypes != [],
            "no bundle archetypes found, so the refutations below would check nothing"
 
-    for skill <- default["skills"] do
+    for skill <- tour_guide["skills"] do
       body =
         Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
         |> File.read!()

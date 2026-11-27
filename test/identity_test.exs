@@ -208,6 +208,7 @@ defmodule Tightbeam.IdentityTest do
            |> String.split("\n", trim: true) ==
              [
                "archetypes/default.toml",
+               "archetypes/tour-guide.toml",
                "guidance/operating-model.md",
                "rails/github-auth.toml",
                "rails/tightbeam-probe.toml",
@@ -2045,6 +2046,7 @@ defmodule Tightbeam.IdentityTest do
     assert :noop = Identity.init!(ctx.base)
     assert File.regular?(Path.join(dir, "kungfu/agentic-engineering/installed.toml"))
     assert File.read!(Path.join(dir, "archetypes/default.toml")) == enriched_default
+    refute File.exists?(Path.join(dir, "archetypes/tour-guide.toml"))
     assert git!(dir, ["log", "-1", "--format=%s"]) == "learn-receipt: agentic-engineering"
 
     assert :noop = Identity.init!(ctx.base)
