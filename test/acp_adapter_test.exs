@@ -1533,6 +1533,24 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
 
+  test "a dispatched Claude prompt can leave history even if it returns an error" do
+    {adapter, capture_path} = start_adapter(harness: :claude)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+    assert {:error, _} = Adapter.prompt(adapter, sid, "fail after dispatch")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               sid,
+               Model.new("claude-sonnet-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
   test "Codex model switch updates the resident session without forking" do
     {adapter, capture_path} = start_adapter(harness: :codex)
 
@@ -2817,7 +2835,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "bounded continuity guidance uses the supported harness channel on new and load" do
     guidance =
       "served guidance\n\n" <>
-        "Run `tightbeam transcript --session \"same-key\" --limit 50`. " <>
+        "Run `tightbeam transcript --session \"same-key\" --limit 50 --no-notices --format text`. " <>
         "Do not replay or inject earlier messages."
 
     for {harness, expected} <- [

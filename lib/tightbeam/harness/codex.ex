@@ -276,6 +276,9 @@ defmodule Tightbeam.Harness.Codex do
     do: Support.owned_home_entries("hooks.json")
 
   @impl true
+  def conversation_directory, do: "sessions"
+
+  @impl true
   def reconcile_home(target, home, desired) do
     rails =
       case desired.rails do

@@ -2,6 +2,7 @@ mod anthropic_oauth;
 mod args;
 mod attempt_diagnostic;
 mod base_dir;
+mod capacity_probe;
 mod catalog_probe;
 mod ceremonies;
 mod child_process;
@@ -10,6 +11,7 @@ mod contain;
 mod cursor_execution_identity;
 mod cursor_rails;
 mod dispatch;
+mod first_run;
 mod github_auth;
 mod harklight_child;
 mod harness_process;
@@ -24,6 +26,7 @@ mod rail_action;
 mod session_connect;
 mod session_rail_scope;
 mod skills;
+mod transcript;
 mod transport_receipt;
 mod users;
 
@@ -37,6 +40,18 @@ fn main() {
             "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
         );
         std::process::exit(1);
+    }
+
+    if args == ["onboard", "--first-run", "--check"] {
+        std::process::exit(if first_run::pending() { 0 } else { 1 });
+    }
+
+    if args == ["onboard", "--first-run"] {
+        if let Err(error) = first_run::run() {
+            eprintln!("First-run onboarding: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if args.first().is_some_and(|arg| arg == "harklight-child") {
@@ -112,6 +127,16 @@ fn main() {
 
     if args.first().is_some_and(|arg| arg == "catalog-probe") {
         match catalog_probe::probe(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "capacity-probe") {
+        match capacity_probe::probe(&args[1..]) {
             Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");

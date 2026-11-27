@@ -2820,6 +2820,103 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  test "Pi typed turn failures keep incident evidence but are never redelivered", ctx do
+    Application.put_env(:tightbeam, :pi_typed_turn_failures_enabled, true)
+
+    [first, second, healthy] = pi_sessions!(ctx.db)
+
+    sources =
+      for {ref, message_id, kind, attempts, final_error} <- [
+            {first, "pi-exhausted-timeout", "pi_retry_exhausted", 4, "Request timed out."},
+            {first, "pi-exhausted-rate-limit", "pi_retry_exhausted", 4,
+             "429 rate limit exceeded: usage limit reached"},
+            {second, "pi-failed-rate-limit", "pi_turn_failed", 1,
+             "429 rate limit exceeded: usage limit reached"}
+          ] do
+        fail_health_turn!(
+          ctx.db,
+          ref,
+          message_id,
+          "do not replay this prompt",
+          pi_typed_turn_failure(kind, attempts, final_error)
+        )
+      end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2,?3)",
+               Enum.map(sources, & &1.seq)
+             )
+
+    # Incident and fact observability is unchanged: the classified failures
+    # still open the rate-limit incident with their own observations.
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "rate-limit-dead"
+
+    assert incident.harness == "pi"
+
+    assert ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "pi",
+             "testhost",
+             "rate-limit-dead"
+           )
+
+    assert HarnessHealth.get(ctx.db, incident.id).observations
+           |> Enum.map(& &1.correlation_id)
+           |> MapSet.new() ==
+             sources
+             |> Enum.drop(1)
+             |> Enum.map(&"harness-turn:#{&1.seq}:rate-limit-dead")
+             |> MapSet.new()
+
+    _restoration = restore_health_turn!(ctx.db, healthy, "pi-typed-restoration")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "pi",
+             "testhost",
+             "rate-limit-dead"
+           )
+
+    assert {:ok, [[3, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT SUM(status='failed'),SUM(status='queued') FROM turns WHERE messageId IN " <>
+                 "('pi-exhausted-timeout','pi-exhausted-rate-limit','pi-failed-rate-limit')"
+             )
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM health_redelivery_attempts")
+  end
+
+  test "only a Pi session's typed failure skips its redelivery source", ctx do
+    Application.put_env(:tightbeam, :pi_typed_turn_failures_enabled, true)
+
+    [claude | _] = ctx.sessions
+    [pi | _] = pi_sessions!(ctx.db)
+    typed = pi_typed_turn_failure("pi_retry_exhausted", 4, "Request timed out.")
+    untyped = update_in(typed, ["data"], &Map.delete(&1, "errorKind"))
+
+    # Controls: the same typed carrier on another harness, and a Pi failure
+    # without the Pi kind, keep the existing unclassified redelivery source.
+    for {session_key, message_id, reason, expected} <- [
+          {pi, "pi-typed-timeout", typed, []},
+          {claude.session, "non-pi-typed-timeout", typed, [["unclassified"]]},
+          {pi, "pi-untyped-timeout", untyped, [["unclassified"]]}
+        ] do
+      source = fail_health_turn!(ctx.db, session_key, message_id, "prompt", reason)
+
+      assert {:ok, ^expected} =
+               DB.query(
+                 ctx.db,
+                 "SELECT failureClass FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+    end
+  end
+
   test "unclassified and compaction failures redeliver once on same-harness success", ctx do
     [first, second, healthy | _] = ctx.sessions
 
@@ -4810,7 +4907,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[^wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
-  test "recovery CLI selection follows pin, validated PATH, then adapter bundle" do
+  test "Codex recovery CLI selection follows pin, validated PATH, then adapter bundle" do
     # Resolve version-manager shims before running with the fixture PATH.
     {node, 0} = System.cmd("node", ["-p", "process.execPath"])
     node = String.trim(node)
@@ -4832,35 +4929,29 @@ defmodule Tightbeam.HarnessHealthTest do
 
     on_exit(fn -> File.rm_rf!(root) end)
 
-    Enum.each(["claude", "codex"], fn harness ->
-      bundles = create_recovery_adapter_bundle!(node, adapter_root, harness)
-      cli = Path.join(path_dir, harness)
-      bad_cli = Path.join(bad_path_dir, harness)
-      File.write!(cli, "#!/bin/sh\necho 'fixture 1.0.0'\n")
-      File.chmod!(cli, 0o755)
-      File.write!(bad_cli, "#!/bin/sh\nexit 1\n")
-      File.chmod!(bad_cli, 0o755)
+    bundle = create_codex_recovery_adapter_bundle!(adapter_root)
+    cli = Path.join(path_dir, "codex")
+    bad_cli = Path.join(bad_path_dir, "codex")
+    File.write!(cli, "#!/bin/sh\necho 'fixture 1.0.0'\n")
+    File.chmod!(cli, 0o755)
+    File.write!(bad_cli, "#!/bin/sh\nexit 1\n")
+    File.chmod!(bad_cli, 0o755)
 
-      pin = Path.join(root, "pinned-#{harness}")
+    pin = Path.join(root, "pinned-codex")
 
-      assert %{"command" => [^pin], "source" => "pin"} =
-               recovery_binary_selection!(node, adapter_root, harness, path_dir, pin)
+    assert %{"command" => [^pin], "source" => "pin"} =
+             codex_recovery_binary_selection!(node, adapter_root, path_dir, pin)
 
-      assert %{"command" => [^cli], "source" => "path"} =
-               recovery_binary_selection!(node, adapter_root, harness, path_dir, "")
+    assert %{"command" => [selected_cli], "source" => "path"} =
+             codex_recovery_binary_selection!(node, adapter_root, path_dir, "")
 
-      selected = recovery_binary_selection!(node, adapter_root, harness, bad_path_dir, "")
+    assert same_file?(cli, selected_cli)
 
-      if harness == "codex" do
-        bundle = bundles
-        assert %{"command" => [selected_node, selected_bundle], "source" => "bundle"} = selected
-        assert same_file?(node, selected_node)
-        assert same_file?(bundle, selected_bundle)
-      else
-        assert %{"command" => [bundle], "source" => "bundle"} = selected
-        assert Enum.any?(bundles, &same_file?(&1, bundle))
-      end
-    end)
+    assert %{"command" => [selected_node, selected_bundle], "source" => "bundle"} =
+             codex_recovery_binary_selection!(node, adapter_root, bad_path_dir, "")
+
+    assert same_file?(node, selected_node)
+    assert same_file?(bundle, selected_bundle)
   end
 
   test "resolution withdraws the hold cycle before its deadline", ctx do
@@ -4949,13 +5040,13 @@ defmodule Tightbeam.HarnessHealthTest do
     end)
   end
 
-  defp recovery_binary_selection!(node, adapter_root, harness, path, pin) do
-    script = RecoveryCheck.binary_selection_program(harness)
+  defp codex_recovery_binary_selection!(node, adapter_root, path, pin) do
+    script = RecoveryCheck.binary_selection_program("codex")
 
     {output, 0} =
       System.cmd(
         node,
-        ["-e", script, adapter_root, harness, pin],
+        ["-e", script, adapter_root, "codex", pin],
         env: [{"PATH", path}],
         stderr_to_stdout: true
       )
@@ -4963,7 +5054,7 @@ defmodule Tightbeam.HarnessHealthTest do
     JSON.decode!(output)
   end
 
-  defp create_recovery_adapter_bundle!(_node, adapter_root, "codex") do
+  defp create_codex_recovery_adapter_bundle!(adapter_root) do
     adapter = Path.join(adapter_root, "node_modules/@agentclientprotocol/codex-acp")
     codex = Path.join(adapter_root, "node_modules/@openai/codex/bin/codex.js")
     File.mkdir_p!(adapter)
@@ -4983,45 +5074,6 @@ defmodule Tightbeam.HarnessHealthTest do
 
     File.write!(codex, "process.stdout.write('fixture 1.0.0')\n")
     codex
-  end
-
-  defp create_recovery_adapter_bundle!(node, adapter_root, "claude") do
-    adapter = Path.join(adapter_root, "node_modules/@agentclientprotocol/claude-agent-acp")
-    sdk = Path.join(adapter_root, "node_modules/@anthropic-ai/claude-agent-sdk")
-    File.mkdir_p!(adapter)
-    File.mkdir_p!(sdk)
-
-    File.write!(
-      Path.join(adapter, "package.json"),
-      ~s|{"name":"@agentclientprotocol/claude-agent-acp","main":"index.js"}|
-    )
-
-    entry = Path.join(adapter, "index.js")
-    File.write!(entry, "")
-
-    File.write!(
-      Path.join(sdk, "package.json"),
-      ~s|{"name":"@anthropic-ai/claude-agent-sdk","main":"index.js"}|
-    )
-
-    File.write!(Path.join(sdk, "index.js"), "")
-    {runtime, 0} = System.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
-    [platform, arch] = String.split(String.trim(runtime))
-
-    packages =
-      if platform == "linux" do
-        ["claude-agent-sdk-linux-#{arch}", "claude-agent-sdk-linux-#{arch}-musl"]
-      else
-        ["claude-agent-sdk-#{platform}-#{arch}"]
-      end
-
-    Enum.map(packages, fn package ->
-      binary = Path.join([adapter_root, "node_modules/@anthropic-ai", package, "claude"])
-      File.mkdir_p!(Path.dirname(binary))
-      File.write!(binary, "")
-      File.chmod!(binary, 0o755)
-      binary
-    end)
   end
 
   defp same_file?(left, right) do
@@ -5113,6 +5165,45 @@ defmodule Tightbeam.HarnessHealthTest do
              end)
 
     turn
+  end
+
+  defp pi_sessions!(db) do
+    for index <- 1..3 do
+      session_key = "agent:harness-health:pi-#{index}"
+
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: "Pi harness health #{index}",
+        owner_user_id: "synthetic-owner",
+        origin: "user:synthetic-owner",
+        archetype: "coder",
+        host: "testhost",
+        harness: "pi",
+        provider: "opencode_go",
+        model: Model.new("opencode-go/gpt-5.6-luna")
+      })
+
+      session_key
+    end
+  end
+
+  # The JSON-RPC error the patched pi-acp 0.0.34 sends (Tightbeam.Harness.Pi).
+  defp pi_typed_turn_failure(kind, attempts, final_error) do
+    message =
+      if kind == "pi_retry_exhausted",
+        do: "pi retry exhausted after #{attempts} attempts: #{final_error}",
+        else: "pi turn failed: #{final_error}"
+
+    %{
+      "code" => -32_603,
+      "message" => "Internal error: " <> message,
+      "data" => %{
+        "errorKind" => kind,
+        "piAttempts" => attempts,
+        "transportAttempts" => "unobserved",
+        "finalError" => final_error
+      }
+    }
   end
 
   defp failure(ref, failure_class, observed_at, correlation_id) do

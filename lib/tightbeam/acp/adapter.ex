@@ -1466,7 +1466,13 @@ defmodule Tightbeam.Acp.Adapter do
 
         # Only a confirmed port write invalidates the occupied-context snapshot.
         # A local capacity refusal has not changed the receiver history.
-        state = %{state | context_usage: Map.delete(state.context_usage, sid)}
+        # A dispatched prompt may persist history even if its reply is an error.
+        state = %{
+          state
+          | context_usage: Map.delete(state.context_usage, sid),
+            unprompted: MapSet.delete(state.unprompted, sid)
+        }
+
         state = put_in(state.prompts[sid].request_id, request_id)
 
         case trace_dispatch(opts, request_id) do
@@ -1726,11 +1732,6 @@ defmodule Tightbeam.Acp.Adapter do
 
     GenServer.reply(from, reply)
     state = %{state | progress: Map.delete(state.progress, sid)}
-
-    state =
-      if match?({:ok, _response}, result),
-        do: %{state | unprompted: MapSet.delete(state.unprompted, sid)},
-        else: state
 
     state = %{
       state
