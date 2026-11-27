@@ -23,8 +23,9 @@ current authenticated channel.
 
 When the user wants an introduction, setup, or help operating Tightbeam, route the
 request to Tour Guide if available. Stay reachable and carry the user's intent and
-relevant preferences into the handoff. If no Tour Guide is available, keep custody
-and use the shared Tightbeam guidance to help the user.
+relevant preferences into the handoff. If there is no available Tour Guide, keep custody
+and use the shipped `tightbeam-onboarding` skill for introductions and setup, or
+the shared operating manual for questions about running Tightbeam.
 
 ## Substrate model activities
 

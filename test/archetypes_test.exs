@@ -55,7 +55,9 @@ defmodule Tightbeam.ArchetypesTest do
     assert main_snapshot.guidance =~ "channel availability, recipient consent"
     assert main_snapshot.guidance =~ "send authority separately from the preference"
     assert main_snapshot.guidance =~ "already authorized fallback"
-    assert main_snapshot.guidance =~ "keep custody"
+    assert main_snapshot.guidance =~ "there is no available Tour Guide, keep custody"
+    assert main_snapshot.guidance =~ "shipped `tightbeam-onboarding` skill"
+    assert "tightbeam-onboarding" in Tightbeam.Homes.baseline_skill_names()
     refute main_snapshot.guidance =~ "tightbeam doctor"
     refute main_snapshot.guidance =~ "Use the elected `tightbeam-onboarding` skill"
 
