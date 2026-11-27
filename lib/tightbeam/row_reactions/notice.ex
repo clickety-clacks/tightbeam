@@ -157,6 +157,7 @@ defmodule Tightbeam.RowReactions.Notice do
           end
 
         id = wake.wake_id
+        replace_notice(txn, value["reference"], value["replace_wake_id"], id, at)
         Reference.put(txn, value["reference"], id)
         input = Map.put(input, :wake_id, id)
 
@@ -193,6 +194,37 @@ defmodule Tightbeam.RowReactions.Notice do
     end
 
     :ok
+  end
+
+  defp replace_notice(_txn, _reference, nil, _replacement, _at), do: :ok
+  defp replace_notice(_txn, _reference, id, id, _at), do: :ok
+
+  defp replace_notice(
+         txn,
+         %{"resource" => "work_item", "field" => "slateWakeId", "id" => item_id},
+         old,
+         replacement,
+         at
+       ) do
+    case Wakes.get_in_txn(txn, old) do
+      %{state: "pending", delivered_turn_seq: nil} ->
+        command = %{
+          wake_id: old,
+          requester: %{kind: "process", id: "tightbeam:work-items"},
+          reason_kind: "routing_bracket_satisfied",
+          causal_source: %{kind: "routing_bracket", id: item_id},
+          outcome: %{kind: "replacement", replacement_wake_id: replacement}
+        }
+
+        unless Wakes.cancel_in_txn(txn, command, fn -> at end),
+          do: raise(WithdrawalRefused, wake_id: old)
+
+      %{state: "canceled"} ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "reaction replacement is no longer pending"
+    end
   end
 
   defp withdraw_action(txn, id, action, at) do

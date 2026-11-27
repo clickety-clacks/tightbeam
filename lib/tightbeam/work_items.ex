@@ -1065,7 +1065,20 @@ defmodule Tightbeam.WorkItems do
             principal: {:process, "tightbeam"},
             at: event["at"],
             before: event["before"],
-            after: event["after"]
+            after:
+              if(Tightbeam.WorkItemFollowthrough.enabled?(),
+                do:
+                  Map.put(
+                    event["after"],
+                    "followThrough",
+                    Tightbeam.WorkItemFollowthrough.delivery_context(
+                      txn,
+                      wake_id,
+                      event["delivery"]["sessionKey"]
+                    )
+                  ),
+                else: event["after"]
+              )
           },
           nil,
           wake_id

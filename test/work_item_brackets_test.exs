@@ -102,6 +102,209 @@ defmodule Tightbeam.WorkItemBracketsTest do
     }
   end
 
+  test "owner follow-through observes only successful exact notice turns once", ctx do
+    Application.put_env(:tightbeam, :work_item_followthrough_enabled, true)
+    on_exit(fn -> Application.delete_env(:tightbeam, :work_item_followthrough_enabled) end)
+
+    for terminal <- ~w(delivered failed canceled failed_unknown) do
+      item = create(ctx, {:user, "flynn"}, %{title: "Follow through #{terminal}"})
+      update(ctx, item.id, %{delivery_owner_session_key: "holder"})
+      {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "work", item.id)
+      complete(ctx, "holder", assignment.id)
+      finish_delivery_queue(ctx.db, "holder")
+      wake_id = slate_wake_id(ctx.db, item.id)
+
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "holder",
+          message_id: "s_follow_#{terminal}",
+          origin: "process:tightbeam",
+          prompt: "slate notice",
+          wake_id: wake_id
+        })
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE wakes SET state='fired',deliveredTurnSeq=?2 WHERE wakeId=?1", [
+          wake_id,
+          seq
+        ])
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "follow-through-test")
+      assert turn.seq == seq
+      assert :ok = Ledger.finish(ctx.db, seq, terminal, nil, owner_lease: turn.owner_lease)
+
+      assert :already_terminal =
+               Ledger.finish(ctx.db, seq, terminal, nil, owner_lease: turn.owner_lease)
+
+      {:ok, rows} =
+        DB.query(
+          ctx.db,
+          "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+          [item.id]
+        )
+
+      if terminal == "delivered" do
+        assert [[encoded]] = rows
+        event = JSON.decode!(encoded)
+        assert event["source"]["id"] == seq
+        assert event["sourceAfter"]["followThrough"]["misses"] == 1
+      else
+        assert rows == []
+      end
+    end
+  end
+
+  test "successive misses keep one owner notice and expose missing supervision", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    second = slate_wake_id(ctx.db, item.id)
+    assert second != first
+    assert Wakes.get(ctx.db, second).session_key == "holder"
+    assert Wakes.get(ctx.db, second).prompt =~ "route: unavailable"
+    assert item_wake_count(ctx.db, item.id) == 1
+    finish_notice(ctx, second)
+    third = slate_wake_id(ctx.db, item.id)
+    assert third != second
+    assert Wakes.get(ctx.db, third).session_key == "holder"
+    assert item_wake_count(ctx.db, item.id) == 1
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == third
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "explicit policy elects a unique current exec and ambiguous election stays with owner",
+       ctx do
+    enable_followthrough()
+    session(ctx.db, "exec-a", "flynn")
+    session(ctx.db, "exec-b", "flynn")
+
+    for candidates <- [["exec-a"], ["exec-a", "exec-b"]] do
+      relations =
+        Enum.map_join(candidates, ",", fn key ->
+          ~s({ owner_session_key = "holder", supervisor_session_key = "#{key}" })
+        end)
+
+      File.write!(Path.join(ctx.law_base, "identity/rules/followthrough-supervision.toml"), """
+      [[reaction]]
+      name = "explicit-supervision"
+      family = "work-item-followthrough-supervision"
+      archetypes = ["*"]
+      english = "Explicit current supervision for this isolated test."
+      settings = { relations = [#{relations}] }
+      """)
+
+      Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      second = slate_wake_id(ctx.db, item.id)
+      assert Wakes.get(ctx.db, second).session_key == "holder"
+      finish_notice(ctx, second)
+      notice = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      assert notice.session_key == if(length(candidates) == 1, do: "exec-a", else: "holder")
+
+      assert notice.prompt =~
+               if(length(candidates) == 1, do: "route: available", else: "route: ambiguous")
+
+      assert item_wake_count(ctx.db, item.id) == 1
+    end
+  end
+
+  test "disposition, new work, custody change and cancellation before terminal do not count",
+       ctx do
+    enable_followthrough()
+    session(ctx.db, "next-owner", "flynn")
+
+    for change <- [:close, :assign, :handoff, :cancel] do
+      {item, first} = followthrough_item(ctx)
+      turn = start_notice(ctx, first)
+
+      case change do
+        :close ->
+          dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+
+        :assign ->
+          disp_assign(ctx, {:user, "flynn"}, "holder", "next work", item.id)
+
+        :handoff ->
+          update(ctx, item.id, %{delivery_owner_session_key: "next-owner"})
+
+        :cancel ->
+          current = slate_wake_id(ctx.db, item.id)
+
+          DB.transaction(ctx.db, fn txn ->
+            command = %{
+              wake_id: current,
+              requester: %{kind: "process", id: "tightbeam:row-reactions"},
+              reason_kind: "superseded",
+              causal_source: %{kind: "wake", id: current}
+            }
+
+            {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
+            Wakes.cancel_in_txn(txn, Map.put(command, :outcome, outcome))
+          end)
+      end
+
+      :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+                 [item.id]
+               )
+    end
+  end
+
+  defp enable_followthrough do
+    prior = Application.get_env(:tightbeam, :work_item_followthrough_enabled)
+    Application.put_env(:tightbeam, :work_item_followthrough_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(prior),
+        do: Application.delete_env(:tightbeam, :work_item_followthrough_enabled),
+        else: Application.put_env(:tightbeam, :work_item_followthrough_enabled, prior)
+    end)
+  end
+
+  defp followthrough_item(ctx) do
+    item = create(ctx, {:user, "flynn"}, %{title: "Owner follow-through"})
+    update(ctx, item.id, %{delivery_owner_session_key: "holder"})
+    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "work", item.id)
+    complete(ctx, "holder", assignment.id)
+    finish_delivery_queue(ctx.db, "holder")
+    {item, slate_wake_id(ctx.db, item.id)}
+  end
+
+  defp start_notice(ctx, wake_id) do
+    wake = Wakes.get(ctx.db, wake_id)
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: wake.session_key,
+        message_id: "s_notice_#{System.unique_integer([:positive])}",
+        origin: "process:tightbeam",
+        prompt: wake.prompt,
+        wake_id: wake_id
+      })
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET state='fired',deliveredTurnSeq=?2 WHERE wakeId=?1", [
+        wake_id,
+        seq
+      ])
+
+    :ok = WorkItems.reconcile_delivered_brackets(ctx.db, wake.session_key, wake_id)
+    {:ok, turn} = Ledger.claim_next(ctx.db, wake.session_key, "follow-through-test")
+    assert turn.seq == seq
+    turn
+  end
+
+  defp finish_notice(ctx, wake_id) do
+    turn = start_notice(ctx, wake_id)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+  end
+
   test "custody transfer keeps assigned and bare item ownership after source retirement", ctx do
     alias Tightbeam.Firehose.Hub
     owner = ctx.holder.owner_user_id

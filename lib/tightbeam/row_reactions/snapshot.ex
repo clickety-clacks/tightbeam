@@ -19,7 +19,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
     hold open_assignment_count opener_responsibility parent_activity_at personal_session_key
     process_notification_recipient recovery_check request ruling_result_recipients
     scope_participant_archetypes scope_record_session_groups sessions terminal_sources
-    wakes work_item)
+    wakes work_item work_item_followthrough_enabled work_item_supervision)
   def fact_reference?(path), do: hd(String.split(path, ".", parts: 2)) in @fact_roots
 
   @assignment ~w(id holderKey workItemId reviewsAssignmentId openedBySession currentOpenerSessionKey openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
@@ -158,6 +158,8 @@ defmodule Tightbeam.RowReactions.Snapshot do
     %{
       "work_item" => item,
       "open_assignment_count" => count,
+      "work_item_followthrough_enabled" => Tightbeam.WorkItemFollowthrough.enabled?(),
+      "work_item_supervision" => Tightbeam.WorkItemFollowthrough.route(txn, item),
       "personal_session_key" => personal,
       "sessions" =>
         sessions(txn, [

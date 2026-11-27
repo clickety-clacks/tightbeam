@@ -958,6 +958,7 @@ defmodule Tightbeam.Ledger do
 
     if won do
       append_terminal_in_txn(txn, seq, terminal, opts)
+      Tightbeam.WorkItemFollowthrough.terminal_in_txn(txn, seq, terminal, opts[:work_outcome])
       Publisher.turn_in_txn(txn, "turn.ended", seq)
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
       Org.sync_mechanical_status_in_txn(txn, session_key)
