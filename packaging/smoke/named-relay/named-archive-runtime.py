@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import secrets
 from pathlib import Path
 import signal
 import socket
@@ -116,15 +117,33 @@ def main(archive, root, smoke_path):
     discovery = root / "tools/claude"
     discovery.write_text('#!/bin/sh\ncase "$1" in --version) echo "2.1.280";; *) exit 64;; esac\n')
     discovery.chmod(0o700)
+    descriptor = root / "base/gateway.json"
+    descriptor.touch(mode=0o600, exist_ok=False)
+    descriptor.write_text(json.dumps({"cliToken": "tbc_" + secrets.token_urlsafe(24)}))
     (root / "relay.json").write_text(json.dumps({
         "connection": os.environ["E2E_IDENTITY"], "sender": "app:relay-e2e",
         "users": {SENDER: os.environ["E2E_PERSON"]},
     }))
     seed = """
-      false = Node.alive?()
-      {:ok, _} = Application.ensure_all_started(:tightbeam)
-      Code.require_file(System.fetch_env!("RELAY_PROOF_SEED"))
-      :ok = Application.stop(:tightbeam)
+      for {label, action} <- [
+        {"distribution check", fn -> false = Node.alive?() end},
+        {"application startup", fn -> {:ok, _} = Application.ensure_all_started(:tightbeam) end},
+        {"fixture rows", fn -> Code.require_file(System.fetch_env!("RELAY_PROOF_SEED")) end},
+        {"application stop", fn -> :ok = Application.stop(:tightbeam) end}
+      ] do
+        try do
+          action.()
+          IO.puts("RELAY_PROOF_SEED: " <> label <> " OK")
+        rescue
+          exception ->
+            stack = Enum.map(__STACKTRACE__, fn {m, f, a, _} ->
+              {m, f, if(is_list(a), do: length(a), else: a)}
+            end)
+            IO.puts("RELAY_PROOF_SEED: " <> label <> " failed: " <>
+              inspect(exception.__struct__) <> " " <> inspect(stack))
+            System.halt(1)
+        end
+      end
     """
     wait_marker = root / "watcher-wait"
     wrapper = root / "fault/tightbeam"
@@ -151,8 +170,12 @@ exec "$E2E_REAL_TIGHTBEAM" "$@"
         return rows if len(rows) == 2 and all(row["delivery_state"] == "reported" for row in rows) else None
 
     with (root / "gateway.private.log").open("wb") as gateway_log, (root / "watch.private.log").open("wb") as watch_log:
-        subprocess.run([gateway, "eval", seed], cwd=root, env=env, stdout=gateway_log,
-                       stderr=gateway_log, timeout=75, check=True)
+        result = subprocess.run([gateway, "eval", seed], cwd=root, env=env,
+                                capture_output=True, text=True, timeout=75)
+        for line in result.stdout.splitlines():
+            if line.startswith("RELAY_PROOF_SEED:"):
+                print(line)
+        result.check_returncode()
         with smoke.start_gateway(gateway, root, env, port, None, gateway_log, expected):
             print(f"packaged gateway {expected}: verified owned process and sole loopback listener")
             readiness = tb("relay", "people-wait", {"limit": 1, "timeout_ms": 20})

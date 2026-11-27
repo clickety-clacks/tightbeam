@@ -20,7 +20,7 @@ gh release download v0.2.10 --repo clickety-clacks/harklight-agent --dir agent \
   --pattern "$agent" --pattern SHA256SUMS
 printf '%s  %s\n' \
   72650dbc9ddebaeb9e8410491d5c458400dcbe49f4a2ce9275c408a83bf5aad3 server/"$server" \
-  9a7d9200e343265ed52205c89fd07d71a6d77c959d742dee18e30e89e6ba3f0 agent/"$agent" |
-  sha256sum --check
+  9a7d9200e343265ed52205c89fd07d71a6d77c9595d742dee18e30e89e6ba3f0 agent/"$agent" |
+  sha256sum --strict --check
 bash "$driver/setup-release.sh" bash "$driver/enroll-and-test.sh"
 echo "Disposable stock Server and archive acceptance completed."
