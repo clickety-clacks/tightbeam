@@ -4198,6 +4198,62 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            end)
   end
 
+  test "REST attest pages and notices keep their wire shape with additive stored commit refs",
+       ctx do
+    attest_id = "att_additive_refs"
+    core = %{"repo" => "Example/Repo", "commit" => String.duplicate("a", 40)}
+
+    enriched =
+      Map.merge(core, %{
+        "remote" => "https://example.invalid/repo.git",
+        "ref" => "refs/heads/main",
+        "futureMetadata" => %{"producer" => 2}
+      })
+
+    query!(
+      ctx.db,
+      "INSERT INTO attests(id,assignmentId,kind,bySession,commitRefs,ts) VALUES (?,?,'progress',?,?,?)",
+      [attest_id, ctx.assignment.id, ctx.assignment.holderKey, JSON.encode!([core]), 1]
+    )
+
+    path = "/api/attests/" <> attest_id
+    list_path = "/api/attests?assignmentId=" <> ctx.assignment.id
+    old_detail = get(ctx, path)
+    old_list = get(ctx, list_path)
+    assert old_detail.status == 200
+    assert old_list.status == 200
+    item = JSON.decode!(old_detail.resp_body)["item"]
+    assert item["commitRefs"] == [core]
+
+    query!(ctx.db, "UPDATE attests SET commitRefs=? WHERE id=?", [
+      JSON.encode!([enriched]),
+      attest_id
+    ])
+
+    new_detail = get(ctx, path)
+    new_list = get(ctx, list_path)
+    assert new_detail.status == 200
+    assert new_list.status == 200
+    assert new_detail.resp_body == old_detail.resp_body
+    assert new_list.resp_body == old_list.resp_body
+
+    row = StateResources.query_attest(ctx.db, attest_id)
+    assert row.commit_refs == [enriched]
+    notice = Publisher.committed_notice("attest.filed", row, %{})
+    assert JSON.decode!(Publisher.encode_wire_notice(notice, %{}))["payload"] == item
+
+    invalid = Map.put(enriched, "commit", 42)
+
+    query!(ctx.db, "UPDATE attests SET commitRefs=? WHERE id=?", [
+      JSON.encode!([invalid]),
+      attest_id
+    ])
+
+    refused = get(ctx, path)
+    assert refused.status == 500
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "projection_invalid"
+  end
+
   test "B2 missing priority sidecar preserves configured and fallback defaults across reads and notices",
        ctx do
     for {configured_default, expected_priority} <- [{"7", 7}, {"0", 0}, {nil, 4}] do

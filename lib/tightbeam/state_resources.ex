@@ -2647,19 +2647,30 @@ defmodule Tightbeam.StateResources do
     "{" <> encoded <> "}"
   end
 
-  defp normalize_item_projection("work items", %{"effectiveCommitRefs" => refs} = item)
-       when is_list(refs) do
-    # Remote/ref are stored for provenance. The REST reference has only repo/commit.
-    refs =
-      Enum.map(refs, fn
-        ref when is_map(ref) -> Map.drop(ref, ["remote", "ref"])
-        ref -> ref
-      end)
+  defp normalize_item_projection("work items", item),
+    do: project_commit_refs(item, "effectiveCommitRefs")
 
-    Map.put(item, "effectiveCommitRefs", refs)
-  end
+  defp normalize_item_projection("attests", item),
+    do: project_commit_refs(item, "commitRefs")
 
   defp normalize_item_projection(_resource, item), do: item
+
+  defp project_commit_refs(item, field) do
+    case Map.fetch(item, field) do
+      {:ok, refs} when is_list(refs) ->
+        # The wire reference consumes only repo/commit. Provenance remains stored.
+        projected =
+          Enum.map(refs, fn
+            ref when is_map(ref) -> Map.take(ref, ["repo", "commit"])
+            ref -> ref
+          end)
+
+        Map.put(item, field, projected)
+
+      _ ->
+        item
+    end
+  end
 
   @doc false
   def item_shape_complete?(resource, item) when is_binary(resource) and is_map(item) do
@@ -3713,11 +3724,11 @@ defmodule Tightbeam.StateResources do
       label when is_binary(label) ->
         %{"label" => label}
 
-      %{"label" => label} = option when map_size(option) == 1 and is_binary(label) ->
-        option
+      %{"label" => label, "effect" => effect}
+      when is_binary(label) and effect in ["allow", "deny"] ->
+        %{"label" => label}
 
-      %{"label" => label, "effect" => effect} = option
-      when map_size(option) == 2 and is_binary(label) and effect in ["allow", "deny"] ->
+      %{"label" => label} = option when is_binary(label) and not is_map_key(option, "effect") ->
         %{"label" => label}
 
       _invalid ->
