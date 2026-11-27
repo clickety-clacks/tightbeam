@@ -1,0 +1,36 @@
+name: release fixture diagnostic
+on:
+  push:
+    branches: [test/release-fixture-diagnostic]
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 737f98d98cb8a5ed50e16aefbc0f735f75331908
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record tested versions
+        run: |
+          test "$(git rev-parse HEAD)" = 737f98d98cb8a5ed50e16aefbc0f735f75331908
+          elixir --version
+          rustc --version
+          sha256sum test/fixtures/releases/0.1.17+5505.sql
+      - name: Prepare startup dependencies
+        run: |
+          echo "$PWD/priv/harness_cli" >> "$GITHUB_PATH"
+          git config --global user.name "Tightbeam CI"
+          git config --global user.email "ci@example.invalid"
+          cargo build --release --manifest-path cli/Cargo.toml
+          echo "$PWD/cli/target/release" >> "$GITHUB_PATH"
+          mix deps.get
+      - name: Run the interrupted startup scenario
+        run: scripts/verify_mix.sh test/release_fixture_upgrade_test.exs --trace
