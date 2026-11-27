@@ -126,6 +126,21 @@ def validate_members(files):
     return manifest
 
 
+def verify_manual(path, source):
+    suffix = "/priv/guidance/operating-manual.md"
+    with tarfile.open(path, "r:gz") as archive:
+        version = json.load(archive.extractfile("tightbeam/package.json"))["version"]
+        canonical = f"tightbeam/release/lib/tightbeam-{version}{suffix}"
+        manuals = [member for member in archive if member.name.endswith(suffix)]
+        if [member.name for member in manuals if member.isfile()] != [canonical] or len(manuals) != 1:
+            raise ValueError("expected exactly one regular canonical operating manual")
+        with archive.extractfile(manuals[0]) as data:
+            contents = data.read()
+    if contents != source.read_bytes():
+        raise ValueError("bundled operating manual differs from the canonical source")
+    print(f"{manuals[0].mode:04o} {hashlib.sha256(contents).hexdigest()} {canonical}")
+
+
 def verify_archive(path, operating_system):
     files = {}
     support = {
@@ -190,6 +205,7 @@ def main():
     verifier = commands.add_parser("verify-archive")
     verifier.add_argument("archive", type=Path)
     verifier.add_argument("platform", choices=["linux", "darwin"])
+    verifier.add_argument("--manual", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "import":
@@ -200,6 +216,8 @@ def main():
             write_members(args.destination, files)
         else:
             verify_archive(args.archive, args.platform)
+            if args.manual is not None:
+                verify_manual(args.archive, args.manual)
     except (OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"relay payload: {error}\n")
 
