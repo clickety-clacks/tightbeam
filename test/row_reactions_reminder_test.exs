@@ -6,7 +6,7 @@ defmodule Tightbeam.RowReactionsReminderTest do
   """
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.Rules
+  alias Tightbeam.{DB, Roles, RowReactions, Rules}
   alias Tightbeam.RowReactions.Reminder
 
   # The two worked examples from the subtree-rules design, verbatim. They are
@@ -308,6 +308,246 @@ defmodule Tightbeam.RowReactionsReminderTest do
       end
     end
 
+    test "the assignment example uses completion notes and late artifacts as answers", ctx do
+      put_file(ctx, "code.toml", @code_check)
+      assert [%{name: "e2e-check"}] = load(ctx)
+
+      event = completed_event()
+      snapshot = facts()
+
+      assert [
+               %{value: %{"session_key" => "s-holder", "due_at" => 1_000}},
+               %{value: %{"session_key" => "s-opener", "due_at" => later, "prompt" => prompt}}
+             ] = selected(event, snapshot)
+
+      assert later == 1_000 + 3 * @hour
+      assert prompt =~ "Holder completed asg_1 (Widget)"
+
+      for answered <- [
+            put_in(snapshot, ["assignment", "notes"], ["E2E: ran the full flow, passed"]),
+            put_in(snapshot, ["work_item", "artifact_titles"], ["e2e not needed: copy change"]),
+            put_in(snapshot, ["assignment", "is_review"], true)
+          ] do
+        assert [] = selected(event, answered)
+      end
+    end
+
+    test "an unscoped anchor notice addresses Main and renders its display name", ctx do
+      put_file(
+        ctx,
+        "matter.toml",
+        String.replace(@matter_check, "Matter", "{anchor_name}: Matter")
+      )
+
+      assert [%{name: "conflict-check"}] = load(ctx)
+
+      event = %{
+        "id" => "work-item:wi_1:created",
+        "org" => "owner",
+        "kind" => "work_item_observation",
+        "workItemId" => "wi_1",
+        "operation" => "created",
+        "at" => 1_000
+      }
+
+      snapshot =
+        facts()
+        |> Map.update!("sessions", &[%{"sessionKey" => "s-main", "archetype" => "lead"} | &1])
+        |> Map.put(Tightbeam.RowReactions.Plan.subtree_facts_key(), %{
+          "anchors" => %{nil => %{"session_key" => "s-main", "name" => "Main"}}
+        })
+
+      assert %{value: %{"session_key" => "s-main", "prompt" => prompt}} =
+               Enum.find(selected(event, snapshot), &(&1.slot == "notify-2"))
+
+      assert prompt =~ ~s|Main: Matter "Widget" (wi_1)|
+    end
+
+    for cause <- [:answer, :retirement] do
+      test "the completion example cancels the opener notice after #{cause}", ctx do
+        db = reminder_db()
+        put_file(ctx, "code.toml", @code_check)
+        assert [%{name: "e2e-check"}] = load(ctx)
+        at = System.system_time(:millisecond)
+
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   """
+                   INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
+                   VALUES ('wi-code','Code','owner','open','owner',?1)
+                   """,
+                   [at]
+                 )
+
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   """
+                   INSERT INTO assignments
+                     (id,subject,holderKey,openedBySession,openedAt,state,workItemId)
+                   VALUES ('asg-code','Code','member','lead',?1,'open','wi-code')
+                   """,
+                   [at]
+                 )
+
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   """
+                   INSERT INTO attests (id,assignmentId,kind,note,bySession,ts)
+                   VALUES ('completion-fixture','asg-code','completion','Finished','member',?1)
+                   """,
+                   [at]
+                 )
+
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   """
+                   UPDATE assignments SET state='closed',outcome='completed',closedAt=?1,
+                     closedBySession='member',closingAttestId='completion-fixture'
+                   WHERE id='asg-code'
+                   """,
+                   [at]
+                 )
+
+        terminal = %{
+          source_kind: "attest",
+          source_token: "completion-fixture",
+          owner_user_id: "owner",
+          terminal_at: at,
+          assignment_id: "asg-code",
+          work_item_id: "wi-code",
+          child_session_key: "member",
+          opened_by_id: "lead",
+          outcome: "completed"
+        }
+
+        assert {:ok, {:ok, _}} =
+                 DB.transaction(db, fn txn ->
+                   RowReactions.terminal_in_txn(txn, terminal, %{"state" => "open"})
+                 end)
+
+        assert {:ok, [[first, "member", ^at], [second, "lead", later]]} =
+                 DB.query(
+                   db,
+                   """
+                   SELECT w.wakeId,w.sessionKey,w.dueAt FROM row_reaction_actions a
+                   JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+                   WHERE a.family='reminder:e2e-check' ORDER BY w.dueAt
+                   """
+                 )
+
+        assert later == at + 3 * @hour
+        assert {:ok, :ready} = DB.transaction(db, &RowReactions.prepare_in_txn(&1, first))
+
+        case unquote(cause) do
+          :retirement ->
+            assert {:ok, _} =
+                     DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='lead'")
+
+          :answer ->
+            assert {:ok, _} =
+                     DB.query(
+                       db,
+                       """
+                       INSERT INTO artifacts
+                         (artifactId,kind,title,createdBySession,workItemId,originPath,state,createdAt,updatedAt)
+                       VALUES ('art-e2e','report','E2E: full flow passed','member','wi-code',
+                               '/scratch/answer.md','in-workspace',?1,?1)
+                       """,
+                       [at + @hour]
+                     )
+        end
+
+        assert {:ok, :held} = DB.transaction(db, &RowReactions.prepare_in_txn(&1, second))
+
+        assert {:ok, [["lead", "canceled"]]} =
+                 DB.query(db, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [second])
+      end
+    end
+
+    test "the work-item example schedules both notices and withdraws the second after an answer",
+         ctx do
+      db = reminder_db()
+
+      assert %{name: "partner:litigation"} =
+               Roles.create!(db, "partner:litigation", "owner", "lead")
+
+      scoped_fixture =
+        String.replace(
+          @matter_check,
+          ~s(name = "conflict-check"),
+          ~s(name = "conflict-check"
+scope = { subtree_of = "role:partner:litigation" })
+        )
+
+      put_file(ctx, "matter.toml", scoped_fixture)
+      assert [%{name: "conflict-check"}] = load(ctx)
+
+      at = System.system_time(:millisecond)
+
+      for {id, owner} <- [{"wi-member", "member"}, {"wi-outsider", "outsider"}] do
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   """
+                   INSERT INTO work_items
+                     (id,title,ownerUserId,state,createdByUser,createdAt,deliveryOwnerSessionKey)
+                   VALUES (?1,'Matter','owner','open','owner',?2,?3)
+                   """,
+                   [id, at, owner]
+                 )
+
+        assert {:ok, _} =
+                 DB.transaction(db, fn txn ->
+                   RowReactions.observe_work_item_in_txn(
+                     txn,
+                     id,
+                     "created",
+                     %{kind: "fixture", id: id, at: at, principal: {:user, "owner"}},
+                     %{}
+                   )
+                 end)
+      end
+
+      assert {:ok,
+              [[first, "member", "wi-member", first_at], [second, "lead", "wi-member", second_at]]} =
+               DB.query(
+                 db,
+                 """
+                 SELECT w.wakeId,w.sessionKey,json_extract(e.event,'$.workItemId'),w.dueAt
+                 FROM row_reaction_actions a
+                 JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+                 JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
+                 WHERE a.family='reminder:conflict-check'
+                 ORDER BY w.dueAt
+                 """
+               )
+
+      assert first_at == at + 24 * @hour
+      assert second_at == at + 48 * @hour
+      assert {:ok, :ready} = DB.transaction(db, &RowReactions.prepare_in_txn(&1, first))
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO artifacts
+                   (artifactId,kind,title,createdBySession,workItemId,originPath,state,createdAt,updatedAt)
+                 VALUES ('art-answer','report','Conflict Check: clear','member','wi-member',
+                         '/scratch/answer.md','in-workspace',?1,?1)
+                 """,
+                 [at + 25 * @hour]
+               )
+
+      assert {:ok, :held} = DB.transaction(db, &RowReactions.prepare_in_txn(&1, second))
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(db, "SELECT state FROM wakes WHERE wakeId=?1", [second])
+    end
+
     test "durations" do
       assert Reminder.duration_ms("0m") == {:ok, 0}
       assert Reminder.duration_ms("90s") == {:ok, 90_000}
@@ -469,6 +709,34 @@ defmodule Tightbeam.RowReactionsReminderTest do
       "scope_participant_archetypes" => ["worker"],
       "scope_record_session_groups" => [["s-opener", "s-holder"]]
     }
+  end
+
+  defp reminder_db do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    for {key, parent} <- [{"lead", nil}, {"member", "lead"}, {"outsider", nil}] do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO sessions
+                   (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,
+                    createdAt,updatedAt,spawnedBy)
+                 VALUES (?1,?1,'owner','user:owner','default','claude','anthropic','fixture',1,1,?2)
+                 """,
+                 [key, parent]
+               )
+    end
+
+    db
+  end
+
+  defp selected(event, snapshot) do
+    event
+    |> Rules.reaction_plans(snapshot)
+    |> Enum.filter(& &1.selected)
+    |> Enum.sort_by(& &1.slot)
   end
 
   defp restore_flag(nil), do: Application.delete_env(:tightbeam, :subtree_rules)
