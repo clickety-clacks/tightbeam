@@ -546,14 +546,21 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   defp parse_catalog(output) when is_binary(output) do
-    entries =
+    {entries, unreadable} =
       output
       |> String.split("\n")
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == "" or &1 == "Available models" or String.starts_with?(&1, "Tip:")))
       |> Enum.map(&parse_catalog_line/1)
+      |> Enum.split_with(&match?({:ok, _}, &1))
 
-    if entries != [] and Enum.all?(entries, &match?({:ok, _}, &1)) do
+    if entries != [] do
+      if unreadable != [] do
+        Logger.warning(
+          "Cursor model catalog may be incomplete: skipped #{length(unreadable)} unreadable lines"
+        )
+      end
+
       {:ok, Enum.map(entries, fn {:ok, entry} -> entry end)}
     else
       {:error, :malformed_catalog}

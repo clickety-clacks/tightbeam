@@ -228,6 +228,43 @@ defmodule Tightbeam.CursorRegistrationTest do
              Cursor.fetch_catalog(put_in(base_state, [:options, :sh], fn _ -> {"denied", 42} end))
   end
 
+  test "Cursor keeps readable model rows and reports an incomplete listing" do
+    target = cursor_target()
+    parent = self()
+
+    sh = fn argv ->
+      send(parent, {:catalog_probe, argv})
+
+      {"Available models\n\nAccount model access may vary.\n" <>
+         "auto - Auto (default)\nmissing-name - \nnew-model - New Model - Beta\n", 0}
+    end
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, entries} =
+                 Cursor.fetch_catalog(%{
+                   base_dir: target.host_config.base_dir,
+                   host_config: target.host_config,
+                   credential_kind: :api_key,
+                   options: %{
+                     sh: sh,
+                     find_executable: target.find_executable,
+                     realpath: target.realpath,
+                     sha256: target.sha256
+                   }
+                 })
+
+        assert Enum.map(entries, &{&1.family, &1.display_name}) == [
+                 {"auto", "Auto"},
+                 {"new-model", "New Model - Beta"}
+               ]
+      end)
+
+    assert log =~ "Cursor model catalog may be incomplete: skipped 2 unreadable lines"
+    assert_received {:catalog_probe, _argv}
+    refute_received {:catalog_probe, _argv}
+  end
+
   test "Cursor integrity failures remain typed at probe and launch" do
     target = %{cursor_target() | sha256: fn _ -> "wrong" end}
     assert {:error, %{code: "cursor_cli_integrity_mismatch"}} = Cursor.probe_cli(target)
