@@ -3,6 +3,7 @@ defmodule Tightbeam.CursorRegistrationTest do
 
   alias Tightbeam.Harness
   alias Tightbeam.Harness.Cursor
+  alias Tightbeam.{Model, ModelCatalog, Readiness}
 
   setup do
     previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
@@ -231,38 +232,53 @@ defmodule Tightbeam.CursorRegistrationTest do
   test "Cursor keeps readable model rows and reports an incomplete listing" do
     target = cursor_target()
     parent = self()
+    host = target.host_name
+    valid = "auto - Auto (default)\nnew-model - New Model - Beta\n"
+    mixed = "Account model access may vary.\nmissing-name - \n" <> valid
 
-    sh = fn argv ->
-      send(parent, {:catalog_probe, argv})
+    for {output, expected_health} <- [
+          {mixed, {:incomplete, :fresh, 2}},
+          {valid, :fresh}
+        ] do
+      sh = fn argv ->
+        send(parent, {:catalog_probe, argv})
+        {"Available models\n\n" <> output, 0}
+      end
 
-      {"Available models\n\nAccount model access may vary.\n" <>
-         "auto - Auto (default)\nmissing-name - \nnew-model - New Model - Beta\n", 0}
+      name = :"cursor_catalog_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {ModelCatalog,
+         name: name,
+         base_dir: target.base_dir,
+         hosts: fn -> %{host => target.host_config} end,
+         now: fn -> 0 end,
+         credential_status: fn
+           :cursor -> :onboarded
+           _ -> {:needs_onboarding, :missing}
+         end,
+         credential_kind: :api_key,
+         sh: sh,
+         find_executable: target.find_executable,
+         realpath: target.realpath,
+         sha256: target.sha256},
+        id: name
+      )
+
+      assert_receive {:catalog_probe, _argv}
+      assert :ok = Readiness.await_settled(name, 1_000, 5)
+      assert {entries, ^expected_health} = ModelCatalog.get(host, "cursor", name)
+
+      assert Enum.map(entries, &{&1.family, &1.display_name}) == [
+               {"auto", "Auto"},
+               {"new-model", "New Model - Beta"}
+             ]
+
+      assert {:ok, %{health: ^expected_health}} =
+               ModelCatalog.route(host, "cursor", Model.new("auto"), name)
+
+      refute_receive {:catalog_probe, _argv}
     end
-
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert {:ok, entries} =
-                 Cursor.fetch_catalog(%{
-                   base_dir: target.host_config.base_dir,
-                   host_config: target.host_config,
-                   credential_kind: :api_key,
-                   options: %{
-                     sh: sh,
-                     find_executable: target.find_executable,
-                     realpath: target.realpath,
-                     sha256: target.sha256
-                   }
-                 })
-
-        assert Enum.map(entries, &{&1.family, &1.display_name}) == [
-                 {"auto", "Auto"},
-                 {"new-model", "New Model - Beta"}
-               ]
-      end)
-
-    assert log =~ "Cursor model catalog may be incomplete: skipped 2 unreadable lines"
-    assert_received {:catalog_probe, _argv}
-    refute_received {:catalog_probe, _argv}
   end
 
   test "Cursor integrity failures remain typed at probe and launch" do
