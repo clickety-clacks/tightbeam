@@ -21,7 +21,10 @@ defmodule Tightbeam.RowReactions.Notice do
         )
 
       %{state: "canceled"} ->
-        if Wakes.undelivered_notice_in_txn?(txn, id) do
+        if Wakes.undelivered_notice_in_txn?(txn, id,
+             consumer_unavailable:
+               slate_reference?(get_in(action, ["plan", "value", "reference"]))
+           ) do
           Store.record(
             txn,
             action,
@@ -90,7 +93,15 @@ defmodule Tightbeam.RowReactions.Notice do
 
   def execute(txn, action, at) do
     value = action["plan"]["value"]
-    value = Map.put(value, "prompt", render(txn, value, at))
+    compact = compact_slate?(txn, action, value)
+
+    prompt =
+      if compact,
+        do:
+          "Work item #{value["work_item_id"]} still needs a disposition. The previous reminder exceeded the delivery limit. Read the item, then close or fail it, assign the next work, or record its real dependency wait.",
+        else: render(txn, value, at)
+
+    value = Map.put(value, "prompt", prompt)
 
     unless is_map(value) and is_binary(value["wake_id"]) and is_binary(value["prompt"]) and
              is_binary(value["origin"]) and is_binary(value["owner_user_id"]) and
@@ -147,7 +158,10 @@ defmodule Tightbeam.RowReactions.Notice do
             %{state: "canceled", delivered_turn_seq: nil} ->
               if (available or value["on_unavailable"] == "schedule") and
                    get_in(action, ["result", "delivery"]) == "undelivered" do
-                Wakes.retry_undelivered_notice_in_txn(txn, id, input, at)
+                Wakes.retry_undelivered_notice_in_txn(txn, id, input, at,
+                  paced: slate_reference?(value["reference"]),
+                  consumer_unavailable: slate_reference?(value["reference"])
+                )
               else
                 raise ArgumentError, "reaction output identity is already terminal"
               end
@@ -156,8 +170,14 @@ defmodule Tightbeam.RowReactions.Notice do
               raise ArgumentError, "reaction output identity is already terminal"
           end
 
+        reference =
+          if wake.wake_id != id and slate_reference?(value["reference"]),
+            do: Map.put(value["reference"], "expected", id),
+            else: value["reference"]
+
         id = wake.wake_id
-        Reference.put(txn, value["reference"], id)
+        replace_notice(txn, value["reference"], value["replace_wake_id"], id, at)
+        Reference.put(txn, reference, id)
         input = Map.put(input, :wake_id, id)
 
         result =
@@ -167,6 +187,7 @@ defmodule Tightbeam.RowReactions.Notice do
               get_in(action, ["result", "intent_wake_id"]) ||
                 get_in(action, ["result", "wake_id"]) || id,
             "delivery" => "queued",
+            "compact_slate" => compact,
             "requested_due_at" => input.due_at,
             "emitted" => Map.new(input, fn {key, value} -> {Atom.to_string(key), value} end)
           })
@@ -193,6 +214,37 @@ defmodule Tightbeam.RowReactions.Notice do
     end
 
     :ok
+  end
+
+  defp replace_notice(_txn, _reference, nil, _replacement, _at), do: :ok
+  defp replace_notice(_txn, _reference, id, id, _at), do: :ok
+
+  defp replace_notice(
+         txn,
+         %{"resource" => "work_item", "field" => "slateWakeId", "id" => item_id},
+         old,
+         replacement,
+         at
+       ) do
+    case Wakes.get_in_txn(txn, old) do
+      %{state: "pending", delivered_turn_seq: nil} ->
+        command = %{
+          wake_id: old,
+          requester: %{kind: "process", id: "tightbeam:work-items"},
+          reason_kind: "routing_bracket_satisfied",
+          causal_source: %{kind: "routing_bracket", id: item_id},
+          outcome: %{kind: "replacement", replacement_wake_id: replacement}
+        }
+
+        unless Wakes.cancel_in_txn(txn, command, fn -> at end),
+          do: raise(WithdrawalRefused, wake_id: old)
+
+      %{state: "canceled"} ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "reaction replacement is no longer pending"
+    end
   end
 
   defp withdraw_action(txn, id, action, at) do
@@ -228,6 +280,19 @@ defmodule Tightbeam.RowReactions.Notice do
 
     Tightbeam.Reminders.render(txn, template, values)
   end
+
+  defp compact_slate?(txn, action, value) do
+    slate_reference?(value["reference"]) and
+      (get_in(action, ["result", "compact_slate"]) == true or
+         Txn.q(
+           txn,
+           "SELECT 1 FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1 LIMIT 1",
+           [get_in(action, ["result", "wake_id"])]
+         ) == [[1]])
+  end
+
+  defp slate_reference?(%{"resource" => "work_item", "field" => "slateWakeId"}), do: true
+  defp slate_reference?(_), do: false
 
   defp revise(txn, old, input, result) do
     # A scheduler may defer an unchanged request while its recipient is busy.

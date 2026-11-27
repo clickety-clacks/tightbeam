@@ -58,9 +58,40 @@ defmodule Tightbeam.WorkItemBracketsTest do
     def handle_info({:push, payload}, received), do: {:noreply, [payload | received]}
   end
 
-  setup do
+  setup context do
+    previous_item_wait_flag = Application.get_env(:tightbeam, :work_item_waits_enabled)
+    Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous_item_wait_flag),
+        do: Application.delete_env(:tightbeam, :work_item_waits_enabled),
+        else: Application.put_env(:tightbeam, :work_item_waits_enabled, previous_item_wait_flag)
+    end)
+
     db = :"brackets_db_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
+
+    db_opts =
+      if context[:persistent_db] do
+        base =
+          Path.join(
+            System.tmp_dir!(),
+            "tb-followthrough-restart-#{System.unique_integer([:positive])}"
+          )
+
+        on_exit(fn -> File.rm_rf!(base) end)
+        prepared = Tightbeam.GuardRuntimeFixture.prepare!(base, "schema_shape_runtime.exs")
+
+        [
+          path: Path.join(prepared.base, "state.db"),
+          name: db,
+          guard_inputs: [],
+          payload_root: prepared.payload
+        ]
+      else
+        [path: ":memory:", name: db]
+      end
+
+    start_supervised!({DB, db_opts})
     start_supervised!({ConnRegistry, name: ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
@@ -94,12 +125,722 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     %{
       db: db,
+      db_opts: db_opts,
       law_base: base,
       handlers: handlers,
       flynn_main: flynn_main,
       holder: holder,
       dsession: dsession
     }
+  end
+
+  test "owner follow-through observes only successful exact notice turns once", ctx do
+    Application.put_env(:tightbeam, :work_item_followthrough_enabled, true)
+    on_exit(fn -> Application.delete_env(:tightbeam, :work_item_followthrough_enabled) end)
+
+    for terminal <- ~w(delivered failed canceled failed_unknown) do
+      item = create(ctx, {:user, "flynn"}, %{title: "Follow through #{terminal}"})
+      update(ctx, item.id, %{delivery_owner_session_key: "holder"})
+      {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "work", item.id)
+      complete(ctx, "holder", assignment.id)
+      finish_delivery_queue(ctx.db, "holder")
+      wake_id = slate_wake_id(ctx.db, item.id)
+
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "holder",
+          message_id: "s_follow_#{terminal}",
+          origin: "process:tightbeam",
+          prompt: "slate notice",
+          wake_id: wake_id
+        })
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE wakes SET state='fired',deliveredTurnSeq=?2 WHERE wakeId=?1", [
+          wake_id,
+          seq
+        ])
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "follow-through-test")
+      assert turn.seq == seq
+      assert :ok = Ledger.finish(ctx.db, seq, terminal, nil, owner_lease: turn.owner_lease)
+
+      assert :already_terminal =
+               Ledger.finish(ctx.db, seq, terminal, nil, owner_lease: turn.owner_lease)
+
+      {:ok, rows} =
+        DB.query(
+          ctx.db,
+          "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+          [item.id]
+        )
+
+      if terminal == "delivered" do
+        assert [[encoded]] = rows
+        event = JSON.decode!(encoded)
+        assert event["source"]["id"] == seq
+        assert event["sourceAfter"]["followThrough"]["misses"] == 1
+      else
+        assert rows == []
+      end
+    end
+  end
+
+  test "successive misses keep one owner notice and expose missing supervision", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    second = slate_wake_id(ctx.db, item.id)
+    assert second != first
+    assert Wakes.get(ctx.db, second).session_key == "holder"
+    assert Wakes.get(ctx.db, second).prompt =~ "route: unavailable"
+    assert item_wake_count(ctx.db, item.id) == 1
+    finish_notice(ctx, second)
+    third = slate_wake_id(ctx.db, item.id)
+    assert third != second
+    assert Wakes.get(ctx.db, third).session_key == "holder"
+    assert item_wake_count(ctx.db, item.id) == 1
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == third
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "explicit policy elects a unique current exec and ambiguous election stays with owner",
+       ctx do
+    enable_followthrough()
+    session(ctx.db, "exec-a", "flynn")
+    session(ctx.db, "exec-b", "flynn")
+
+    for candidates <- [["exec-a"], ["exec-a", "exec-b"]] do
+      relations =
+        Enum.map_join(candidates, ",", fn key ->
+          ~s({ owner_session_key = "holder", supervisor_session_key = "#{key}" })
+        end)
+
+      File.write!(Path.join(ctx.law_base, "identity/rules/followthrough-supervision.toml"), """
+      [[reaction]]
+      name = "explicit-supervision"
+      family = "work-item-followthrough-supervision"
+      archetypes = ["*"]
+      english = "Explicit current supervision for this isolated test."
+      settings = { relations = [#{relations}] }
+      """)
+
+      Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      second = slate_wake_id(ctx.db, item.id)
+      assert Wakes.get(ctx.db, second).session_key == "holder"
+      finish_notice(ctx, second)
+      notice = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      assert notice.session_key == if(length(candidates) == 1, do: "exec-a", else: "holder")
+
+      assert notice.prompt =~
+               if(length(candidates) == 1, do: "route: available", else: "route: ambiguous")
+
+      assert item_wake_count(ctx.db, item.id) == 1
+    end
+  end
+
+  test "disposition, new work, custody change and cancellation before terminal do not count",
+       ctx do
+    enable_followthrough()
+    session(ctx.db, "next-owner", "flynn")
+
+    for change <- [:close, :assign, :handoff, :cancel] do
+      {item, first} = followthrough_item(ctx)
+      turn = start_notice(ctx, first)
+
+      case change do
+        :close ->
+          dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+
+        :assign ->
+          disp_assign(ctx, {:user, "flynn"}, "holder", "next work", item.id)
+
+        :handoff ->
+          update(ctx, item.id, %{delivery_owner_session_key: "next-owner"})
+
+        :cancel ->
+          current = slate_wake_id(ctx.db, item.id)
+
+          DB.transaction(ctx.db, fn txn ->
+            command = %{
+              wake_id: current,
+              requester: %{kind: "process", id: "tightbeam:row-reactions"},
+              reason_kind: "superseded",
+              causal_source: %{kind: "wake", id: current}
+            }
+
+            {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
+            Wakes.cancel_in_txn(txn, Map.put(command, :outcome, outcome))
+          end)
+      end
+
+      :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+                 [item.id]
+               )
+    end
+  end
+
+  test "standing item wait suppresses terminal follow-through and resets after resolution", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    turn = start_notice(ctx, first)
+
+    assert %{wait: %{active: true}} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "test-dependency",
+               condition_scope: item.id
+             })
+
+    :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    scheduler = item_wait_scheduler(ctx)
+
+    Tightbeam.ConditionFacts.file(ctx.db, scheduler, %{
+      kind: "test-dependency",
+      scope: item.id,
+      origin: "process:tightbeam"
+    })
+
+    refute get(ctx, item.id).wait.active
+    finish_delivery_queue(ctx.db, "holder")
+    resumed = slate_wake_id(ctx.db, item.id)
+    assert is_binary(resumed)
+    finish_notice(ctx, resumed)
+    event = item_observation(ctx.db, item.id, "owner_turn_completed")
+    assert event["sourceAfter"]["followThrough"]["misses"] == 1
+  end
+
+  test "terminal rollback emits no follow-up and retry commits one", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    turn = start_notice(ctx, first)
+    pending = slate_wake_id(ctx.db, item.id)
+
+    assert {:error, %RuntimeError{}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil,
+                        owner_lease: turn.owner_lease
+                      )
+
+               raise "rollback terminal"
+             end)
+
+    assert slate_wake_id(ctx.db, item.id) == pending
+    assert Wakes.get(ctx.db, pending).state == "pending"
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    refute slate_wake_id(ctx.db, item.id) == pending
+    assert Wakes.get(ctx.db, pending).state == "canceled"
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "gateway delivery provenance drives follow-through for the actual owner turn", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, first))
+    source = Wakes.get(ctx.db, first)
+    assert is_integer(source.delivered_turn_seq)
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [source.delivered_turn_seq])
+
+    next = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert next.prompt =~ "completed owner turn"
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "successor starts a new missed-turn episode after pending follow-up moves", ctx do
+    enable_followthrough()
+    session(ctx.db, "successor-owner", "flynn")
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    pending = slate_wake_id(ctx.db, item.id)
+    update(ctx, item.id, %{delivery_owner_session_key: "successor-owner"})
+    assert Wakes.get(ctx.db, pending).session_key == "successor-owner"
+    finish_notice(ctx, pending)
+
+    {:ok, [[encoded]]} =
+      DB.query(
+        ctx.db,
+        "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1 ORDER BY admittedAt DESC,rowid DESC LIMIT 1",
+        [item.id]
+      )
+
+    context = JSON.decode!(encoded)["sourceAfter"]["followThrough"]
+    assert context["ownerSessionKey"] == "successor-owner"
+    assert context["misses"] == 1
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "a disposition after successful terminal withdraws the sole follow-up", ctx do
+    enable_followthrough()
+
+    for disposition <- [:close, :assign, :wait] do
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      pending = slate_wake_id(ctx.db, item.id)
+
+      case disposition do
+        :close ->
+          dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+
+        :assign ->
+          disp_assign(ctx, {:user, "flynn"}, "holder", "next work", item.id)
+
+        :wait ->
+          record_item_wait(ctx, item.id, %{
+            condition_kind: "after-terminal",
+            condition_scope: item.id
+          })
+      end
+
+      assert Wakes.get(ctx.db, pending).state == "canceled"
+      assert slate_wake_id(ctx.db, item.id) == nil
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert Wakes.get(ctx.db, pending).state == "canceled"
+    end
+  end
+
+  test "one successful batch counts each slate source and ignores its disposed sibling", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    {sibling, second} = followthrough_item(ctx)
+    _ = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000)
+    assert [%{delivery_wake_id: carrier}] = NoticeBatcher.source_refs(ctx.db, first)
+    assert [%{delivery_wake_id: ^carrier}] = NoticeBatcher.source_refs(ctx.db, second)
+    {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "batch-follow-through-test")
+    assert turn.wake_id == carrier
+    assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, sibling.id)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert item_wake_count(ctx.db, item.id) == 1
+    assert item_wake_count(ctx.db, sibling.id) == 0
+    assert item_observation(ctx.db, item.id, "owner_turn_completed")["source"]["id"] == turn.seq
+  end
+
+  test "follow-through stays disabled when recorded item waits are disabled", ctx do
+    enable_followthrough()
+    Application.put_env(:tightbeam, :work_item_waits_enabled, false)
+    refute Tightbeam.WorkItemFollowthrough.enabled?()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    assert Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id)).due_at >
+             System.system_time(:millisecond) + 60_000
+  end
+
+  test "disabling either flag restores one ordinary horizon across repeated recovery", ctx do
+    enable_followthrough()
+
+    for flag <- [:work_item_followthrough_enabled, :work_item_waits_enabled] do
+      Application.put_env(:tightbeam, :work_item_followthrough_enabled, true)
+      Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      pending = slate_wake_id(ctx.db, item.id)
+      assert Wakes.get(ctx.db, pending).prompt =~ "completed owner turn"
+      Application.put_env(:tightbeam, flag, false)
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      restored = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      assert restored.wake_id == pending
+      assert restored.session_key == "holder"
+      refute restored.prompt =~ "completed owner turn"
+      assert restored.due_at > System.system_time(:millisecond) + 60_000
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert Wakes.get(ctx.db, pending).due_at == restored.due_at
+      assert item_wake_count(ctx.db, item.id) == 1
+      assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+    end
+  end
+
+  test "terminally undeliverable follow-up retries the actual pointer with bounded pacing", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    failed = slate_wake_id(ctx.db, item.id)
+    at = System.system_time(:millisecond)
+
+    {:ok, {:canceled, _}} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.undeliverable_delivery_in_txn(txn, failed, "target unavailable", at)
+      end)
+
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != failed
+    assert Wakes.get(ctx.db, failed).state == "canceled"
+    wake = Wakes.get(ctx.db, retry)
+    assert wake.due_at >= at + 30_000
+    assert wake.due_at <= at + 1_800_000
+    assert wake.session_key == "holder"
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert slate_wake_id(ctx.db, item.id) == retry
+    assert Wakes.get(ctx.db, retry).due_at == wake.due_at
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    session(ctx.db, "retry-successor", "flynn")
+    update(ctx, item.id, %{delivery_owner_session_key: "retry-successor"})
+
+    for attempt <- 2..9 do
+      previous = slate_wake_id(ctx.db, item.id)
+      before = System.system_time(:millisecond)
+
+      {:ok, {:canceled, _}} =
+        DB.transaction(ctx.db, fn txn ->
+          Wakes.undeliverable_delivery_in_txn(txn, previous, "target unavailable", before)
+        end)
+
+      after_at = System.system_time(:millisecond)
+      next = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      delay = min(30_000 * Integer.pow(2, attempt - 1), 1_800_000)
+      assert next.wake_id != previous
+      assert next.session_key == "retry-successor"
+      assert next.due_at >= before + delay
+      assert next.due_at <= after_at + delay
+      assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert slate_wake_id(ctx.db, item.id) == next.wake_id
+      assert item_wake_count(ctx.db, item.id) == 1
+    end
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*), MAX(json_extract(event,'$.sourceAfter.followThrough.misses')) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+  end
+
+  test "a real wait withdraws the paced retry without reviving the failed notice", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    failed = slate_wake_id(ctx.db, item.id)
+
+    {:ok, {:canceled, _}} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.undeliverable_delivery_in_txn(
+          txn,
+          failed,
+          "target unavailable",
+          System.system_time(:millisecond)
+        )
+      end)
+
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != failed
+
+    assert %{wait: %{active: true}} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "retry-dependency",
+               condition_scope: item.id
+             })
+
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert slate_wake_id(ctx.db, item.id) == nil
+    assert Wakes.get(ctx.db, retry).state == "canceled"
+    assert Wakes.get(ctx.db, failed).state == "canceled"
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "scalar supervision settings leave ordinary operations and terminal commits available",
+       ctx do
+    enable_followthrough()
+
+    for scalar <- [~s("invalid"), "true", "7"], enabled <- [false, true] do
+      Application.put_env(:tightbeam, :work_item_followthrough_enabled, enabled)
+
+      File.write!(Path.join(ctx.law_base, "identity/rules/followthrough-supervision.toml"), """
+      [[reaction]]
+      name = "explicit-supervision"
+      family = "work-item-followthrough-supervision"
+      archetypes = ["*"]
+      english = "Malformed supervision must not block ordinary work."
+      settings = { relations = #{scalar} }
+      """)
+
+      Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      wake = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      assert wake.session_key == "holder"
+      if enabled, do: assert(wake.prompt =~ "route: unavailable")
+      assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+      assert item_wake_count(ctx.db, item.id) == 0
+    end
+  end
+
+  test "flag-off retries survive old served rules through recovery and real delivery", ctx do
+    Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
+
+    File.cp!(
+      Path.join(__DIR__, "fixtures/work_items/pre_followthrough_rules.toml"),
+      Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    )
+
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    {item, first} = followthrough_item(ctx)
+
+    {:ok, {:canceled, _}} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.undeliverable_delivery_in_txn(
+          txn,
+          first,
+          "recipient unavailable",
+          System.system_time(:millisecond)
+        )
+      end)
+
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != first
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert slate_wake_id(ctx.db, item.id) == retry
+    assert item_wake_count(ctx.db, item.id) == 1
+    _ = NoticeBatcher.recover(ctx.db, Wakes.get(ctx.db, retry).due_at + 1000)
+    assert [%{delivery_wake_id: carrier}] = NoticeBatcher.source_refs(ctx.db, retry)
+    {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "old-rule-retry")
+    assert turn.wake_id == carrier
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert :ok = Wakes.reconcile_turn_delivered_sources(ctx.db, turn.seq)
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+  end
+
+  test "oversized ordinary routing notice keeps its cancellation through general recovery", ctx do
+    Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
+    path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    oversized = String.duplicate("x", 1_100_000)
+
+    rules =
+      String.replace(
+        File.read!(path),
+        ~s(template = "work-item-routing",),
+        ~s(template = "work-item-routing", prompt = "#{oversized}",)
+      )
+
+    File.write!(path, rules)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    item = create(ctx, {:user, "flynn"}, %{title: "Ordinary routing size failure"})
+    first = routing_wake_id(ctx.db, item.id)
+    wake = Wakes.get(ctx.db, first)
+
+    DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey=?1", [wake.session_key])
+
+    assert byte_size(wake.prompt) == 1_100_000
+    _ = NoticeBatcher.recover(ctx.db, wake.due_at + 1000)
+    assert Wakes.get(ctx.db, first).state == "canceled"
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert routing_wake_id(ctx.db, item.id) == nil
+    assert item_wake_count(ctx.db, item.id) == 0
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [first]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_retry_attempts WHERE predecessorWakeId=?1",
+               [first]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1",
+               [first]
+             )
+  end
+
+  test "oversized rendered slate becomes one paced compact retry without an owner miss", ctx do
+    Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
+    rules_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    oversized = String.duplicate("x", 1_100_000)
+    rules = File.read!(rules_path)
+
+    rules =
+      Regex.replace(
+        ~r/prompt = .*?, replace_wake_id =/,
+        rules,
+        fn _ -> "prompt = \"#{oversized}\", replace_wake_id =" end
+      )
+
+    File.write!(rules_path, rules)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey='holder'", [])
+    {item, first} = followthrough_item(ctx)
+    assert byte_size(Wakes.get(ctx.db, first).prompt) == 1_100_000
+    at = System.system_time(:millisecond)
+    _ = NoticeBatcher.recover(ctx.db, at + 1000)
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != first
+    assert Wakes.get(ctx.db, first).state == "canceled"
+    compact = Wakes.get(ctx.db, retry)
+    assert compact.due_at >= at + 30_000
+    assert compact.prompt =~ item.id
+    assert compact.prompt =~ "exceeded the delivery limit"
+    assert byte_size(compact.prompt) < 1000
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert Wakes.get(ctx.db, retry).prompt == compact.prompt
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1",
+               [first]
+             )
+
+    _ = NoticeBatcher.recover(ctx.db, compact.due_at + 1000)
+    assert [%{delivery_wake_id: carrier}] = NoticeBatcher.source_refs(ctx.db, retry)
+    {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "compact-retry")
+    assert turn.wake_id == carrier
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert :ok = Wakes.reconcile_turn_delivered_sources(ctx.db, turn.seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  @tag persistent_db: true
+  test "database restart retains the episode and single pending follow-up", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    pending = slate_wake_id(ctx.db, item.id)
+    stop_supervised!(DB)
+    start_supervised!({DB, ctx.db_opts})
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == pending
+    assert item_wake_count(ctx.db, item.id) == 1
+    finish_notice(ctx, pending)
+
+    {:ok, [[encoded]]} =
+      DB.query(
+        ctx.db,
+        "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1 ORDER BY admittedAt DESC,rowid DESC LIMIT 1",
+        [item.id]
+      )
+
+    assert JSON.decode!(encoded)["sourceAfter"]["followThrough"]["misses"] == 2
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  defp enable_followthrough do
+    prior = Application.get_env(:tightbeam, :work_item_followthrough_enabled)
+    Application.put_env(:tightbeam, :work_item_followthrough_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(prior),
+        do: Application.delete_env(:tightbeam, :work_item_followthrough_enabled),
+        else: Application.put_env(:tightbeam, :work_item_followthrough_enabled, prior)
+    end)
+  end
+
+  defp followthrough_item(ctx) do
+    item = create(ctx, {:user, "flynn"}, %{title: "Owner follow-through"})
+    update(ctx, item.id, %{delivery_owner_session_key: "holder"})
+    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "work", item.id)
+    complete(ctx, "holder", assignment.id)
+    finish_delivery_queue(ctx.db, "holder")
+    {item, slate_wake_id(ctx.db, item.id)}
+  end
+
+  defp start_notice(ctx, wake_id) do
+    wake = Wakes.get(ctx.db, wake_id)
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: wake.session_key,
+        message_id: "s_notice_#{System.unique_integer([:positive])}",
+        origin: "process:tightbeam",
+        prompt: wake.prompt,
+        wake_id: wake_id
+      })
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET state='fired',deliveredTurnSeq=?2 WHERE wakeId=?1", [
+        wake_id,
+        seq
+      ])
+
+    :ok = WorkItems.reconcile_delivered_brackets(ctx.db, wake.session_key, wake_id)
+    {:ok, turn} = Ledger.claim_next(ctx.db, wake.session_key, "follow-through-test")
+    assert turn.seq == seq
+    turn
+  end
+
+  defp finish_notice(ctx, wake_id) do
+    turn = start_notice(ctx, wake_id)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+  end
+
+  test "item waits default off refuses commands without storing wakes or links", ctx do
+    Application.delete_env(:tightbeam, :work_item_waits_enabled)
+    refute Tightbeam.WorkItemWaits.enabled?()
+    item = create(ctx, {:user, "flynn"}, %{title: "Flag off"})
+    before = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes", [])
+
+    for verb <- ["work-item-wait", "work-item-wait-withdraw"] do
+      assert %{code: "feature_disabled"} =
+               ctx.handlers[verb].(
+                 work_item_call(verb, {:user, "flynn"}, %{work_item_id: item.id})
+               )
+    end
+
+    assert DB.query(ctx.db, "SELECT COUNT(*) FROM wakes", []) == before
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM work_item_waits", [])
+
+    result =
+      ctx.handlers["work-item-get"].(
+        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: item.id})
+      )
+
+    refute Map.has_key?(result, :wait)
   end
 
   test "custody transfer keeps assigned and bare item ownership after source retirement", ctx do
@@ -1547,6 +2288,692 @@ defmodule Tightbeam.WorkItemBracketsTest do
     fail_base = doorbell_count(ctx.db, fail_item.id)
     dispose(ctx, "work-item-fail", {:user, "flynn"}, fail_item.id)
     assert doorbell_count(ctx.db, fail_item.id) == fail_base + 1
+  end
+
+  test "recorded wait quiets routing only and completion resumes reminders once", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Await upstream"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Upstream"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Upstream", upstream.id)
+    routing = routing_wake_id(ctx.db, item.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+    assert wait.active
+    assert Wakes.get(ctx.db, routing).state == "canceled"
+    assert routing_wake_id(ctx.db, item.id) == nil
+    assert slate_wake_id(ctx.db, item.id) == nil
+    # Idempotent retry preserves both identity and the original safety deadline.
+    assert %{wait: ^wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+    assert %{assignment: %{outcome: "completed"}} = complete(ctx, "holder", resolver.id)
+    wake = Wakes.get(ctx.db, wait.wakeId)
+    assert wake.recognition_path == "success"
+    refute get(ctx, item.id).wait.active
+    reminder = Wakes.get(ctx.db, routing_wake_id(ctx.db, item.id))
+    assert reminder.due_at >= wake.recognition_at + 86_400_000
+    assert reminder.wake_id != routing
+
+    assert {:ok, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.WorkItemWaits.release_in_txn(txn, wait.wakeId)
+             end)
+
+    assert routing_wake_id(ctx.db, item.id) == reminder.wake_id
+  end
+
+  test "assignment activity during an item wait keeps assignment notices but quiets slate", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Waiting item"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "Related work", item.id)
+    assert get(ctx, item.id).wait.active
+    assert %{assignment: _} = complete(ctx, "holder", assignment.id)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    assert get(ctx, item.id).wait.active
+    assert %{outcome: "revoked"} = revoke(ctx, resolver.id)
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+    assert get(ctx, item.id).wait.recognitionDisposition == "revoked"
+    assert is_binary(slate_wake_id(ctx.db, item.id))
+    assert routing_wake_id(ctx.db, item.id) == nil
+  end
+
+  test "replacing and withdrawing waits leaves no stale continuation", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Change dependency"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, first} = disp_assign(ctx, {:user, "flynn"}, "holder", "First", upstream.id)
+    {:ok, second} = disp_assign(ctx, {:user, "flynn"}, "holder", "Second", upstream.id)
+    %{wait: old} = record_item_wait(ctx, item.id, %{assignment_id: first.id})
+    %{wait: next} = record_item_wait(ctx, item.id, %{assignment_id: second.id})
+    assert old.wakeId != next.wakeId
+    assert Wakes.get(ctx.db, old.wakeId).state == "canceled"
+    complete(ctx, "holder", first.id)
+    assert get(ctx, item.id).wait.active
+
+    assert %{wait: %{active: false}} =
+             ctx.handlers["work-item-wait-withdraw"].(
+               work_item_call("work-item-wait-withdraw", {:user, "flynn"}, %{
+                 work_item_id: item.id
+               })
+             )
+
+    assert Wakes.get(ctx.db, next.wakeId).state == "canceled"
+    reminder = routing_wake_id(ctx.db, item.id)
+    assert is_binary(reminder)
+    complete(ctx, "holder", second.id)
+    assert routing_wake_id(ctx.db, item.id) == reminder
+  end
+
+  test "terminal and reopened items do not resurrect waits", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Park waiting work"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+
+    assert %{ok: true} =
+             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id, %{reason: "Paused"})
+
+    assert Wakes.get(ctx.db, wait.wakeId).state == "canceled"
+    assert %{ok: true} = dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
+    refute get(ctx, item.id).wait.active
+    assert is_binary(routing_wake_id(ctx.db, item.id))
+    complete(ctx, "holder", resolver.id)
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == nil
+  end
+
+  test "wait resolution addresses current delivery owner and retirement fallback", ctx do
+    for retire? <- [false, true] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Owner changes"})
+      upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+      {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+      %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+      owner = "wait-owner-#{retire?}"
+      session(ctx.db, owner, "flynn")
+      update(ctx, item.id, %{delivery_owner_session_key: owner})
+      assert Wakes.get(ctx.db, wait.wakeId).session_key == owner
+      if retire?, do: Org.retire(ctx.db, owner, "test:retirement")
+      revoke(ctx, resolver.id)
+      expected = if retire?, do: Org.personal_session_key("flynn"), else: owner
+      assert Wakes.get(ctx.db, wait.wakeId).session_key == expected
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+    end
+  end
+
+  test "item owner and delivery owner can record waits; open assignments retain their own waits",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Wait authority"})
+
+    params = %{
+      work_item_id: item.id,
+      condition_kind: "assignment-landed",
+      condition_scope: item.id,
+      after_ms: 60_000,
+      wait_reason: "Waiting for landing"
+    }
+
+    handler = ctx.handlers["work-item-wait"]
+
+    assert %{code: "not_authorized"} =
+             handler.(work_item_call("work-item-wait", {:session, "dsession"}, params))
+
+    update(ctx, item.id, %{delivery_owner_session_key: "dsession"})
+
+    assert %{wait: %{active: true}} =
+             handler.(work_item_call("work-item-wait", {:session, "dsession"}, params))
+
+    {:ok, _assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "Active work", item.id)
+
+    assert %{code: "assignments_open"} =
+             handler.(work_item_call("work-item-wait", {:user, "flynn"}, params))
+
+    assert get(ctx, item.id).wait.active
+  end
+
+  test "invalid declarations refuse without quieting the current reminder", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Keep reminder"})
+    original = routing_wake_id(ctx.db, item.id)
+
+    assert %{code: "invalid_resolver"} =
+             record_item_wait(ctx, item.id, %{assignment_id: "missing"})
+
+    assert %{code: "invalid_wait_target"} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: " ",
+               condition_scope: "scope"
+             })
+
+    assert %{code: "missing_reason"} =
+             record_item_wait(ctx, item.id, %{assignment_id: "missing", wait_reason: " "})
+
+    assert %{code: "invalid_fallback"} =
+             record_item_wait(ctx, item.id, %{assignment_id: "missing", after_ms: 0})
+
+    assert routing_wake_id(ctx.db, item.id) == original
+    assert Wakes.get(ctx.db, original).state == "pending"
+    assert get(ctx, item.id).wait == nil
+  end
+
+  test "already completed dependency resumes reminders immediately", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Already ready"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    complete(ctx, "holder", resolver.id)
+
+    assert %{wait: %{active: false, recognitionPath: "success"}} =
+             record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+
+    assert is_binary(routing_wake_id(ctx.db, item.id))
+  end
+
+  defp record_item_wait(ctx, id, target) do
+    ctx.handlers["work-item-wait"].(
+      work_item_call(
+        "work-item-wait",
+        {:user, "flynn"},
+        Map.merge(
+          %{
+            work_item_id: id,
+            after_ms: if(target[:condition_kind], do: 10_800_000),
+            wait_reason: "Waiting for upstream work"
+          },
+          target
+        )
+      )
+    )
+  end
+
+  test "unannounced events are accepted with the ordinary producer warning and require a fallback",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Agent event"})
+
+    assert %{code: "invalid_fallback"} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "release-live",
+               condition_scope: "next-release",
+               after_ms: nil
+             })
+
+    assert %{wait: %{active: true}, warnings: [%{code: "no-live-producer", kind: "release-live"}]} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "release-live",
+               condition_scope: "next-release"
+             })
+  end
+
+  test "record targets have no deadline and refuse fallback durations", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Record lifetime"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id, after_ms: nil})
+    assert wait.dueAt == nil
+    assert wait.active
+
+    for target <- [%{assignment_id: resolver.id}, %{decision_request_id: "dr_unused"}] do
+      assert %{
+               code: "invalid_fallback",
+               message: "--fallback-after is only supported for event waits"
+             } =
+               record_item_wait(ctx, item.id, Map.put(target, :after_ms, 1))
+
+      assert get(ctx, item.id).wait.wakeId == wait.wakeId
+    end
+
+    scheduler = item_wait_scheduler(ctx)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert get(ctx, item.id).wait.active
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == nil
+    complete(ctx, "holder", resolver.id)
+    refute get(ctx, item.id).wait.active
+  end
+
+  test "ordinary existing schema gains item waits without rewriting elected rules", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Existing item"})
+    reminder = routing_wake_id(ctx.db, item.id)
+    rule_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    rules = File.read!(rule_path)
+    # This additive link table is the only new schema object. Preserve existing
+    # work, wake and reaction rows while bootstrapping its predecessor shape.
+    assert {:ok, _} = DB.query(ctx.db, "DROP TABLE work_item_waits")
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert File.read!(rule_path) == rules
+    assert routing_wake_id(ctx.db, item.id) == reminder
+
+    assert %{wait: %{active: true}} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "agreed-event",
+               condition_scope: "upstream"
+             })
+
+    assert Wakes.get(ctx.db, reminder).state == "canceled"
+    assert File.read!(rule_path) == rules
+  end
+
+  test "unchanged customized reminder rules respect item waits and resume their interval", ctx do
+    rule_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    File.write!(rule_path, File.read!(rule_path) |> String.replace("86400000", "7000"))
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    item = create(ctx, {:user, "flynn"}, %{title: "Custom reminder"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id, after_ms: nil})
+    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "Local work", item.id)
+    complete(ctx, "holder", assignment.id)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    complete(ctx, "holder", resolver.id)
+    wake = Wakes.get(ctx.db, wait.wakeId)
+    reminder = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert reminder.due_at >= wake.recognition_at + 7000
+    assert reminder.due_at < wake.recognition_at + 20_000
+  end
+
+  test "fact wait recognizes an existing occurrence and a future matching fact", ctx do
+    scheduler = item_wait_scheduler(ctx)
+
+    for historical? <- [true, false] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Event dependency"})
+      scope = item.id
+
+      if historical?,
+        do:
+          Tightbeam.ConditionFacts.file(ctx.db, scheduler, %{
+            kind: "assignment-landed",
+            scope: scope,
+            origin: "process:tightbeam"
+          })
+
+      %{wait: wait} =
+        record_item_wait(ctx, item.id, %{
+          condition_kind: "assignment-landed",
+          condition_scope: scope
+        })
+
+      if historical? do
+        refute wait.active
+      else
+        assert wait.active
+
+        Tightbeam.ConditionFacts.file(ctx.db, scheduler, %{
+          kind: "assignment-landed",
+          scope: "other",
+          origin: "process:tightbeam"
+        })
+
+        assert get(ctx, item.id).wait.active
+
+        Tightbeam.ConditionFacts.file(ctx.db, scheduler, %{
+          kind: "assignment-landed",
+          scope: scope,
+          origin: "process:tightbeam"
+        })
+      end
+
+      assert get(ctx, item.id).wait.recognitionPath == "success"
+      refute get(ctx, item.id).wait.active
+    end
+  end
+
+  test "fallback survives scheduler restart and emits one continuation then normal reminder",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Missing event"})
+
+    %{wait: wait} =
+      record_item_wait(ctx, item.id, %{
+        condition_kind: "assignment-landed",
+        condition_scope: item.id
+      })
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert get(ctx, item.id).wait.active
+    scheduler = item_wait_scheduler(ctx)
+    DB.query(ctx.db, "UPDATE wakes SET dueAt=1 WHERE wakeId=?1", [wait.wakeId])
+    assert :ok = Wakes.fire_due(scheduler)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "fallback"
+    assert get(ctx, item.id).wait.recognitionPath == "fallback"
+    assert is_map(get(ctx, item.id).wait.recognitionEvidence)
+    refute get(ctx, item.id).wait.active
+    reminder = routing_wake_id(ctx.db, item.id)
+    assert is_binary(reminder)
+    assert Wakes.get(ctx.db, reminder).state == "pending"
+    # A restart replays neither recognition nor delivery.
+    stop_supervised!(scheduler)
+    scheduler = item_wait_scheduler(ctx)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert routing_wake_id(ctx.db, item.id) == reminder
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM turns t WHERE t.wakeId=?1 OR t.wakeId IN (
+                 SELECT b.deliveryWakeId FROM notice_batch_members m JOIN notice_batches b ON b.batchId=m.batchId
+                 WHERE m.sourceWakeId=?1 AND b.state='delivered')
+               """,
+               [wait.wakeId]
+             )
+
+    deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, reminder))
+    next_reminder = routing_wake_id(ctx.db, item.id)
+    assert next_reminder != reminder
+    assert Wakes.get(ctx.db, next_reminder).state == "pending"
+  end
+
+  test "decision withdrawal and supersession wake for reconsideration", ctx do
+    for terminal <- [:withdrawn, :superseded] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Decision dependency"})
+
+      request =
+        Tightbeam.Escalation.operator_ask(ctx.db, %{
+          principal: {:session, "holder"},
+          session_key: "holder",
+          origin: "agent:holder",
+          params:
+            Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, "holder", %{
+              question: "Choose an outcome",
+              options: [%{label: "proceed"}, %{label: "stop"}]
+            })
+        })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+      if terminal == :withdrawn do
+        Tightbeam.Escalation.operator_withdraw(ctx.db, %{
+          principal: {:session, "holder"},
+          origin: "agent:holder",
+          params: %{request: request.id, reason: "Question no longer applies"}
+        })
+      else
+        Tightbeam.Escalation.operator_ask(ctx.db, %{
+          principal: {:session, "holder"},
+          session_key: "holder",
+          origin: "agent:holder",
+          params:
+            Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, "holder", %{
+              question: "Replacement question",
+              options: [%{label: "proceed"}, %{label: "stop"}],
+              supersedes: request.id
+            })
+        })
+      end
+
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+      refute get(ctx, item.id).wait.active
+    end
+  end
+
+  for terminal <- [:answer, :return] do
+    @terminal terminal
+    test "agent decision #{@terminal} releases one item continuation and restores reminders",
+         ctx do
+      item = create(ctx, {:user, "flynn"}, %{title: "Decision wait"})
+
+      request =
+        Tightbeam.Escalation.ask(ctx.db, %{
+          verb: "ask",
+          principal: {:session, "holder"},
+          origin: "agent:holder",
+          session_key: Org.personal_session_key("flynn"),
+          params: %{question: "Which result?"}
+        })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+      call = %{
+        verb: to_string(@terminal),
+        principal: {:session, "holder"},
+        origin: "agent:holder",
+        params: %{request: request.id, reason: "Needs context", answer: "Proceed"}
+      }
+
+      result = ctx.handlers[to_string(@terminal)].(call)
+      expected = if @terminal == :answer, do: "success", else: "reconsideration"
+      assert result.status == if(@terminal == :answer, do: "answered", else: "returned")
+      # Recognition is caused by the write, before any scheduler/deadline pass.
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == expected
+      assert get(ctx, item.id).wait.recognitionDisposition == result.status
+      refute get(ctx, item.id).wait.active
+      reminder = routing_wake_id(ctx.db, item.id)
+      assert is_binary(reminder)
+      recognized_at = Wakes.get(ctx.db, wait.wakeId).recognition_at
+      assert ctx.handlers[to_string(@terminal)].(call).status == result.status
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_at == recognized_at
+      scheduler = item_wait_scheduler(ctx)
+      assert :ok = Wakes.fire_due(scheduler)
+      stop_supervised!(scheduler)
+      scheduler = item_wait_scheduler(ctx)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert routing_wake_id(ctx.db, item.id) == reminder
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT COUNT(*) FROM turns t WHERE t.wakeId=?1 OR t.wakeId IN (
+                   SELECT b.deliveryWakeId FROM notice_batch_members m JOIN notice_batches b ON b.batchId=m.batchId
+                   WHERE m.sourceWakeId=?1 AND b.state='delivered')
+                 """,
+                 [wait.wakeId]
+               )
+
+      deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, reminder))
+      next_reminder = routing_wake_id(ctx.db, item.id)
+      assert next_reminder != reminder
+      assert Wakes.get(ctx.db, next_reminder).state == "pending"
+    end
+  end
+
+  test "agent withdrawal and retirement withdrawal both recognize item waits", ctx do
+    for terminal <- [:withdraw, :retirement] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Decision withdrawal"})
+
+      request =
+        Tightbeam.Escalation.ask(ctx.db, %{
+          verb: "ask",
+          principal: {:session, "holder"},
+          origin: "agent:holder",
+          session_key: Org.personal_session_key("flynn"),
+          params: %{question: "Which result?"}
+        })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+      if terminal == :withdraw do
+        assert %{status: "withdrawn"} =
+                 Tightbeam.Escalation.withdraw(ctx.db, %{
+                   principal: {:session, "holder"},
+                   origin: "agent:holder",
+                   params: %{request: request.id, reason: "No longer needed"}
+                 })
+      else
+        assert :ok = Tightbeam.Escalation.withdraw_for_retired(ctx.db, "holder")
+      end
+
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+      assert get(ctx, item.id).wait.recognitionDisposition == "withdrawn"
+      refute get(ctx, item.id).wait.active
+      assert is_binary(routing_wake_id(ctx.db, item.id))
+    end
+  end
+
+  test "retirement and boot recovery recognize revoked assignment item waits", ctx do
+    for recovery? <- [false, true] do
+      holder = "retiring-resolver-#{recovery?}"
+      session(ctx.db, holder, "flynn")
+      item = create(ctx, {:user, "flynn"}, %{title: "Wait for retiring resolver"})
+      upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+      {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, holder, "Dependency", upstream.id)
+      %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+
+      if recovery? do
+        Org.retire(ctx.db, holder, "user:flynn")
+        assert :ok = Tightbeam.Supervision.close_retired_holder_assignments(ctx.db)
+      else
+        result =
+          ctx.handlers["retire"].(%{
+            origin: "user:flynn",
+            principal: {:user, "flynn"},
+            session_key: holder,
+            params: %{}
+          })
+
+        assert holder in result.retired_session_keys
+      end
+
+      assert get(ctx, item.id).wait.recognitionDisposition == "revoked"
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+      refute get(ctx, item.id).wait.active
+      assert is_binary(routing_wake_id(ctx.db, item.id))
+    end
+  end
+
+  test "statute ruling waiver consumption and withdrawal paths recognize item waits", ctx do
+    for terminal <- [:rule, :consume_inline, :waive, :withdraw, :recovery] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Statute dependency"})
+
+      call = %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{assignment_id: "dependency-#{terminal}", kind: "completion"}
+      }
+
+      statute = %{name: "wait-review-#{terminal}", text: "Owner review"}
+
+      assert {:decision_pending, id} =
+               Tightbeam.Escalation.escalate(ctx.db, call, statute, %{
+                 question: "Allow the action?",
+                 options: nil
+               })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: id})
+
+      case terminal do
+        kind when kind in [:rule, :consume_inline] ->
+          Tightbeam.Escalation.rule(
+            ctx.db,
+            %{
+              origin: "user:flynn",
+              principal: {:user, "flynn"},
+              params: %{request_id: id, decision: "allow"}
+            },
+            authorized: true
+          )
+
+        :waive ->
+          Tightbeam.Escalation.waive(
+            ctx.db,
+            %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{request_id: id}},
+            authorized: true
+          )
+
+        :withdraw ->
+          Tightbeam.Escalation.withdraw(ctx.db, %{
+            origin: "user:flynn",
+            principal: {:user, "flynn"},
+            params: %{request_id: id, reason: "No longer needed"}
+          })
+
+        :recovery ->
+          Tightbeam.Escalation.withdraw_episodes(ctx.db, [id], statute.name)
+      end
+
+      expected =
+        if terminal in [:rule, :consume_inline, :waive], do: "success", else: "reconsideration"
+
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == expected,
+             "terminal path #{terminal}"
+
+      refute get(ctx, item.id).wait.active
+      assert is_binary(routing_wake_id(ctx.db, item.id))
+
+      if terminal in [:rule, :consume_inline] do
+        if terminal == :consume_inline do
+          assert {:ok, true} =
+                   DB.transaction(ctx.db, fn txn ->
+                     Tightbeam.Escalation.consume_in_txn(txn, id, "memento-set", "user:flynn")
+                   end)
+        else
+          assert Tightbeam.Escalation.consume(ctx.db, id)
+        end
+
+        # Consumption follows ruling: suppression has already ended before either path.
+        refute get(ctx, item.id).wait.active
+        %{wait: consumed} = record_item_wait(ctx, item.id, %{decision_request_id: id})
+        assert consumed.recognitionPath == "success"
+        assert consumed.recognitionDisposition == "consumed"
+        refute consumed.active
+      end
+    end
+  end
+
+  test "operator ruling and historical surrendered assignment are recognized", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Operator dependency"})
+
+    request =
+      Tightbeam.Escalation.operator_ask(ctx.db, %{
+        principal: {:session, "holder"},
+        session_key: "holder",
+        origin: "agent:holder",
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, "holder", %{
+            question: "Choose",
+            options: [%{label: "proceed"}, %{label: "stop"}]
+          })
+      })
+
+    %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+    assert %{status: "ruled"} =
+             Tightbeam.Escalation.operator_rule(ctx.db, %{
+               principal: {:user, "flynn"},
+               origin: "user:flynn",
+               params: %{request: request.id, decision: "proceed"}
+             })
+
+    assert get(ctx, item.id).wait.recognitionDisposition == "ruled"
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "success"
+    refute get(ctx, item.id).wait.active
+
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Legacy dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Legacy", upstream.id)
+    complete(ctx, "holder", resolver.id)
+    # Current writers never create surrendered; retain admission for stored history.
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET outcome='surrendered' WHERE id=?1", [
+               resolver.id
+             ])
+
+    %{wait: historical} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+    assert historical.recognitionPath == "reconsideration"
+    assert historical.recognitionDisposition == "surrendered"
+    refute historical.active
+  end
+
+  defp item_wait_scheduler(ctx) do
+    name = :"item_wait_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         name: name,
+         db: ctx.db,
+         tick_ms: 60_000,
+         deliver: fn wake ->
+           Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+             db: ctx.db,
+             wake_id: wake.wake_id,
+             sender: wake.origin,
+             target_gate: wake,
+             conn_registry: ConnRegistry,
+             lane_manager: Tightbeam.LaneManager
+           )
+         end,
+         delivery_opts: [conn_registry: ConnRegistry, lane_manager: Tightbeam.LaneManager]},
+        id: name
+      )
+    )
+
+    name
   end
 
   ## Helpers ----------------------------------------------------------------

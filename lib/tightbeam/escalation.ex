@@ -1660,73 +1660,85 @@ defmodule Tightbeam.Escalation do
     answered_at = now()
 
     {:ok, result} =
-      DB.transaction(db, fn txn ->
-        before = request_in_txn(txn, request.id)
+      DB.transaction_then(
+        db,
+        fn txn ->
+          before = request_in_txn(txn, request.id)
 
-        Txn.q(
-          txn,
-          """
-          UPDATE decision_requests
-          SET status = 'answered', answer = ?2, answeredBy = ?3, answeredAt = ?4
-          WHERE id = ?1 AND kind = 'agent' AND status = 'open'
-          """,
-          [request.id, text, answered_by, answered_at]
-        )
-
-        if Txn.changes(txn) == 1 do
-          if cannot_proceed_request?(before) do
-            Wakes.clear_decision_request_notice_in_txn(txn, request.id)
-
-            :ok =
-              Tightbeam.Assignments.settle_cannot_proceed_by_answer_in_txn(
-                txn,
-                request.id,
-                answered_by,
-                answered_at
-              )
-          end
-
-          EventLog.lifecycle_in_txn(
+          Txn.q(
             txn,
-            "decision_request_answered",
-            request.id,
-            "by=#{answered_by} askedOf=#{request.expecter_session_key}"
+            """
+            UPDATE decision_requests
+            SET status = 'answered', answer = ?2, answeredBy = ?3, answeredAt = ?4
+            WHERE id = ?1 AND kind = 'agent' AND status = 'open'
+            """,
+            [request.id, text, answered_by, answered_at]
           )
 
-          # Preserve the asker's existing prompt wake; the state notice below
-          # is a separate best-effort snapshot for Firehose clients.
-          Wakes.schedule_in_txn(txn, %{
-            session_key: request.current_raiser_session_key,
-            origin: "process:tightbeam",
-            prompt: answer_notification(request, text, answered_by),
-            due_at: answered_at,
-            target_gate: 0
-          })
+          if Txn.changes(txn) == 1 do
+            if cannot_proceed_request?(before) do
+              Wakes.clear_decision_request_notice_in_txn(txn, request.id)
 
-          answered = request_in_txn(txn, request.id)
-          Publisher.maybe_accepted_in_txn(txn, call, answered)
+              :ok =
+                Tightbeam.Assignments.settle_cannot_proceed_by_answer_in_txn(
+                  txn,
+                  request.id,
+                  answered_by,
+                  answered_at
+                )
+            end
 
-          answered =
-            publish_decision_transition_in_txn(
+            EventLog.lifecycle_in_txn(
               txn,
-              before,
-              answered,
-              Map.get(call, :firehose_hub, Hub)
+              "decision_request_answered",
+              request.id,
+              "by=#{answered_by} askedOf=#{request.expecter_session_key}"
             )
 
-          answered
-        else
-          current = request_in_txn(txn, request.id)
+            # Preserve the asker's existing prompt wake; the state notice below
+            # is a separate best-effort snapshot for Firehose clients.
+            Wakes.schedule_in_txn(txn, %{
+              session_key: request.current_raiser_session_key,
+              origin: "process:tightbeam",
+              prompt: answer_notification(request, text, answered_by),
+              due_at: answered_at,
+              target_gate: 0
+            })
 
-          if current.status == "answered" and current.answered_by == answered_by and
-               current.answer == text do
-            Publisher.maybe_observed_accepted_in_txn(txn, call)
-            current
+            answered = request_in_txn(txn, request.id)
+            Publisher.maybe_accepted_in_txn(txn, call, answered)
+
+            answered =
+              publish_decision_transition_in_txn(
+                txn,
+                before,
+                answered,
+                Map.get(call, :firehose_hub, Hub)
+              )
+
+            DB.record_row_commit(
+              txn,
+              decision_transition(before, "open", "answered", answered_by, "answer")
+            )
+
+            answered
           else
-            error("not_open", "decision request is not open")
+            current = request_in_txn(txn, request.id)
+
+            if current.status == "answered" and current.answered_by == answered_by and
+                 current.answer == text do
+              Publisher.maybe_observed_accepted_in_txn(txn, call)
+              current
+            else
+              error("not_open", "decision request is not open")
+            end
           end
+        end,
+        fn txn, result ->
+          Wakes.row_commit_in_txn(txn, [])
+          result
         end
-      end)
+      )
 
     result
   end
@@ -1735,59 +1747,71 @@ defmodule Tightbeam.Escalation do
     returned_at = now()
 
     {:ok, result} =
-      DB.transaction(db, fn txn ->
-        before = request_in_txn(txn, request.id)
+      DB.transaction_then(
+        db,
+        fn txn ->
+          before = request_in_txn(txn, request.id)
 
-        Txn.q(
-          txn,
-          """
-          UPDATE decision_requests
-          SET status = 'returned', returnedBy = ?2, returnReason = ?3, returnedAt = ?4
-          WHERE id = ?1 AND kind = 'agent' AND status = 'open'
-          """,
-          [request.id, returned_by, reason, returned_at]
-        )
-
-        if Txn.changes(txn) == 1 do
-          EventLog.lifecycle_in_txn(
+          Txn.q(
             txn,
-            "decision_request_returned",
-            request.id,
-            "by=#{returned_by} askedOf=#{request.expecter_session_key}"
+            """
+            UPDATE decision_requests
+            SET status = 'returned', returnedBy = ?2, returnReason = ?3, returnedAt = ?4
+            WHERE id = ?1 AND kind = 'agent' AND status = 'open'
+            """,
+            [request.id, returned_by, reason, returned_at]
           )
 
-          Wakes.schedule_in_txn(txn, %{
-            session_key: request.current_raiser_session_key,
-            origin: "process:tightbeam",
-            prompt: return_notification(request, reason, returned_by),
-            due_at: returned_at,
-            target_gate: 0
-          })
-
-          returned = request_in_txn(txn, request.id)
-          Publisher.maybe_accepted_in_txn(txn, call, returned)
-
-          returned =
-            publish_decision_transition_in_txn(
+          if Txn.changes(txn) == 1 do
+            EventLog.lifecycle_in_txn(
               txn,
-              before,
-              returned,
-              Map.get(call, :firehose_hub, Hub)
+              "decision_request_returned",
+              request.id,
+              "by=#{returned_by} askedOf=#{request.expecter_session_key}"
             )
 
-          returned
-        else
-          current = request_in_txn(txn, request.id)
+            Wakes.schedule_in_txn(txn, %{
+              session_key: request.current_raiser_session_key,
+              origin: "process:tightbeam",
+              prompt: return_notification(request, reason, returned_by),
+              due_at: returned_at,
+              target_gate: 0
+            })
 
-          if current.status == "returned" and current.returned_by == returned_by and
-               current.return_reason == reason do
-            Publisher.maybe_observed_accepted_in_txn(txn, call)
-            current
+            returned = request_in_txn(txn, request.id)
+            Publisher.maybe_accepted_in_txn(txn, call, returned)
+
+            returned =
+              publish_decision_transition_in_txn(
+                txn,
+                before,
+                returned,
+                Map.get(call, :firehose_hub, Hub)
+              )
+
+            DB.record_row_commit(
+              txn,
+              decision_transition(before, "open", "returned", returned_by, "return")
+            )
+
+            returned
           else
-            error("not_open", "decision request is not open")
+            current = request_in_txn(txn, request.id)
+
+            if current.status == "returned" and current.returned_by == returned_by and
+                 current.return_reason == reason do
+              Publisher.maybe_observed_accepted_in_txn(txn, call)
+              current
+            else
+              error("not_open", "decision request is not open")
+            end
           end
+        end,
+        fn txn, result ->
+          Wakes.row_commit_in_txn(txn, [])
+          result
         end
-      end)
+      )
 
     result
   end

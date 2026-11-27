@@ -78,7 +78,8 @@ defmodule Tightbeam.WorkItems do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
     with :ok <- DB.execute(db, @ddl),
-         :ok <- DB.execute(db, @priority_ddl) do
+         :ok <- DB.execute(db, @priority_ddl),
+         :ok <- Tightbeam.WorkItemWaits.ensure_schema(db) do
       :ok
     end
   end
@@ -86,6 +87,8 @@ defmodule Tightbeam.WorkItems do
   @doc false
   def __handle__(db, "work-item-create", call), do: create_result(db, call)
   def __handle__(db, "work-item-get", call), do: get_result(db, call)
+  def __handle__(db, "work-item-wait", call), do: wait_result(db, call, :record)
+  def __handle__(db, "work-item-wait-withdraw", call), do: wait_result(db, call, :withdraw)
   def __handle__(db, "work-item-trace", call), do: trace_result(db, call)
   def __handle__(db, "work-item-list", call), do: list_result(db, call)
   def __handle__(db, "work-item-update", call), do: update_result(db, call)
@@ -914,6 +917,8 @@ defmodule Tightbeam.WorkItems do
                 })
               )
             else
+              Tightbeam.WorkItemWaits.dispose_in_txn(txn, id, to_string(transition_id))
+
               cancel_brackets_in_txn(txn, id, %{
                 causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
                 observation: observation,
@@ -1065,7 +1070,20 @@ defmodule Tightbeam.WorkItems do
             principal: {:process, "tightbeam"},
             at: event["at"],
             before: event["before"],
-            after: event["after"]
+            after:
+              if(Tightbeam.WorkItemFollowthrough.enabled?(),
+                do:
+                  Map.put(
+                    event["after"],
+                    "followThrough",
+                    Tightbeam.WorkItemFollowthrough.delivery_context(
+                      txn,
+                      wake_id,
+                      item_id
+                    )
+                  ),
+                else: event["after"]
+              )
           },
           nil,
           wake_id
@@ -1193,6 +1211,31 @@ defmodule Tightbeam.WorkItems do
     end)
   end
 
+  defp wait_result(db, call, operation) do
+    transaction(db, fn txn ->
+      case fetch_in_txn(txn, call.params[:work_item_id]) do
+        nil ->
+          unknown(call.params[:work_item_id])
+
+        item ->
+          if disposition_allowed?(txn, call.principal, item) or
+               call.principal == {:session, item.deliveryOwnerSessionKey} do
+            result = Tightbeam.WorkItemWaits.apply_in_txn(txn, item, call, operation)
+
+            if is_map(result) and not Map.has_key?(result, :code),
+              do: stamp_version_in_txn(txn, item.id, now())
+
+            result
+          else
+            error(
+              "not_authorized",
+              "recording a wait requires the item owner, delivery owner or an admin"
+            )
+          end
+      end
+    end)
+  end
+
   ## Reads
 
   defp get_result(db, call) do
@@ -1207,6 +1250,11 @@ defmodule Tightbeam.WorkItems do
             workItem: Mementos.attach(db, "work_item", handler_detail_work_item(db, item)),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
+          |> then(fn result ->
+            if Tightbeam.WorkItemWaits.enabled?(),
+              do: Map.put(result, :wait, Tightbeam.WorkItemWaits.get(db, item.id)),
+              else: result
+          end)
       end
     end
   end
