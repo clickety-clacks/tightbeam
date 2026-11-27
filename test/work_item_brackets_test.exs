@@ -269,13 +269,40 @@ defmodule Tightbeam.WorkItemBracketsTest do
     enable_followthrough()
     {item, first} = followthrough_item(ctx)
     turn = start_notice(ctx, first)
-    assert %{wait: %{active: true}} = record_item_wait(ctx, item.id, %{condition_kind: "test-dependency", condition_scope: item.id})
+
+    assert %{wait: %{active: true}} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "test-dependency",
+               condition_scope: item.id
+             })
+
     :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert item_wake_count(ctx.db, item.id) == 1
-    assert {:ok, [[0]]} = DB.query(ctx.db,
-      "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1", [item.id])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
     :ok = Tightbeam.RowReactions.recover(ctx.db)
     assert slate_wake_id(ctx.db, item.id) == nil
+    scheduler = item_wait_scheduler(ctx)
+
+    Tightbeam.ConditionFacts.file(ctx.db, scheduler, %{
+      kind: "test-dependency",
+      scope: item.id,
+      origin: "process:tightbeam"
+    })
+
+    refute get(ctx, item.id).wait.active
+    finish_delivery_queue(ctx.db, "holder")
+    resumed = slate_wake_id(ctx.db, item.id)
+    assert is_binary(resumed)
+    finish_notice(ctx, resumed)
+    event = item_observation(ctx.db, item.id, "owner_turn_completed")
+    assert event["sourceAfter"]["followThrough"]["misses"] == 1
   end
 
   test "terminal rollback emits no follow-up and retry commits one", ctx do
@@ -283,10 +310,16 @@ defmodule Tightbeam.WorkItemBracketsTest do
     {item, first} = followthrough_item(ctx)
     turn = start_notice(ctx, first)
     pending = slate_wake_id(ctx.db, item.id)
-    assert {:error, %RuntimeError{}} = DB.transaction(ctx.db, fn txn ->
-      assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-      raise "rollback terminal"
-    end)
+
+    assert {:error, %RuntimeError{}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil,
+                        owner_lease: turn.owner_lease
+                      )
+
+               raise "rollback terminal"
+             end)
+
     assert slate_wake_id(ctx.db, item.id) == pending
     assert Wakes.get(ctx.db, pending).state == "pending"
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
@@ -301,9 +334,124 @@ defmodule Tightbeam.WorkItemBracketsTest do
     deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, first))
     source = Wakes.get(ctx.db, first)
     assert is_integer(source.delivered_turn_seq)
-    assert {:ok, [["delivered"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [source.delivered_turn_seq])
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [source.delivered_turn_seq])
+
     next = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
     assert next.prompt =~ "completed owner turn"
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "successor starts a new missed-turn episode after pending follow-up moves", ctx do
+    enable_followthrough()
+    session(ctx.db, "successor-owner", "flynn")
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    pending = slate_wake_id(ctx.db, item.id)
+    update(ctx, item.id, %{delivery_owner_session_key: "successor-owner"})
+    assert Wakes.get(ctx.db, pending).session_key == "successor-owner"
+    finish_notice(ctx, pending)
+
+    {:ok, [[encoded]]} =
+      DB.query(
+        ctx.db,
+        "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1 ORDER BY admittedAt DESC,rowid DESC LIMIT 1",
+        [item.id]
+      )
+
+    context = JSON.decode!(encoded)["sourceAfter"]["followThrough"]
+    assert context["ownerSessionKey"] == "successor-owner"
+    assert context["misses"] == 1
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "a disposition after successful terminal withdraws the sole follow-up", ctx do
+    enable_followthrough()
+
+    for disposition <- [:close, :assign, :wait] do
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      pending = slate_wake_id(ctx.db, item.id)
+
+      case disposition do
+        :close ->
+          dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+
+        :assign ->
+          disp_assign(ctx, {:user, "flynn"}, "holder", "next work", item.id)
+
+        :wait ->
+          record_item_wait(ctx, item.id, %{
+            condition_kind: "after-terminal",
+            condition_scope: item.id
+          })
+      end
+
+      assert Wakes.get(ctx.db, pending).state == "canceled"
+      assert slate_wake_id(ctx.db, item.id) == nil
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert Wakes.get(ctx.db, pending).state == "canceled"
+    end
+  end
+
+  test "one successful batch counts each slate source and ignores its disposed sibling", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    {sibling, second} = followthrough_item(ctx)
+    _ = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000)
+    assert [%{delivery_wake_id: carrier}] = NoticeBatcher.source_refs(ctx.db, first)
+    assert [%{delivery_wake_id: ^carrier}] = NoticeBatcher.source_refs(ctx.db, second)
+    {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "batch-follow-through-test")
+    assert turn.wake_id == carrier
+    assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, sibling.id)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert item_wake_count(ctx.db, item.id) == 1
+    assert item_wake_count(ctx.db, sibling.id) == 0
+    assert item_observation(ctx.db, item.id, "owner_turn_completed")["source"]["id"] == turn.seq
+  end
+
+  test "follow-through stays disabled when recorded item waits are disabled", ctx do
+    enable_followthrough()
+    Application.put_env(:tightbeam, :work_item_waits_enabled, false)
+    refute Tightbeam.WorkItemFollowthrough.enabled?()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    assert Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id)).due_at >
+             System.system_time(:millisecond) + 60_000
+  end
+
+  test "database restart retains the episode and single pending follow-up", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    pending = slate_wake_id(ctx.db, item.id)
+    path = Path.join(ctx.law_base, "restart-state.db")
+    assert {:ok, _} = DB.query(ctx.db, "VACUUM INTO ?1", [path])
+    stop_supervised!(DB)
+    start_supervised!({DB, path: path, name: ctx.db})
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == pending
+    assert item_wake_count(ctx.db, item.id) == 1
+    finish_notice(ctx, pending)
+
+    {:ok, [[encoded]]} =
+      DB.query(
+        ctx.db,
+        "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1 ORDER BY admittedAt DESC,rowid DESC LIMIT 1",
+        [item.id]
+      )
+
+    assert JSON.decode!(encoded)["sourceAfter"]["followThrough"]["misses"] == 2
     assert item_wake_count(ctx.db, item.id) == 1
   end
 

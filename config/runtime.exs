@@ -111,6 +111,13 @@ if config_env() != :test do
     config :tightbeam, :wake_tick_ms, String.to_integer(value)
   end
 
+  case System.get_env("TIGHTBEAM_WORK_ITEM_FOLLOWTHROUGH_ENABLED") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :work_item_followthrough_enabled, true
+    _ -> raise ArgumentError, "TIGHTBEAM_WORK_ITEM_FOLLOWTHROUGH_ENABLED must be true or false"
+  end
+
   case System.get_env("TIGHTBEAM_WORK_ITEM_WAITS_ENABLED") do
     nil -> :ok
     "false" -> :ok

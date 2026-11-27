@@ -4,12 +4,17 @@ defmodule Tightbeam.WorkItemFollowthrough do
   alias Tightbeam.RowReactions.Store
   alias Tightbeam.{RowReactions, WorkItems}
 
-  def enabled?, do: Application.get_env(:tightbeam, :work_item_followthrough_enabled, false)
+  def enabled?,
+    do:
+      Application.get_env(:tightbeam, :work_item_followthrough_enabled, false) and
+        Tightbeam.WorkItemWaits.enabled?()
 
   # Carry the episode through the existing delivery replacement. This is not a
   # second reminder: the only actionable notice remains work_items.slateWakeId.
   def delivery_context(txn, wake_id, item_id) do
-    [[session_key]] = Txn.q(txn, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id=?1", [item_id])
+    [[session_key]] =
+      Txn.q(txn, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id=?1", [item_id])
+
     prior =
       case Store.output_event(txn, wake_id) do
         {event, _} -> get_in(event, ["sourceAfter", "followThrough"])
@@ -78,7 +83,8 @@ defmodule Tightbeam.WorkItemFollowthrough do
   defp observe_success(txn, seq, wake_id, item_id, session_key) do
     # Delivery reconciliation can arrive after the terminal callback. Admit its
     # existing replacement first; pointer matching makes this replay-safe.
-    if Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1 AND slateWakeId=?2", [item_id, wake_id]) == [[1]] do
+    if Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1 AND slateWakeId=?2", [item_id, wake_id]) ==
+         [[1]] do
       WorkItems.rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: item_id})
     end
 
