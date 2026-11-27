@@ -159,6 +159,8 @@ defmodule Tightbeam.Ephemeral do
       Tightbeam.Retirements.session_retired_in_txn(txn, key)
 
       if retired? do
+        Tightbeam.PeopleMessages.retire_in_txn(txn, key)
+
         Txn.handoff(
           txn,
           Tightbeam.HarklightWakes,

@@ -33,10 +33,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      install_channels: ${{ steps.channels.outputs.enabled }}
     permissions:
       actions: read
       contents: read
@@ -78,6 +84,15 @@ jobs:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Detect install channels in the selected candidate
+        id: channels
+        run: |
+          if [ -f packaging/prepare-install-channels.mjs ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify main commit and unused release tag
         shell: bash
@@ -173,6 +188,19 @@ jobs:
           linux_source="candidate-stage/tightbeam-$version-linux-x86_64-$short_sha.tgz"
           test -f "$darwin_source"
           test -f "$linux_source"
+          # Older candidates predate setup, and this job uses the candidate's checkout.
+          if git cat-file -e "$CANDIDATE_SHA:cli/src/setup.mjs" 2>/dev/null; then
+            for package in "$darwin_source" "$linux_source"; do
+              if ! tar -xOf "$package" tightbeam/setup-build.json |
+                jq -e --slurp --arg commit "$CANDIDATE_SHA" --arg tag "$RELEASE_TAG" \
+                  'length == 1 and .[0].commit == $commit and .[0].tag == $tag' >/dev/null; then
+                echo "release: missing or invalid setup build identity in $package" >&2
+                exit 1
+              fi
+            done
+          else
+            echo "The selected candidate predates setup build identity. Skipped the setup stamp check." >> "$GITHUB_STEP_SUMMARY"
+          fi
           python3 packaging/extract-payload.py --inventory-only "$darwin_source"
           python3 packaging/extract-payload.py --inventory-only "$linux_source"
 
@@ -217,7 +245,7 @@ jobs:
         with:
           name: release-payload-${{ inputs.candidate_sha }}
           path: ${{ runner.temp }}/release/
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   publish:
@@ -254,6 +282,22 @@ jobs:
             and .soak.source_sha == $sha
           ' release/release-provenance.json > /dev/null
 
+      - uses: actions/checkout@v4
+        with:
+          path: release-tooling
+          persist-credentials: false
+
+      - name: Read the reviewed direct-upgrade line
+        id: upgrade-notes
+        shell: bash
+        run: |
+          identity=${RELEASE_TAG#v}
+          notes="release-tooling/docs/releases/${identity%%+*}.md"
+          if [[ -f "$notes" ]]; then
+            line=$(sed -n '/^Direct upgrades\{0,1\}: /{p;q;}' "$notes")
+            echo "line=$line" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create the GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -262,9 +306,234 @@ jobs:
           target_commitish: ${{ inputs.candidate_sha }}
           name: Tightbeam ${{ inputs.release_tag }}
           generate_release_notes: true
+          body: ${{ steps.upgrade-notes.outputs.line }}
+          prerelease: false
+          make_latest: "true"
           fail_on_unmatched_files: true
           files: |
             release/tightbeam-*.tgz
             release/release-candidate-manifest.json
             release/SHA256SUMS
             release/release-provenance.json
+
+      - name: Report legacy candidate publication
+        if: needs.prepare.outputs.install_channels != 'true'
+        run: echo "Published GitHub release. The selected candidate predates npm and Homebrew distribution." >> "$GITHUB_STEP_SUMMARY"
+
+  distribute:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.install_channels == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - name: Check publication credentials
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "Set HOMEBREW_TAP_TOKEN with Contents write access to clickety-clacks/homebrew-tap" >&2
+            exit 1
+          fi
+          status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' https://registry.npmjs.org/tightbeam)
+          case "$status" in
+            200)
+              if [ -z "$NODE_AUTH_TOKEN" ] &&
+                 { [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; }; then
+                echo "Set NPM_TOKEN or enable npm Trusted Publishing with GitHub Actions OIDC" >&2
+                exit 1
+              fi
+              ;;
+            404) test -n "$NODE_AUTH_TOKEN" || {
+                   echo "Set NPM_TOKEN to bootstrap the unclaimed tightbeam package" >&2
+                   exit 1
+                 } ;;
+            *) echo "npm registry lookup failed (HTTP $status)" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-payload-${{ inputs.candidate_sha }}
+          path: verified-release
+
+      - name: Confirm this is the latest stable GitHub release with the verified archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" |
+            jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and (.draft or .prerelease | not)'
+          gh release download "$RELEASE_TAG" --dir published-release \
+            --pattern SHA256SUMS --pattern 'tightbeam-*.tgz' --pattern release-candidate-manifest.json
+          cmp verified-release/SHA256SUMS published-release/SHA256SUMS
+          (cd published-release && sha256sum --check SHA256SUMS)
+          node packaging/prepare-install-channels.mjs "$RELEASE_TAG" published-release/SHA256SUMS channels
+
+      - uses: actions/checkout@v4
+        with:
+          repository: clickety-clacks/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Publish npm and Homebrew and verify both public channels
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash packaging/publish-install-channels.sh "$PWD/channels" "$PWD/homebrew-tap"
+
+      - uses: Homebrew/actions/setup-homebrew@main
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+
+      - name: Verify setup through the published npm and Homebrew commands
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+        shell: bash
+        run: |
+          source packaging/smoke/verify-setup-entrypoints.sh
+          verify_public_setup_entrypoints "$PWD/channels/npm/package.json" "$CANDIDATE_SHA"
+  generate-fixture:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fixture tooling follows the publisher, even for an older candidate.
+          persist-credentials: false
+
+      - name: Read back published release identity and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" |
+            jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and (.draft or .prerelease | not)'
+          gh release download "$RELEASE_TAG" --dir published             --pattern SHA256SUMS --pattern release-provenance.json --pattern 'tightbeam-*.tgz'             --pattern release-candidate-manifest.json
+          (
+            cd published
+            sha256sum --check SHA256SUMS
+            jq -e --arg tag "$RELEASE_TAG" --arg sha "$CANDIDATE_SHA"               '.tag == $tag and .commit == $sha' release-provenance.json
+            sha256sum release-provenance.json
+          ) >> "$GITHUB_STEP_SUMMARY"
+          notes=$(gh release view "$RELEASE_TAG" --json body --jq .body)
+          if ! grep -qE '^## Breaking changes[[:space:]]*$' <<< "$notes"; then
+            echo "::warning::Published notes have no Breaking changes section"
+          fi
+          if ! grep -qiE '^Direct upgrades?:' <<< "$notes"; then
+            echo "::warning::Published notes have no direct-upgrade line"
+          fi
+
+      - name: Generate and verify the release fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
+          sudo apt-get install -y sqlite3 libfaketime
+          faketime=$(dpkg -L libfaketime | grep '/libfaketime.so.1$')
+          identity=${RELEASE_TAG#v}
+          version=${identity%%+*}
+          archive=published/tightbeam-$version-linux-x86_64-${CANDIDATE_SHA::7}.tgz
+          python3 scripts/seed_release_fixture.py "$archive" "first/$identity.sql" --faketime "$faketime"
+          python3 scripts/seed_release_fixture.py "$archive" "second/$identity.sql" --faketime "$faketime"
+          cmp "first/$identity.sql" "second/$identity.sql"
+          sha256sum "first/$identity.sql" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-fixture-${{ inputs.release_tag }}
+          path: first/*.sql
+          if-no-files-found: error
+
+  propose-fixture:
+    needs: generate-fixture
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-fixture-${{ inputs.release_tag }}
+          path: fixture
+      - name: Open a fixture pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity=${RELEASE_TAG#v}
+          folder=test/fixtures/releases
+          branch="release-fixture/$identity"
+          mkdir -p "$folder"
+          cp "fixture/$identity.sql" "$folder/"
+          mapfile -t fixtures < <(find "$folder" -maxdepth 1 -name '*.sql' | sort -Vr)
+          for obsolete in "${fixtures[@]:4}"; do
+            rm -- "$obsolete"
+          done
+          git add -A "$folder"
+          if git diff --cached --quiet; then
+            echo "Release fixture is already on main." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch"
+            if ! git diff --cached --quiet FETCH_HEAD -- "$folder"; then
+              echo "::error::Existing fixture branch differs. Inspect it before retrying."
+              exit 1
+            fi
+          else
+            git switch -c "$branch"
+            git -c user.name='Tightbeam Release' -c user.email='release@example.invalid'               commit -m "Add database fixture for $RELEASE_TAG"
+            git push origin HEAD
+          fi
+          pr=$(gh pr list --head "$branch" --base main --state open --json url --jq '.[0].url // empty')
+          if [ -z "$pr" ]; then
+            pr=$(gh pr create --base main --head "$branch"               --title "Add database fixture for $RELEASE_TAG"               --body "Generated twice from the checksummed public release package. Review and merge through the normal PR route.")
+          fi
+          echo "Fixture PR $pr" >> "$GITHUB_STEP_SUMMARY"
+
+  installer-smoke:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Dispatch public installer smoke for the release and predecessor
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases"             --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' |
+            awk -v tag="$RELEASE_TAG" '$0 == tag { seen=1; next } seen && !printed { print; printed=1 }')
+          if [ -z "$previous" ]; then
+            echo "::error::Could not identify the previous stable release"
+            exit 1
+          fi
+          gh workflow run install-channels-smoke.yml --repo "$GITHUB_REPOSITORY" --ref main             -f release_tag="$RELEASE_TAG" -f previous_tag="$previous"

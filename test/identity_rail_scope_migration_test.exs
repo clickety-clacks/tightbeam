@@ -1028,6 +1028,11 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       "name = \"#{@archetype}\"\nskills = []\nwhere = [\"*\"]\n"
     )
 
+    File.write!(
+      Path.join(identity_dir, "archetypes/support-agent.toml"),
+      ~s(name = "support-agent"\nskills = []\nwhere = ["*"]\n)
+    )
+
     own_condition =
       ~s({ fact = "target.archetype", op = "eq", value = "#{@archetype}" })
 

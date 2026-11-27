@@ -119,6 +119,31 @@ defmodule Tightbeam.TurnFailureNotice do
     end
   end
 
+  @initial_admitted_sql """
+    SELECT 1 FROM wakes WHERE wakeId=?1 OR (wakeId>=?2 AND wakeId<?3)
+    UNION ALL
+    SELECT 1 FROM turns WHERE wakeId>=?2 AND wakeId<?3
+    UNION ALL
+    SELECT 1 FROM sessions recipient
+    WHERE EXISTS (
+      -- Two arms, so each seeks messages_client_dedupe on all three columns.
+      -- An OR inside one arm makes SQLite walk each session's messages.
+      SELECT 1 FROM messages
+      WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam'
+        AND clientMessageId=?4
+        AND substr(content,-length(?5))=?5
+      UNION ALL
+      SELECT 1 FROM messages
+      WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam'
+        AND clientMessageId>=?6 AND clientMessageId<?7
+        AND substr(content,-length(?5))=?5
+    )
+    LIMIT 1
+  """
+
+  @doc false
+  def initial_admitted_sql, do: @initial_admitted_sql
+
   # The first failure sequence is shared by all routes, independent of the
   # recipient. Existing receipt, question and bubble records are the evidence.
   def initial_admitted?(txn, seq, reason) do
@@ -127,20 +152,7 @@ defmodule Tightbeam.TurnFailureNotice do
 
     Txn.q(
       txn,
-      """
-      SELECT 1 FROM wakes WHERE wakeId=?1 OR (wakeId>=?2 AND wakeId<?3)
-      UNION ALL
-      SELECT 1 FROM turns WHERE wakeId>=?2 AND wakeId<?3
-      UNION ALL
-      SELECT 1 FROM sessions recipient
-      WHERE EXISTS (
-        SELECT 1 FROM messages
-        WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam'
-          AND (clientMessageId=?4 OR (clientMessageId>=?6 AND clientMessageId<?7))
-          AND substr(content,-length(?5))=?5
-      )
-      LIMIT 1
-      """,
+      @initial_admitted_sql,
       [
         "w_health_redelivery_parent_#{seq}",
         prefix,

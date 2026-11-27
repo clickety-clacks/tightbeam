@@ -26,6 +26,49 @@ defmodule Tightbeam.GuardGatewayFixture do
     end
   end
 
+  def make_model_unknown(db, session_key) do
+    {:ok, [[sidecar_trigger]]} =
+      Tightbeam.DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+      )
+
+    # Some current triggers read sessions by key. Suspend them during the
+    # deliberately incomplete table replacement and restore them afterwards.
+    {:ok, revision_triggers} =
+      Tightbeam.DB.query(db, """
+      SELECT name, sql FROM sqlite_schema
+      WHERE type='trigger' AND name GLOB 'execution_map_revision_*'
+        AND tbl_name IN ('sessions', 'turns', 'wakes', 'decision_requests')
+      ORDER BY name
+      """)
+
+    drop_revisions = Enum.map_join(revision_triggers, "\n", fn [name, _] -> "DROP TRIGGER #{name};" end)
+    restore_revisions = Enum.map_join(revision_triggers, ";\n", fn [_, sql] -> sql end)
+
+    :ok = Tightbeam.DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    try do
+      :ok =
+        Tightbeam.DB.execute(
+          db,
+          """
+          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
+          #{drop_revisions}
+          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_with_unknown RENAME TO sessions;
+          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
+          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          #{sidecar_trigger};
+          #{restore_revisions};
+          """
+        )
+    after
+      :ok = Tightbeam.DB.execute(db, "PRAGMA foreign_keys=ON")
+    end
+  end
+
   def run!(proof) do
     [payload, base] = System.argv()
     true = Path.expand(Application.app_dir(:tightbeam)) == Path.expand(payload)

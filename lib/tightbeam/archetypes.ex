@@ -680,6 +680,9 @@ defmodule Tightbeam.Archetypes do
     }
   end
 
+  @doc false
+  def manifest_name(manifest, path), do: Map.get(manifest, "name", Path.basename(path, ".toml"))
+
   defp validate!(manifest, path) do
     allowed =
       MapSet.new([
@@ -707,7 +710,7 @@ defmodule Tightbeam.Archetypes do
             "unknown top-level archetype keys in #{path}: #{unknown |> Enum.sort() |> Enum.join(", ")}"
     end
 
-    name = Map.get(manifest, "name", Path.basename(path, ".toml"))
+    name = manifest_name(manifest, path)
 
     unless is_binary(name) and name != "" and not String.contains?(name, "--") do
       raise ArgumentError, "archetype name must be non-empty and may not contain --: #{path}"

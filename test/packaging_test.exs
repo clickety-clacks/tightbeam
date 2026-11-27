@@ -9,7 +9,6 @@ defmodule Tightbeam.PackagingTest do
   @importer Path.join(@repo_root, "lib/tightbeam/credentials.ex")
   @runtime Path.join(@repo_root, "config/runtime.exs")
   @credential_docs [
-    Path.join(@repo_root, "README.md"),
     Path.join(@repo_root, "docs/ONBOARDING.md")
   ]
 

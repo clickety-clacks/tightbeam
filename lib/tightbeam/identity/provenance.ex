@@ -149,7 +149,8 @@ defmodule Tightbeam.Identity.Provenance do
     Path.join(parts)
   end
 
-  defp parse_receipt!(bytes, path) do
+  @doc false
+  def parse_receipt!(bytes, path) do
     receipt = Toml.decode!(bytes)
     name = Map.fetch!(receipt, "name")
     paths = Map.fetch!(receipt, "paths")
