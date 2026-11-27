@@ -3,9 +3,10 @@ defmodule Tightbeam.PeopleMessages do
 
   alias Tightbeam.{DB, Escalation, Id, Org, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.PeopleReadiness
 
   @mutations ~w(send update reply withdraw)
-  @relay_commands ~w(collect report event lookup)
+  @relay_commands ~w(collect report event lookup wait)
   @availability_refusals ~w(no_recipients decider_unreachable)
   @event_kinds ~w(chat answer seen reminder_not_seen reminder_not_acted joined left unreachable closed)
 
@@ -88,6 +89,9 @@ defmodule Tightbeam.PeopleMessages do
     cond do
       command in @relay_commands and session != relay ->
         error("forbidden", "people-message relay permission required")
+
+      command == "wait" ->
+        wait_for_records(db, params)
 
       true ->
         {:ok, result} =
@@ -325,7 +329,20 @@ defmodule Tightbeam.PeopleMessages do
       [id, message["conversation_id"], actor, key, JSON.encode!(request), JSON.encode!(record)]
     )
 
+    PeopleReadiness.changed_in_txn(txn)
     record
+  end
+
+  defp wait_for_records(db, params) do
+    timeout = Map.get(params, "timeout_ms", 15_000)
+
+    with :ok <-
+           check(
+             is_integer(timeout) and timeout in 0..20_000,
+             "timeout_ms must be between 0 and 20000"
+           ) do
+      PeopleReadiness.wait(timeout, fn -> DB.read_transaction!(db, &collect(&1, params)) end)
+    end
   end
 
   defp collect(txn, params) do
@@ -436,6 +453,7 @@ defmodule Tightbeam.PeopleMessages do
             wake
           ])
 
+          PeopleReadiness.changed_in_txn(txn)
           %{accepted: true, duplicate: false}
         else
           [_ | _] -> error("conflict", "earlier operation awaits its report")
