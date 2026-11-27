@@ -83,3 +83,107 @@ fn truncated_identity_is_never_authority() {
     }
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn writer_lock_probe() {
+    let Ok(root) = std::env::var("TB_TEST_WRITER_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let result = session_exec(&[
+        root.join("lease.identity").to_string_lossy().into_owned(),
+        "writer-lease".into(),
+        "--writer-lock".into(),
+        root.join("lease.lock").to_string_lossy().into_owned(),
+        "--writer-receipt".into(),
+        root.join("writer.done").to_string_lossy().into_owned(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "echo $$ > \"$1/ready\"; while test ! -e \"$1/release\"; do sleep 0.05; done".into(),
+        "lease-test".into(),
+        root.to_string_lossy().into_owned(),
+    ]);
+    std::process::exit(result.unwrap_or(1));
+}
+
+#[test]
+fn losing_the_launcher_keeps_the_owning_host_writer_excluded() {
+    let dir = std::env::temp_dir().join(format!("account-writer-test-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let root = dir.as_path();
+    let lock = root.join("lease.lock");
+    let mut launcher = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "harness_process::launch_tests::writer_lock_probe",
+        ])
+        .env("TB_TEST_WRITER_ROOT", root)
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !root.join("ready").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ready = root.join("ready").exists();
+    let kill = launcher.kill();
+    let settlement = launcher.wait();
+    let excluded = acquire_writer_lock(&lock).is_err();
+    fs::write(root.join("release"), "").unwrap();
+
+    assert!(ready, "writer never signaled readiness");
+    kill.unwrap();
+    settlement.unwrap();
+    assert!(excluded, "launcher loss released an active writer's lock");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if acquire_writer_lock(&lock).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer lock did not release"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("writer.done")).unwrap(),
+        "tightbeam-account-writer-v1\twriter-lease\t0\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn revoked_account_writer_cannot_start_late() {
+    let root =
+        std::env::temp_dir().join(format!("account-writer-revocation-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let lock = root.join("lease.lock");
+    let receipt = root.join("writer.done");
+    let args = vec![
+        lock.to_string_lossy().into_owned(),
+        receipt.to_string_lossy().into_owned(),
+    ];
+
+    let held = acquire_writer_lock(&lock).unwrap();
+    assert!(revoke_writer(&args).is_err());
+    assert!(!receipt.with_extension("revoked").exists());
+    drop(held);
+    revoke_writer(&args).unwrap();
+
+    fs::write(root.join("release"), "").unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "harness_process::launch_tests::writer_lock_probe",
+        ])
+        .env("TB_TEST_WRITER_ROOT", &root)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(!root.join("ready").exists());
+    assert!(!receipt.exists());
+    fs::remove_dir_all(root).unwrap();
+}

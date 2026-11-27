@@ -2164,6 +2164,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.ExecutionMapTurnVersions.ensure_schema(db)
     :ok = Tightbeam.ExecutionMapRevision.ensure_schema(db)
     :ok = Tightbeam.ProviderAccounts.ensure_schema(db)
+    :ok = Tightbeam.AccountWriter.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
