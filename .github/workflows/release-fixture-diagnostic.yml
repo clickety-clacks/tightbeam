@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4dc5874fe8632af8ff7077b3a9ecb0b2d6db5fb0
+          ref: b585baf37f1007ec66296aa505f86cc4ae42f9f9
           persist-credentials: false
       - uses: erlef/setup-beam@v1
         with:
@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Record tested versions
         run: |
-          test "$(git rev-parse HEAD)" = 4dc5874fe8632af8ff7077b3a9ecb0b2d6db5fb0
+          test "$(git rev-parse HEAD)" = b585baf37f1007ec66296aa505f86cc4ae42f9f9
           elixir --version
           rustc --version
           sha256sum test/fixtures/releases/0.1.17+5505.sql
