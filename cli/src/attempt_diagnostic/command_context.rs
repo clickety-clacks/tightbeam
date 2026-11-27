@@ -343,7 +343,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
     match command {
         IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
         PeopleMessage { verb, params } => match verb.as_str() {
-            "people-status" | "people-collect" | "people-lookup" => Read,
+            "people-status" | "people-collect" | "people-lookup" | "people-wait" => Read,
             "people-report" | "people-event" => WriteWithExistingIdempotency,
             _ => keyed_write(params["key"].as_str()),
         },
