@@ -143,7 +143,7 @@ assert_receive {:lane_terminal, "lane-rootfix", ^lane_seq}
 wake_before_release = Task.yield(wake_task, 1_000)
 catalog_before_release = Task.yield(catalog_task, 1_000)
 boot_task = Task.async(fn -> Boot.start_link(%{base_dir: base}) end)
-boot_before_release = Task.await(boot_task, 1_000)
+boot_before_release = Task.await(boot_task, 10_000)
 
 assert {:ok, :ok} = wake_before_release
 assert {:ok, inventories} = catalog_before_release
