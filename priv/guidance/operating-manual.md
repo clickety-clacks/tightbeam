@@ -87,6 +87,82 @@ Messages may repeat or overlap with signals you have already received and handle
 
 Use `tightbeam wake --prod-id <id>` for a prompt you may revise before delivery. A newer prod withdraws only an older queued, undelivered prod with the same id, recipient session and sending session, process or user; its text and delivery time may differ. Different ids, different senders, ordinary messages without an id, running turns and delivered messages remain separate. A sealed notice batch keeps its existing withdrawal limit; check the recorded cancellation result when timing matters.
 
+### Harklight in Tightbeam
+
+Use the native commands when your gateway is configured for Harklight. Send
+within your authority using the full sender ID granted to the gateway. Include
+the product in the title if the sender is shared. A committed send subscribes
+the originating Tightbeam session. Let Tightbeam wake that session for Chat
+and answers.
+
+```sh
+tightbeam harklight-send --session new --sender-id "$HARKLIGHT_SENDER" \
+  --type fyi --title "Product update" --body "The check passed."
+tightbeam harklight-send --session new --sender-id "$HARKLIGHT_SENDER" \
+  --type request --title "Choose the next step" --body "Select an option or reply." \
+  --choices-json '["Proceed", "Defer"]' --reply
+```
+
+An FYI offers Seen. A request with `--reply` and no choices asks an open
+question. Keep the returned `messageId` (the item ID), conversation `handle`,
+and `opId` when present. Use `tightbeam harklight-settle --op-id "$HARKLIGHT_OP_ID"`
+for an uncertain send. Use `tightbeam harklight-settle --message "$HARKLIGHT_ITEM"`
+for a recorded unresolved change. If settlement stays unresolved, retain the
+original operation ID and report its uncertainty before taking dependent action.
+
+```sh
+tightbeam harklight-revise --message "$HARKLIGHT_ITEM" \
+  --base-revision "$HARKLIGHT_REVISION" --title "Updated request"
+tightbeam harklight-retract --message "$HARKLIGHT_ITEM"
+tightbeam harklight-progress --message "$HARKLIGHT_ITEM" \
+  --percent 50 --stage "Verification"
+```
+
+Revise keeps the item and its subscription. A committed retract ends future
+wakes for that item. A new send with `--supersedes "$HARKLIGHT_ITEM"` replaces
+it only as confirmed by the returned effect for each target. An entry captured
+before the change can still be delivered. Create Progress with an FYI using
+`--progress 10 --progress-stage "Build"`. The Progress update retains ordinary
+uploaded attachments on the matched revision. Use the current revision's
+manifest when you need a file.
+
+If an operation is definitively unavailable, use a supported substitute only
+if its actual effects meet the task and you already have authority for those
+effects. Explain the substitution in the message and report the gap to the
+Harklight owner. Resolve an uncertain original operation before substituting.
+
+Use the conversation handle, item ID, and delivered Tightbeam event ID from
+the wake. Keep the originating session for reads, handoff, and responses. The
+event ID used by these commands is distinct from a Server entry ID or feed
+revision.
+
+```sh
+tightbeam harklight-read --handle "$HARKLIGHT_HANDLE"
+tightbeam harklight-ack --handle "$HARKLIGHT_HANDLE" --event "$HARKLIGHT_EVENT"
+tightbeam harklight-reply --handle "$HARKLIGHT_HANDLE" \
+  --request "$HARKLIGHT_ITEM" --in-reply-to "$HARKLIGHT_EVENT" \
+  --body "The request is complete."
+tightbeam harklight-result --handle "$HARKLIGHT_HANDLE" \
+  --request "$HARKLIGHT_ITEM" --in-reply-to "$HARKLIGHT_EVENT" --status received
+```
+
+Acknowledge Chat or an answer to record handoff. Reply to Chat on its event,
+including Chat delivered after an answer. For an answer or Seen event, report
+`applied` when the effect is established, `refused` when it cannot be applied,
+or `received` when confirming receipt alone. A conversation gives no new
+authority to act. Read closed lifecycle notices without acknowledging them.
+
+For an uncertain reply or result, repeat the same native command with unchanged
+inputs and its original `--op-id`. If an older Server definitively refuses late
+Chat as closed, keep that refusal with the original event. Answer with a new
+Tightbeam Harklight send only if you already have authority for that contact.
+
+If the gateway reports a paused or held feed, run
+`tightbeam harklight-retry --session "$HARKLIGHT_HANDLE"` and read its outcome.
+Escalate repeated failures with the recorded diagnostic. If multiple readers
+process the same changes, give each its own cursor. Deduplicate Chat by entry
+ID and terminal occurrences by item ID, state, and occurrence time.
+
 ## 3. Obligations have one holder, and a holder keeps them until they are disposed
 
 When a child assignment ends, choose whether to keep, park, or retire it based on
