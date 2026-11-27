@@ -1,5 +1,6 @@
 defmodule Tightbeam.OriginTest do
-  use ExUnit.Case, async: true
+  # The warning flag is node-wide, so this module must not overlap async tests.
+  use Tightbeam.TestCase, async: false
 
   import ExUnit.CaptureLog
 
@@ -34,12 +35,28 @@ defmodule Tightbeam.OriginTest do
   end
 
   test "an origin outside the class set classifies substrate and warns once" do
-    log = capture_log(fn -> assert Origin.started_by("operator:flynn") == "substrate" end)
+    warning_key = {Origin, :warned_unclassified}
+    previous_warning = :persistent_term.get(warning_key, :unset)
 
-    # The warning is per-node, so this file may or may not be the one that
-    # spends it. What is total is the classification: never nil, never a raise.
-    assert log == "" or log =~ "outside the closed class set"
+    on_exit(fn ->
+      case previous_warning do
+        :unset -> :persistent_term.erase(warning_key)
+        value -> :persistent_term.put(warning_key, value)
+      end
+    end)
 
-    for bad <- ["", "user:", nil, 7], do: assert(Origin.started_by(bad) == "substrate")
+    :persistent_term.erase(warning_key)
+
+    origin = "unknown:origin-warning-test"
+
+    log =
+      capture_log([colors: [enabled: false]], fn ->
+        for bad <- [origin, origin, "", "user:", nil, 7] do
+          assert Origin.started_by(bad) == "substrate"
+        end
+      end)
+
+    assert length(Regex.scan(~r/session origin .* is outside the closed class set;/, log)) == 1
+    assert log =~ "session origin #{inspect(origin)} is outside the closed class set;"
   end
 end
