@@ -1711,12 +1711,14 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemClose {
             identity,
             work_item_id,
-        } => Ok(request(
-            identity,
-            "work-item-close",
-            vec![],
-            vec![string_field("workItemId", work_item_id)],
-        )),
+            reason,
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = reason {
+                params.push(string_field("reason", value));
+            }
+            Ok(request(identity, "work-item-close", vec![], params))
+        }
         Command::WorkItemFail {
             identity,
             work_item_id,
@@ -6730,6 +6732,10 @@ mod tests {
         assert_eq!(
             body(&["work-item-close", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-close", "wi_1", "--reason", "superseded"]),
+            r#"{"verb":"work-item-close","params":{"workItemId":"wi_1","reason":"superseded"}}"#
         );
         assert_eq!(
             body(&[

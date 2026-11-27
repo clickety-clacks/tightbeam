@@ -20,6 +20,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
 
     {runtime, db} = restore(filename)
     original = preserved_rows(db)
+    original_columns = work_item_columns(db)
     schema_existed? = provider_schema?(db)
     if filename == @predecessor, do: refute(schema_existed?)
 
@@ -29,6 +30,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     assert {137, false, _output} = await_exit(port)
 
     assert provider_schema?(db) == schema_existed?
+    assert work_item_columns(db) == original_columns
     assert intact?(db)
     assert preserved_rows(db) == original
 
@@ -48,7 +50,12 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     on_exit(fn -> File.rm_rf!(tmp) end)
     runtime = Tightbeam.GuardRuntimeFixture.prepare!(tmp, @boot)
     File.mkdir_p!(runtime.base)
-    File.write!(Path.join(runtime.base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
+
+    File.write!(
+      Path.join(runtime.base, ".soak-arena"),
+      "tightbeam recovery acceptance arena v1\n"
+    )
+
     Tightbeam.RecoveryFixture.place_adapter!(runtime.base, seed_credential: false)
     db = Path.join(runtime.base, "state.db")
     dump = Path.join(@fixtures, filename)
@@ -62,7 +69,10 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
 
     env =
       runtime.env ++
-        [{"npm_config_offline", "true"}, {"TB_UPGRADE_INTERRUPT", if(interrupt?, do: "1", else: "0")}]
+        [
+          {"npm_config_offline", "true"},
+          {"TB_UPGRADE_INTERRUPT", if(interrupt?, do: "1", else: "0")}
+        ]
 
     Port.open({:spawn_executable, runtime.executable}, [
       :binary,
@@ -70,21 +80,26 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
       :stderr_to_stdout,
       {:line, 8192},
       {:args, runtime.args ++ [stamp]},
-      {:env, Enum.map(env, fn
-        {key, nil} -> {String.to_charlist(key), false}
-        {key, value} -> {String.to_charlist(key), String.to_charlist(value)}
-      end)}
+      {:env,
+       Enum.map(env, fn
+         {key, nil} -> {String.to_charlist(key), false}
+         {key, value} -> {String.to_charlist(key), String.to_charlist(value)}
+       end)}
     ])
   end
 
   defp await_checkpoint(port, output \\ []) do
     receive do
-      {^port, {:data, {:eol, "UPGRADE_TRANSACTION_OPEN " <> pid}}} -> pid
+      {^port, {:data, {:eol, "UPGRADE_TRANSACTION_OPEN " <> pid}}} ->
+        pid
+
       {^port, {:data, {_, line}}} ->
         await_checkpoint(port, [line | output])
 
       {^port, {:exit_status, status}} ->
-        flunk("first boot exited with #{status} before migration checkpoint:\n#{boot_log(output)}")
+        flunk(
+          "first boot exited with #{status} before migration checkpoint:\n#{boot_log(output)}"
+        )
     after
       30_000 -> flunk("first boot did not enter the migration transaction:\n#{boot_log(output)}")
     end
@@ -107,19 +122,45 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     assert {status, ready?} == {0, true}, "restart did not complete:\n#{output}"
     assert provider_schema?(db)
     assert intact?(db)
-    assert preserved_rows(db) == original
+    assert Map.delete(preserved_rows(db), :close_reasons) == Map.delete(original, :close_reasons)
+
+    expected_reasons =
+      original[:close_reasons] || sqlite(db, "SELECT NULL FROM work_items ORDER BY id")
+
+    assert sqlite(db, "SELECT closeReason FROM work_items ORDER BY id") == expected_reasons
   end
 
   defp intact?(db), do: sqlite(db, "PRAGMA integrity_check; PRAGMA foreign_key_check;") == "ok\n"
 
   defp provider_schema?(db) do
-    sqlite(db, "SELECT name FROM sqlite_schema WHERE name = 'provider_account_schema_stamp'") != ""
+    sqlite(db, "SELECT name FROM sqlite_schema WHERE name = 'provider_account_schema_stamp'") !=
+      ""
   end
 
   defp preserved_rows(db) do
-    # The provider migration adds schema without rewriting these seeded tables.
-    Map.new(@preserved_tables, fn table -> {table, sqlite(db, "SELECT * FROM #{table}")} end)
+    # Compare the predecessor's fields even after the nullable closeReason column is added.
+    fields =
+      db
+      |> sqlite(
+        "SELECT group_concat(name, ',') FROM pragma_table_info('work_items') WHERE name != 'closeReason'"
+      )
+      |> String.trim()
+
+    rows =
+      Map.new(@preserved_tables, fn
+        "work_items" -> {"work_items", sqlite(db, "SELECT #{fields} FROM work_items")}
+        table -> {table, sqlite(db, "SELECT * FROM #{table}")}
+      end)
+
+    if sqlite(db, "SELECT name FROM pragma_table_info('work_items') WHERE name='closeReason'") !=
+         "" do
+      Map.put(rows, :close_reasons, sqlite(db, "SELECT closeReason FROM work_items ORDER BY id"))
+    else
+      rows
+    end
   end
+
+  defp work_item_columns(db), do: sqlite(db, "PRAGMA table_info(work_items)")
 
   defp sqlite(db, statement) do
     assert {result, 0} = System.cmd("sqlite3", ["-batch", "-bail", db, statement])

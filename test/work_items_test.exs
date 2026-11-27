@@ -42,6 +42,82 @@ defmodule Tightbeam.WorkItemsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  test "close reasons are atomic, immutable on retry and reset on reopen", ctx do
+    owner = {:user, "flynn"}
+    item = create(ctx, owner, %{title: "Disposition reason"})
+
+    dispose = fn action, params ->
+      verb = "work-item-#{action}"
+
+      WorkItems.__handle__(
+        ctx.db,
+        verb,
+        call(verb, owner, Map.put(params, :work_item_id, item.id))
+      )
+    end
+
+    for reason <- ["", "failed", "Completed", 1, %{}] do
+      assert %{code: "invalid_close_reason"} = dispose.("close", %{reason: reason})
+    end
+
+    assert %{workItem: %{state: "closed", closeReason: "completed", rowVersion: version}} =
+             dispose.("close", %{reason: "completed"})
+
+    assert %{workItem: %{state: "closed", closeReason: "completed", rowVersion: ^version}} =
+             dispose.("close", %{reason: "canceled"})
+
+    assert %{workItems: [%{id: id, closeReason: "completed"}]} =
+             WorkItems.__handle__(ctx.db, "work-item-list", call("work-item-list", owner, %{}))
+
+    assert id == item.id
+    assert %{workItem: %{state: "open", closeReason: nil}} = dispose.("reopen", %{})
+
+    assert %{workItem: %{state: "closed", closeReason: "superseded"}} =
+             dispose.("close", %{reason: "superseded"})
+
+    assert %{workItem: %{state: "open", closeReason: nil}} = dispose.("reopen", %{})
+    assert %{workItem: %{state: "closed", closeReason: nil}} = dispose.("close", %{})
+
+    assert ["completed", nil, "superseded", nil, nil] ==
+             Enum.map(
+               Tightbeam.CausalEvents.for_job(ctx.db, item.id, []),
+               & &1.detail["closeReason"]
+             )
+  end
+
+  test "iceboxing and failure keep their separate reasons", ctx do
+    owner = {:user, "flynn"}
+    item = create(ctx, owner, %{title: "Paused then failed"})
+
+    for {verb, state, reason} <- [
+          {"work-item-icebox", "iceboxed", "waiting on a decision"},
+          {"work-item-fail", "failed", "cannot proceed"}
+        ] do
+      assert %{workItem: %{state: ^state, failReason: ^reason, closeReason: nil}} =
+               WorkItems.__handle__(
+                 ctx.db,
+                 verb,
+                 call(verb, owner, %{work_item_id: item.id, reason: reason})
+               )
+    end
+  end
+
+  test "an older work item table upgrades without inferring outcomes", ctx do
+    owner = {:user, "flynn"}
+    item = create(ctx, owner, %{title: "Previously closed"})
+    assert :ok = DB.execute(ctx.db, "ALTER TABLE work_items DROP COLUMN closeReason")
+    assert :ok = DB.execute(ctx.db, "UPDATE work_items SET state='closed'")
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert %{workItem: %{closeReason: nil, state: "closed"}} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-get",
+               call("work-item-get", owner, %{work_item_id: item.id})
+             )
+  end
+
   test "Firehose Gateway wake replay and cancel have one state notice", ctx do
     alias Tightbeam.Firehose.Hub
     hub = start_supervised!({Hub, name: Hub})
@@ -209,12 +285,15 @@ defmodule Tightbeam.WorkItemsTest do
     Enum.each(["close", "fail"], fn terminal ->
       item = create(ctx, {:user, "flynn"}, %{title: "Lifecycle item"})
 
+      terminal_reason =
+        if terminal == "close", do: "completed", else: "explicit fixture disposition"
+
       Enum.reduce(
         [
           {"work-item-update", %{title: "Changed lifecycle"}, "work_item.updated"},
           {"work-item-icebox", %{reason: "paused for review"}, "work_item.iceboxed"},
           {"work-item-reopen", %{}, "work_item.reopened"},
-          {"work-item-#{terminal}", %{reason: "explicit fixture disposition"},
+          {"work-item-#{terminal}", %{reason: terminal_reason},
            "work_item.#{if terminal == "close", do: "closed", else: "failed"}"}
         ],
         item.rowVersion,
@@ -230,6 +309,7 @@ defmodule Tightbeam.WorkItemsTest do
           Hub.delivered(hub, self())
           assert payload["id"] == item.id
           assert payload["rowVersion"] > previous_version
+          assert payload["closeReason"] == if(verb == "work-item-close", do: "completed")
 
           assert {:ok, [[version]]} =
                    DB.query(
@@ -477,6 +557,16 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert null_message =~ "NOT NULL constraint failed: work_items.ownerUserId"
 
+    for {state, reason} <- [{"open", "completed"}, {"closed", "failed"}] do
+      assert {:error, %DB.Error{message: message}} =
+               DB.query(db, "UPDATE work_items SET state=?1,closeReason=?2 WHERE id='wi_none'", [
+                 state,
+                 reason
+               ])
+
+      assert message =~ "CHECK constraint"
+    end
+
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(work_items)")
 
     assert Enum.map(columns, fn [_cid, name | _] -> name end) == [
@@ -495,7 +585,8 @@ defmodule Tightbeam.WorkItemsTest do
              "createdInTurnSeq",
              "createdContextKnown",
              "createdAt",
-             "deliveryOwnerSessionKey"
+             "deliveryOwnerSessionKey",
+             "closeReason"
            ]
 
     assert {:ok, assignment_columns} = DB.query(db, "PRAGMA table_info(assignments)")
