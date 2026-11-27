@@ -1,11 +1,22 @@
 import Config
 
 if config_env() != :test do
-  case System.get_env("TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL") do
+  case System.get_env("TIGHTBEAM_HARKLIGHT_ITEM_ID_CAPTURE") do
     nil -> :ok
-    "true" -> config :tightbeam, :execution_map_turn_backfill_enabled, true
-    "false" -> config :tightbeam, :execution_map_turn_backfill_enabled, false
-    _ -> raise ArgumentError, "TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL must be true or false"
+    "false" -> :ok
+    "true" -> config :tightbeam, :harklight_item_id_capture, true
+    _ -> raise ArgumentError, "TIGHTBEAM_HARKLIGHT_ITEM_ID_CAPTURE must be true or false"
+  end
+
+  case System.get_env("TIGHTBEAM_HARKLIGHT_ITEM_ID_MATCHING") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :harklight_item_id_matching, true
+    _ -> raise ArgumentError, "TIGHTBEAM_HARKLIGHT_ITEM_ID_MATCHING must be true or false"
+  end
+
+  if System.get_env("TIGHTBEAM_PI_TYPED_TURN_FAILURES") == "1" do
+    config :tightbeam, :pi_typed_turn_failures_enabled, true
   end
 
   case System.get_env("TIGHTBEAM_COORDINATOR_HOLD_DECISIONS") do
@@ -22,6 +33,40 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_SUBTREE_RULES must be true or false"
   end
 
+
+  case System.get_env("TIGHTBEAM_PEOPLE_MESSAGING") do
+    nil -> :ok
+    "true" -> config :tightbeam, :people_messaging_enabled, true
+    "false" -> config :tightbeam, :people_messaging_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_PEOPLE_MESSAGING must be true or false"
+  end
+
+  if relay = System.get_env("TIGHTBEAM_PEOPLE_MESSAGE_RELAY_SESSION") do
+    config :tightbeam, :people_message_relay_session, relay
+  end
+
+  case System.get_env("TIGHTBEAM_HARKLIGHT_PENDING_OPEN_ENABLED") do
+    nil -> :ok
+    "true" -> config :tightbeam, :harklight_pending_open_enabled, true
+    "false" -> config :tightbeam, :harklight_pending_open_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_HARKLIGHT_PENDING_OPEN_ENABLED must be true or false"
+  end
+
+  case System.get_env("TIGHTBEAM_HARKLIGHT_GROUPED_OUTAGE_NOTICES_ENABLED") do
+    nil ->
+      :ok
+
+    "true" ->
+      config :tightbeam, :harklight_grouped_outage_notices_enabled, true
+
+    "false" ->
+      config :tightbeam, :harklight_grouped_outage_notices_enabled, false
+
+    _ ->
+      raise ArgumentError,
+            "TIGHTBEAM_HARKLIGHT_GROUPED_OUTAGE_NOTICES_ENABLED must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end
@@ -31,6 +76,14 @@ if config_env() != :test do
   # strict decoding, base/source/target matching, and schema qualification.
   if value = System.get_env("TIGHTBEAM_LIVE_BASE_TRANSITION") do
     config :tightbeam, :live_base_guard, transition: value
+  end
+
+  if System.get_env("TIGHTBEAM_LOOPBACK_ONLY") == "true" do
+    config :tightbeam, :loopback_only, true
+  end
+
+  if System.get_env("TIGHTBEAM_DISABLE_LOCAL_CODEX") == "true" do
+    config :tightbeam, :disable_local_codex, true
   end
 
   if value = System.get_env("TIGHTBEAM_PORT") do

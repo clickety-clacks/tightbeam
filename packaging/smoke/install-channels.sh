@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/verify-setup-entrypoints.sh"
+
 repo=clickety-clacks/tightbeam
 target=${TARGET_TAG:-$(gh api "repos/$repo/releases/latest" --jq .tag_name)}
 previous=${PREVIOUS_TAG:?Set PREVIOUS_TAG to a published predecessor}
@@ -16,18 +18,21 @@ done
 mkdir "$scratch/home"
 tarball=$(npm pack "$scratch/$target/npm" --pack-destination "$scratch" --silent)
 npm publish "$scratch/$tarball" --dry-run --access public --tag latest
+prepare_setup_smoke "$scratch"
 export TIGHTBEAM_BASE_DIR="$scratch/state"
-if HOME="$scratch/home" npx --yes --package "$scratch/$tarball" tightbeam --mode quick --dry-run >"$scratch/npx.log" 2>&1; then
-  cat "$scratch/npx.log"
-else
-  cat "$scratch/npx.log"
-  # Published releases predating setup can prove install and invocation only.
-  case "$target" in
-    v0.1.15+*|v0.1.16+*|v0.1.17+*) grep -F 'unknown command: setup' "$scratch/npx.log" ;;
-    *) exit 1 ;;
-  esac
-fi
+npx_status=0
+HOME="$scratch/home" npx --yes --package "$scratch/$tarball" tightbeam --mode quick --dry-run >"$scratch/npx.log" 2>&1 || npx_status=$?
 binary=$(find "$scratch/home/.local/share/tightbeam-install" -path '*/bin/tightbeam' -type f)
+payload=$(dirname "$(dirname "$binary")")
+cat "$scratch/npx.log"
+if [ -f "$payload/setup-build.json" ]; then
+  test "$npx_status" -eq 0
+  assert_setup_plan "$scratch/npx.log" "$TIGHTBEAM_BASE_DIR"
+else
+  test "$npx_status" -ne 0
+  grep -F 'unknown command: setup' "$scratch/npx.log"
+  echo "The target archive predates setup. This run verifies package installation only."
+fi
 release_version=${target#v}
 "$binary" --version | grep -F "${release_version%%+*}"
 
@@ -70,6 +75,10 @@ brew test "$formula"
 new_prefix=$(cd "$(brew --prefix --installed "$formula")" && pwd -P)
 test "$old_prefix" != "$new_prefix"
 "$new_prefix/bin/tightbeam" --version | grep -F "${release_version%%+*}"
+if [ -f "$payload/setup-build.json" ]; then
+  cmp "$payload/setup-build.json" "$new_prefix/libexec/setup-build.json"
+  verify_brew_setup "$new_prefix" "$scratch"
+fi
 
 ruby -pi -e 'gsub(/sha256 "[a-f0-9]{64}"/, "sha256 \"" + "0" * 64 + "\"")' \
   "$(brew --repo "$tap")/Formula/tightbeam.rb"

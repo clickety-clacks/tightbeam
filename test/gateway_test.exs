@@ -62,6 +62,10 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harklight-send harklight-revise harklight-progress harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-retry harklight-follow harklight-briefings-catchup)
 
+    expected =
+      expected ++
+        ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup people-wait)
+
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
     expected =
@@ -7343,21 +7347,25 @@ defmodule Tightbeam.GatewayTest do
 
     # Registration provisions the satellite's operator endpoint through the same
     # runner; only the credential probe is being failed here.
-    sh = fn
-      ["ssh" | _] = command ->
-        if "mkdir" in command, do: {"", 0}, else: credential_probe(parent, command)
+    runner = fn registration ->
+      fn
+        ["ssh" | _] = command ->
+          if "mkdir" in command,
+            do: {"", 0},
+            else: credential_probe(parent, registration, command)
 
-      ["rsync" | _] ->
-        {"", 0}
+        ["rsync" | _] ->
+          {"", 0}
 
-      command ->
-        credential_probe(parent, command)
+        command ->
+          credential_probe(parent, registration, command)
+      end
     end
 
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.delete(:credential_status)
-      |> Map.put(:sh, sh)
+      |> Map.put(:sh, runner.(:initial))
 
     start_runtime_supervisor()
     handlers = Gateway.handlers(config)
@@ -7377,7 +7385,7 @@ defmodule Tightbeam.GatewayTest do
     first_pid = GenServer.whereis(server)
     assert is_pid(first_pid)
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
-    first_commands = collect_credential_commands([])
+    first_commands = collect_credential_commands(:initial, [])
     assert first_commands != []
     assert Enum.all?(first_commands, &(Enum.join(&1, " ") =~ "/remote/tb"))
 
@@ -7417,8 +7425,10 @@ defmodule Tightbeam.GatewayTest do
       :ok = :sys.resume(first_pid)
     end
 
+    replacement_handlers = Gateway.handlers(Map.put(config, :sh, runner.(:replacement)))
+
     assert %{host: %{"host" => ^machine}} =
-             handlers["register-host"].(%{
+             replacement_handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{
@@ -7433,7 +7443,7 @@ defmodule Tightbeam.GatewayTest do
     refute second_pid == first_pid
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
     refute File.exists?(probe_ssh <> ".executed")
-    second_commands = collect_credential_commands([])
+    second_commands = collect_credential_commands(:replacement, [])
     assert second_commands != []
     assert Enum.all?(second_commands, &(Enum.join(&1, " ") =~ "/remote/new-tb"))
 
@@ -17668,8 +17678,8 @@ defmodule Tightbeam.GatewayTest do
   defp assert_process_mailbox(name, minimum, 0),
     do: flunk("#{inspect(name)} mailbox did not reach #{minimum} queued message(s)")
 
-  defp credential_probe(parent, command) do
-    send(parent, {:credential_command, command})
+  defp credential_probe(parent, registration, command) do
+    send(parent, {:credential_command, registration, command})
 
     case Enum.take(command, -3) do
       ["test", operator, path] when operator in ["-d", "-x"] ->
@@ -17687,9 +17697,10 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defp collect_credential_commands(commands) do
+  defp collect_credential_commands(registration, commands) do
     receive do
-      {:credential_command, command} -> collect_credential_commands([command | commands])
+      {:credential_command, ^registration, command} ->
+        collect_credential_commands(registration, [command | commands])
     after
       0 -> Enum.reverse(commands)
     end

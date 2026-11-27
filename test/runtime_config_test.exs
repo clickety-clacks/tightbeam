@@ -78,6 +78,24 @@ defmodule Tightbeam.RuntimeConfigTest do
     refute Keyword.has_key?(Keyword.fetch!(production, :tightbeam), :effort_checkin_horizon_ms)
   end
 
+  test "Pi typed turn failures require an explicit runtime opt-in outside test" do
+    key = "TIGHTBEAM_PI_TYPED_TURN_FAILURES"
+    previous = System.get_env(key)
+
+    on_exit(fn ->
+      if previous, do: System.put_env(key, previous), else: System.delete_env(key)
+    end)
+
+    System.put_env(key, "0")
+    disabled = Config.Reader.read!("config/runtime.exs", env: :prod)
+    refute Keyword.has_key?(Keyword.fetch!(disabled, :tightbeam), :pi_typed_turn_failures_enabled)
+
+    System.put_env(key, "1")
+    enabled = Config.Reader.read!("config/runtime.exs", env: :prod)
+    assert Keyword.fetch!(Keyword.fetch!(enabled, :tightbeam), :pi_typed_turn_failures_enabled)
+    assert Config.Reader.read!("config/runtime.exs", env: :test) == []
+  end
+
   test "the removed inactivity reminder has no runtime interval setting" do
     {Tightbeam.Boot, config} =
       Enum.find(Tightbeam.Application.children(), &match?({Tightbeam.Boot, _}, &1))

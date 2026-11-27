@@ -450,6 +450,10 @@ function rulePreflight(candidate, baseDir) {
       if (/^(TIGHTBEAM_|RELEASE_|ERL_|ERTS_)/.test(name)) delete env[name];
     }
     env.TIGHTBEAM_BASE_DIR = scratch;
+    // Read only the conversion marker from the installed database. All identity
+    // conversion and law loading run against scratch files.
+    const stateDatabase = path.join(baseDir, 'state.db');
+    env.TIGHTBEAM_RULE_PREFLIGHT_DB = fs.existsSync(stateDatabase) ? stateDatabase : '';
     env.TIGHTBEAM_PORT = '0';
     const timeoutMs = 10_000;
     const result = spawnSync(

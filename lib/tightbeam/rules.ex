@@ -2340,7 +2340,8 @@ defmodule Tightbeam.Rules do
     rules ++ policies ++ reactions
   end
 
-  defp retired_policy?(policy),
+  @doc false
+  def retired_policy?(policy),
     do:
       is_map(policy) and
         Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
@@ -3059,6 +3060,12 @@ defmodule Tightbeam.Rules do
 
   defp valid_verdict_kind?(_kind), do: false
 
+  @doc false
+  def fact_type(fact), do: Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+
+  @doc false
+  def archetype_fact?(fact), do: MapSet.member?(@archetype_facts, fact)
+
   defp validate_condition!(condition, index, fail) do
     unknown = unknown_keys(condition, @condition_keys)
 
@@ -3081,7 +3088,7 @@ defmodule Tightbeam.Rules do
       end
     end
 
-    type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+    type = fact_type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
     unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")

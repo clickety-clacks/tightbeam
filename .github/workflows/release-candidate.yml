@@ -157,7 +157,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Put the in-repo harness CLI on PATH
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
@@ -346,6 +346,11 @@ jobs:
           sh packaging/assemble.sh
           package=$(find _build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz')
           [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
+          if grep -Fq setup-build.json packaging/assemble.sh; then
+            sh packaging/verify-setup-build.sh "$package" "$(git rev-parse HEAD)"
+          else
+            echo "The selected candidate predates setup build identity. Skipped the setup stamp check." >> "$GITHUB_STEP_SUMMARY"
+          fi
           mkdir -p "stage/packages/$PLATFORM" stage/toolchains
           python3 packaging/gateway-smoke.py "$package" > package-smoke.txt
           cat package-smoke.txt
@@ -440,11 +445,19 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
+      - uses: actions/setup-node@v4
+        if: needs.metadata.outputs.candidate_branch == 'main'
+        with:
+          node-version: "24"
+
       - name: Dry-run the install channel payloads
         if: needs.metadata.outputs.candidate_branch == 'main'
         run: |
           release_tag=$(jq -er .tag candidate-stage/release-provenance.json)
           node packaging/prepare-install-channels.mjs "$release_tag" candidate-stage/SHA256SUMS "$RUNNER_TEMP/install-channels"
+          if [ -f packaging/smoke/verify-setup-entrypoints.sh ]; then
+            jq -e '.engines.node == ">=24"' "$RUNNER_TEMP/install-channels/npm/package.json" >/dev/null
+          fi
           npm pack --dry-run "$RUNNER_TEMP/install-channels/npm"
 
       # Neither candidate artifact exists unless metadata, both test jobs, and both package jobs passed.
@@ -466,3 +479,41 @@ jobs:
           path: candidate-stage/
           retention-days: 90
           if-no-files-found: error
+
+  installer-setup:
+    needs: [metadata, proof]
+    if: needs.metadata.outputs.candidate_branch == 'main'
+    runs-on: ubuntu-24.04
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.candidate_sha }}
+          persist-credentials: false
+
+      - name: Report legacy candidate verification
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') == '' }}
+        run: echo "The selected candidate predates setup entry-point verification." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/download-artifact@v4
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+        with:
+          name: release-candidate-stage-${{ needs.metadata.outputs.candidate_sha }}
+          path: candidate-stage
+
+      - uses: actions/setup-node@v4
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+        with:
+          node-version: "24"
+
+      - uses: Homebrew/actions/setup-homebrew@main
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+
+      - name: Verify setup through the staged npm and Homebrew commands
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+        shell: bash
+        run: |
+          source packaging/smoke/verify-setup-entrypoints.sh
+          verify_staged_setup_entrypoints "$PWD/candidate-stage"

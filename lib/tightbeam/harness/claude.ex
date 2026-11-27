@@ -218,6 +218,9 @@ defmodule Tightbeam.Harness.Claude do
     do: Support.owned_home_entries("settings.json")
 
   @impl true
+  def conversation_directory, do: "projects"
+
+  @impl true
   def reconcile_home(target, home, desired) do
     # THE FABLE FIX (ops-hardening-v1 §3): claude's offered-model list is
     # environment-dependent — the same home and auth offers fable at a cwd whose

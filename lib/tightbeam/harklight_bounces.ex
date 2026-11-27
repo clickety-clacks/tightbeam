@@ -25,7 +25,7 @@ defmodule Tightbeam.HarklightBounces do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, HarklightSend, Id, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{DB, HarklightItemIds, HarklightSend, Id, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   # One wake carries at most this many bounces. A longer list is several wakes
@@ -241,8 +241,8 @@ defmodule Tightbeam.HarklightBounces do
 
   # Only a message Tightbeam sent (its own request record) on a conversation of
   # this host: `:foreign` is not ours, `:elsewhere` is ours but another host's.
-  # Without the message (a live advisory) the message ID must match exactly; a
-  # message migrated from before 0.2 is then left to the read path.
+  # A live advisory can resolve a migrated item through the saved binding.
+  # In compatibility mode, migrated items are resolved on the read path.
   defp registration(txn, candidate) do
     item = candidate.item || %{}
 
@@ -251,15 +251,27 @@ defmodule Tightbeam.HarklightBounces do
       |> Enum.filter(fn [_, sender | _] -> is_nil(item["sender"]) or sender == item["sender"] end)
 
     rows =
-      case {direct, item["legacy_message_id"], item["sender"]} do
-        {[], legacy, sender} when is_binary(legacy) and is_binary(sender) ->
-          Txn.q(txn, @registration_sql <> " WHERE r.senderId=?1 AND r.messageId=?2", [
-            sender,
-            legacy
-          ])
+      if HarklightItemIds.enabled?() do
+        case {direct, HarklightItemIds.migrated_in_txn(txn, candidate.item_id)} do
+          {[], {:ok, handle, sender, message_id}} ->
+            Txn.q(
+              txn,
+              @registration_sql <> " WHERE r.handle=?1 AND r.senderId=?2 AND r.messageId=?3",
+              [
+                handle,
+                sender,
+                message_id
+              ]
+            )
+            |> Enum.filter(fn [_, sender | _] ->
+              is_nil(item["sender"]) or sender == item["sender"]
+            end)
 
-        {rows, _, _} ->
-          rows
+          {rows, _} ->
+            rows
+        end
+      else
+        legacy_registration(txn, direct, item)
       end
 
     case rows do
@@ -284,6 +296,19 @@ defmodule Tightbeam.HarklightBounces do
 
       _ ->
         :foreign
+    end
+  end
+
+  defp legacy_registration(txn, direct, item) do
+    case {direct, item["legacy_message_id"], item["sender"]} do
+      {[], legacy, sender} when is_binary(legacy) and is_binary(sender) ->
+        Txn.q(txn, @registration_sql <> " WHERE r.senderId=?1 AND r.messageId=?2", [
+          sender,
+          legacy
+        ])
+
+      {rows, _, _} ->
+        rows
     end
   end
 
@@ -472,10 +497,28 @@ defmodule Tightbeam.HarklightBounces do
   transaction. Marks nothing Delivered, reopens nothing.
   """
   def read_pass(db, opts \\ []) do
+    with {:ok, remaining} <- HarklightItemIds.capture_status(db),
+         {:ok, result} <- read_registered(db, opts, remaining),
+         {:ok, after_read} <- HarklightItemIds.capture_status(db) do
+      if HarklightItemIds.capture_enabled?() do
+        Logger.info("Harklight item ID capture remaining=#{after_read}")
+      end
+
+      {:ok, result}
+    end
+  end
+
+  defp read_registered(db, opts, remaining) do
     with true <- registered_requests?(db) || :idle,
          {:ok, runner} <- HarklightSend.runner(opts),
-         {:ok, candidates} <- collect(runner, nil, MapSet.new(), []) do
-      DB.transaction(db, fn txn -> process_in_txn(txn, candidates, :read) end)
+         {:ok, {candidates, legacy}} <-
+           HarklightItemIds.read_sent(runner, {[], []}, fn messages, acc ->
+             collect_messages(messages, acc, remaining > 0)
+           end) do
+      DB.transaction(db, fn txn ->
+        :ok = HarklightItemIds.import_in_txn(txn, legacy)
+        process_in_txn(txn, candidates, :read)
+      end)
     else
       :idle -> {:ok, :idle}
       {:error, reason} -> {:error, reason}
@@ -486,32 +529,9 @@ defmodule Tightbeam.HarklightBounces do
     match?({:ok, [[1]]}, DB.query(db, "SELECT 1 FROM harklight_wake_requests LIMIT 1"))
   end
 
-  defp collect(runner, token, seen, acc) do
-    argv = if token, do: ["messages", "--page", token], else: ["messages"]
-
-    case read_page(runner, argv) do
-      {:ok, %{"messages" => messages} = page} when is_list(messages) ->
-        acc = Enum.reduce(messages, acc, &message_candidates/2)
-
-        case page["next_page"] do
-          next when next in [nil, ""] ->
-            {:ok, acc}
-
-          next when is_binary(next) ->
-            if MapSet.member?(seen, next),
-              do: {:error, "harklight_messages_paging_invalid"},
-              else: collect(runner, next, MapSet.put(seen, next), acc)
-
-          _ ->
-            {:error, "harklight_messages_paging_invalid"}
-        end
-
-      {:ok, _} ->
-        {:error, "harklight_messages_unexpected"}
-
-      error ->
-        error
-    end
+  defp collect_messages(messages, {candidates, legacy}, capture?) do
+    legacy = if capture?, do: HarklightItemIds.collect_legacy(messages, legacy), else: legacy
+    {Enum.reduce(messages, candidates, &message_candidates/2), legacy}
   end
 
   defp message_candidates(%{"item_id" => id, "advisories" => advisories} = message, acc)
@@ -526,25 +546,6 @@ defmodule Tightbeam.HarklightBounces do
   end
 
   defp message_candidates(_message, acc), do: acc
-
-  defp read_page(runner, argv) do
-    case runner.(argv) do
-      {output, 0} ->
-        output
-        |> String.split("\n", trim: true)
-        |> Enum.find_value({:error, "harklight_messages_unexpected"}, fn line ->
-          case JSON.decode(line) do
-            {:ok, %{"messages" => _} = page} -> {:ok, page}
-            _ -> nil
-          end
-        end)
-
-      {_output, _status} ->
-        {:error, "harklight_messages_unavailable"}
-    end
-  rescue
-    _ -> {:error, "harklight_messages_unavailable"}
-  end
 
   ## Acknowledgment
 

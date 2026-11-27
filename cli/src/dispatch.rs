@@ -574,6 +574,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifacts", vec![], params))
         }
+        Command::PeopleMessage { verb, params } => Ok(RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
+            path: "/agent/dispatch",
+            body_json: serde_json::json!({ "verb": verb, "params": params }).to_string(),
+        }),
         Command::HarklightSend {
             identity,
             session,
@@ -1596,18 +1602,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             filters,
             tree,
-            limit,
-            after,
         } => {
             let mut params = filter_params(filters);
             if *tree {
                 params.push("\"tree\":true".to_owned());
-            }
-            if let Some(limit) = limit {
-                params.push(format!("\"limit\":{limit}"));
-            }
-            if let Some(after) = after {
-                params.push(string_field("after", after));
             }
             Ok(request(identity, "execution-map", vec![], params))
         }
@@ -4406,6 +4404,7 @@ fn local_harklight_identity_refusal(
 
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
+        Command::PeopleMessage { .. } => Some(&Identity::Session),
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::FactDemand { identity, .. }
