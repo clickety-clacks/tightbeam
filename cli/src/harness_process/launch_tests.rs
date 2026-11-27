@@ -100,11 +100,47 @@ fn writer_lock_probe() {
         "--".into(),
         "/bin/sh".into(),
         "-c".into(),
-        "echo $$ > \"$1/ready\"; while test ! -e \"$1/release\"; do sleep 0.05; done".into(),
+        "test -e \"/dev/fd/${TIGHTBEAM_ACCOUNT_WRITER_FD:?}\" || exit 4; echo $$ > \"$1/ready\"; while test ! -e \"$1/release\"; do sleep 0.05; done".into(),
         "lease-test".into(),
         root.to_string_lossy().into_owned(),
     ]);
     std::process::exit(result.unwrap_or(1));
+}
+
+#[test]
+fn ordinary_launch_probe() {
+    let Ok(identity) = std::env::var("TB_TEST_ORDINARY_LAUNCH_IDENTITY") else {
+        return;
+    };
+    let result = session_exec(&[
+        identity,
+        "ordinary-fixture".into(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "test -z \"${TIGHTBEAM_ACCOUNT_WRITER_FD+x}\"".into(),
+    ]);
+    std::process::exit(result.unwrap_or(1));
+}
+
+#[test]
+fn ordinary_launch_removes_inherited_writer_context() {
+    let root = std::env::temp_dir().join(format!("ordinary-writer-context-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "harness_process::launch_tests::ordinary_launch_probe",
+        ])
+        .env(
+            "TB_TEST_ORDINARY_LAUNCH_IDENTITY",
+            root.join("launch.identity"),
+        )
+        .env("TIGHTBEAM_ACCOUNT_WRITER_FD", "31337")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
