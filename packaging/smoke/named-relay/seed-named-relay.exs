@@ -25,6 +25,7 @@ for role <- ~w(sender relay) do
 end
 
 {:ok, _} = DB.query(
+  DB,
   "INSERT INTO work_items (id,title,ownerUserId,createdByUser,createdAt) VALUES (?1,'Fixture',?2,?2,1)",
   [work, person]
 )
