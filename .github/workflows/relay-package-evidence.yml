@@ -1,6 +1,8 @@
 name: optional relay package evidence
 
 on:
+  push:
+    branches: [evidence/optional-group-relay]
   pull_request:
     paths:
       - ".github/workflows/relay-package-evidence.yml"
@@ -15,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: relay-package-${{ github.event.pull_request.number }}
+  group: relay-package-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -46,7 +48,7 @@ jobs:
 
       - name: Assemble and verify the standard package
         env:
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"

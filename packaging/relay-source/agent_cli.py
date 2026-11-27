@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+from typing import Callable
 
 
 class AgentCLI:
@@ -24,13 +25,24 @@ class AgentCLI:
             raise RuntimeError(f"Harklight Agent {args[0]} did not return one successful result")
         return rows[0]
 
-    def mutation(self, journal_id: str, operation_id: str, args: list[str], *, prepare: bool = False) -> dict:
+    def supports_groups(self) -> bool:
+        result = subprocess.run(
+            [*self.argv, "read", "--help"], capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0 and any(
+            line.strip().split()[:1] == ["--groups"] for line in result.stdout.splitlines()
+        )
+
+    def mutation(self, journal_id: str, operation_id: str, args: list[str], *,
+                 prepare: bool = False, available: Callable[[], bool] | None = None) -> dict:
         status, rows = self.run(
             "retry", "--op-id", operation_id, "--journal-id", journal_id,
         )
         if status == 1 and len(rows) == 1 and rows[0] == {
             "kind": "operation_absent", "op_id": operation_id, "journal_id": journal_id,
         }:
+            if available is not None and not available():
+                return {"kind": "refused", "op_id": operation_id, "status": 400, "error": "unsupported"}
             if prepare:
                 status, rows = self.run(*args, "--op-id", operation_id, "--prepare")
                 if status == 0 and len(rows) == 1 and rows[0].get("kind") == "prepared":

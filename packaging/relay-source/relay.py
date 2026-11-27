@@ -15,7 +15,7 @@ import uuid
 from addresses import Addresses
 from agent_cli import AgentCLI
 from harklight_agent import HarklightAgent
-from outgoing import delivery_outcomes, prepare_send
+from outgoing import delivery_outcomes, is_group_address, prepare_send
 from projection import event_for
 from relay_state import RelayState
 from relay_watch import RelayWatch
@@ -38,8 +38,13 @@ class Relay:
             return {"refusal": {"code": "conversation_undelivered",
                                 "message": "The initial send did not open a conversation."}}
         request = {"kind": kind, **binding, "body": record["body"]}
+        if any(is_group_address(address) for address in record["addresses"]):
+            request["groups"] = True
         if kind == "update":
-            current = self.agent.read_message(binding["item_id"])
+            if request.get("groups"):
+                current = self.agent.read_message(binding["item_id"], groups=True)
+            else:
+                current = self.agent.read_message(binding["item_id"])
             request["base_revision"] = current["revision"]
             message = {**current["message"], "title": record["title"], "body": record["body"]}
             if record["answer_rule"] and record["choices"] is not None:
@@ -204,6 +209,7 @@ class Relay:
                 self.state.prepare_event({
                     "event": event,
                     "checkpoint": checkpoint,
+                    "groups": bool((checkpoint or {}).get("groups")),
                     "receipt_id": (
                         str(uuid.uuid4()) if event["kind"] in {"chat", "answer"}
                         and change.get("pending") is not False else None

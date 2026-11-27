@@ -5,7 +5,10 @@ existing relay installation alone. Run it only from a dedicated operator
 account with Tightbeam relay permissions and an enrolled, supported
 Harklight Agent. The relay uses Python 3.10 or later and its standard library.
 Named-person messaging was verified with Harklight Agent 0.2.10 and Server
-0.2.34. Use the compatible Tightbeam CLI and gateway with the authenticated
+0.2.34 on the named-person tree. This group-capable package is an isolated
+proof only. Group operations require the compatible Agent group command
+surface. A released group-compatible Agent has yet to be selected for this
+package. Use the compatible Tightbeam CLI and gateway with the authenticated
 people-wait readiness capability. Keep both
 the normal tightbeam and harklight-agent executables on the relay's PATH.
 

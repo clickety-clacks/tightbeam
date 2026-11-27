@@ -160,6 +160,8 @@ class RelayState:
             if receipt is not None:
                 event = receipt["event"]
                 key = self.event_key(event)
+                if receipt.get("groups"):
+                    event = {**event, "groups": True}
                 self.db.execute(
                     "INSERT OR IGNORE INTO receipts VALUES (?, ?, ?)",
                     (key, receipt["receipt_id"], json.dumps(event)),

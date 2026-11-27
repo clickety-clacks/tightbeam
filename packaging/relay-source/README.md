@@ -28,9 +28,12 @@ It holds pending operation IDs and requests, the conversation bindings, the
 Agent journal, and the last accepted feed position. Preserve that state
 with its connection and sender.
 
-The shared-messaging interface supports named recipients in this release
-of the relay. Group addresses receive an unsupported delivery report until
-the Harklight groups interface is available. If the service is stopped,
+Address named recipients with `user:<user ID>`. For a group, use one
+`group:<local name>` or `group-id:<opaque ID>` address. The name form applies
+to self-hosted Harklight. Hosted group sends use the opaque ID. The Server
+resolves the selector and authorizes the send. Tightbeam receives one
+outcome for the group address. Both the Server and Agent must support
+groups for a new group send. If the service is stopped,
 Tightbeam keeps waiting records for its next run. Harklight's pending
 baseline recovers chat and answers after a cursor expires. Historical Seen
 transitions may be unavailable after Server feed compaction.
