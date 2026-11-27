@@ -49,6 +49,38 @@ defmodule Tightbeam.RowReactions.Expression do
     end)
   end
 
+  def archetype_comparisons(expression) do
+    expression
+    |> terms()
+    |> Enum.flat_map(fn
+      %{"op" => op, "args" => [left, right | _]} when op in ~w(eq ne in not_in) ->
+        case {left, right} do
+          {%{"ref" => name}, value} -> archetype_comparison(name, op, value)
+          {value, %{"ref" => name}} when op in ~w(eq ne) -> archetype_comparison(name, op, value)
+          _ -> []
+        end
+
+      _ ->
+        []
+    end)
+  end
+
+  def fact_references(expression) do
+    for %{"ref" => "facts." <> path} <- terms(expression), do: path
+  end
+
+  defp terms(value) when is_map(value),
+    do: [value | Enum.flat_map(Map.values(value), &terms/1)]
+
+  defp terms(value) when is_list(value), do: Enum.flat_map(value, &terms/1)
+  defp terms(_value), do: []
+
+  defp archetype_comparison(name, op, value) when is_binary(name) do
+    if String.ends_with?(name, ".archetype"), do: [{name, op, value}], else: []
+  end
+
+  defp archetype_comparison(_name, _op, _value), do: []
+
   def evaluate(%{"ref" => path}, facts), do: get_in(facts, String.split(path, "."))
 
   def evaluate(%{"op" => "if", "args" => [condition, yes, no]}, facts),
