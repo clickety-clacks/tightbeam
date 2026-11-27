@@ -7675,6 +7675,7 @@ mod tests {
                 "decision-request",
                 "decision-requests",
                 "dispatch",
+                "setup",
                 "doctor",
                 "session-diagnose",
                 "harness-process",

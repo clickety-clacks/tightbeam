@@ -230,6 +230,10 @@ jobs:
       - name: mix test
         run: scripts/verify_mix.sh
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: cargo test
         working-directory: cli
         run: cargo test
