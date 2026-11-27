@@ -142,6 +142,7 @@ defmodule Tightbeam.HarnessProcess do
 
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
     dedicated_cursor? = Keyword.get(opts, :cursor_execution_identity, false)
+    writer_lock = Keyword.get(opts, :account_writer_lock)
 
     preparation_boot =
       if is_nil(ssh) do
@@ -159,58 +160,67 @@ defmodule Tightbeam.HarnessProcess do
       if dedicated_cursor?, do: File.chmod!(Path.dirname(identity_path), 0o2770)
     end
 
+    if target = Keyword.get(opts, :account_writer_target) do
+      Tightbeam.AccountWriter.reconcile(db, key_name(key), target, Keyword.fetch!(opts, :home))
+    end
+
     case DB.transaction(db, fn txn ->
-           case DB.Txn.q(
-                  txn,
-                  """
-                  SELECT 1 FROM harness_processes
-                   WHERE adapterKey = ?1
-                     AND state IN ('launching','running','park_requested','kill_failed')
-                     AND resolvedAt IS NULL
-                  UNION ALL
-                  SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
-                  LIMIT 1
-                  """,
-                  [key_name(key)]
-                ) do
-             [] ->
-               [[launch_sequence]] =
+           if writer_lock && Tightbeam.AccountWriter.reserved?(txn, key_name(key)) do
+             :writer_active
+           else
+             case DB.Txn.q(
+                    txn,
+                    """
+                    SELECT 1 FROM harness_processes
+                     WHERE adapterKey = ?1
+                       AND state IN ('launching','running','park_requested','kill_failed')
+                       AND resolvedAt IS NULL
+                    UNION ALL
+                    SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
+                    LIMIT 1
+                    """,
+                    [key_name(key)]
+                  ) do
+               [] ->
+                 [[launch_sequence]] =
+                   DB.Txn.q(
+                     txn,
+                     "SELECT COALESCE(MAX(launchSequence), 0) + 1 FROM harness_processes"
+                   )
+
                  DB.Txn.q(
                    txn,
-                   "SELECT COALESCE(MAX(launchSequence), 0) + 1 FROM harness_processes"
+                   """
+                   INSERT INTO harness_processes
+                     (launchId, adapterKey, harness, preset, host, ssh, helperPath,
+                      identityPath, launchSequence, state, createdAt, preparationBootIdentity)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'launching', ?10, ?11)
+                   """,
+                   [
+                     launch_id,
+                     key_name(key),
+                     to_string(harness),
+                     preset,
+                     host,
+                     ssh,
+                     helper_path,
+                     identity_path,
+                     launch_sequence,
+                     now(),
+                     preparation_boot
+                   ]
                  )
 
-               DB.Txn.q(
-                 txn,
-                 """
-                 INSERT INTO harness_processes
-                   (launchId, adapterKey, harness, preset, host, ssh, helperPath,
-                    identityPath, launchSequence, state, createdAt, preparationBootIdentity)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'launching', ?10, ?11)
-                 """,
-                 [
-                   launch_id,
-                   key_name(key),
-                   to_string(harness),
-                   preset,
-                   host,
-                   ssh,
-                   helper_path,
-                   identity_path,
-                   launch_sequence,
-                   now(),
-                   preparation_boot
-                 ]
-               )
+                 :ok
 
-               :ok
-
-             [[1]] ->
-               :fenced
+               [[1]] ->
+                 :fenced
+             end
            end
          end) do
       {:ok, :ok} -> :ok
       {:ok, :fenced} -> raise "adapter park in progress for #{key_name(key)}"
+      {:ok, :writer_active} -> raise "credential writer active for #{key_name(key)}"
     end
 
     opts
@@ -224,7 +234,8 @@ defmodule Tightbeam.HarnessProcess do
         identity_path,
         launch_id,
         root,
-        Keyword.get(opts, :cursor_rails_sha256)
+        Keyword.get(opts, :cursor_rails_sha256),
+        writer_lock
       )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
@@ -1260,7 +1271,8 @@ defmodule Tightbeam.HarnessProcess do
          _identity_path,
          _launch_id,
          _root,
-         _rails_sha256
+         _rails_sha256,
+         _writer_lock
        )
        when not is_nil(destination) do
     raise ArgumentError, "Cursor execution identity is local-only; SSH hosts are unsupported"
@@ -1274,7 +1286,8 @@ defmodule Tightbeam.HarnessProcess do
          identity_path,
          launch_id,
          _root,
-         rails_sha256
+         rails_sha256,
+         _writer_lock
        ) do
     [
       "/usr/bin/sudo"
@@ -1305,9 +1318,11 @@ defmodule Tightbeam.HarnessProcess do
          identity_path,
          launch_id,
          _root,
-         _rails_sha256
+         _rails_sha256,
+         writer_lock
        ) do
-    [helper_path, "harness-exec", identity_path, launch_id, "--" | cmd]
+    [helper_path, "harness-exec", identity_path, launch_id] ++
+      writer_lock_args(writer_lock) ++ ["--" | cmd]
   end
 
   defp wrap_command(
@@ -1318,7 +1333,8 @@ defmodule Tightbeam.HarnessProcess do
          identity_path,
          launch_id,
          _root,
-         _rails_sha256
+         _rails_sha256,
+         writer_lock
        ) do
     {prefix, remote} = Enum.split_while(rest, &(&1 != destination))
 
@@ -1333,15 +1349,16 @@ defmodule Tightbeam.HarnessProcess do
             helper_path,
             "harness-exec",
             identity_path,
-            launch_id,
-            "--"
-            | remote_cmd
-          ]
+            launch_id
+          ] ++ writer_lock_args(writer_lock && shell_quote(writer_lock)) ++ ["--" | remote_cmd]
 
       _ ->
         raise ArgumentError, "remote harness command does not contain its SSH destination"
     end
   end
+
+  defp writer_lock_args(nil), do: []
+  defp writer_lock_args(path), do: ["--writer-lock", path]
 
   defp cursor_sudo_args, do: ["-n", "-H", "-u", @cursor_account, "--"]
 

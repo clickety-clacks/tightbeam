@@ -23,3 +23,8 @@ This register is not an inventory of every existing configuration option.
 | `TIGHTBEAM_FIRST_RUN_ONBOARDING=true` | Enables the once-per-installation Chat welcome when setup invokes `tightbeam onboard --first-run`. | `false` | Installer owner | Keep setup opt-in until prompt approval and first-run acceptance on supported installers, then remove with the installer default change. |
 | `TIGHTBEAM_HARKLIGHT_ITEM_ID_MATCHING=true` | Uses captured opaque Harklight item IDs for pre-0.2 routing and changes. Enable after capture reports zero remaining. | `false` | Gateway release owner | Remove after supported installations have recorded their retained item IDs and the release soak confirms item-ID-only routing and changes. |
 | `TIGHTBEAM_HARKLIGHT_ITEM_ID_CAPTURE=true` | Captures opaque IDs for pre-0.2 sends using a read that does not mark delivery. Can run with routing disabled. The gateway logs `Harklight item ID capture remaining=0` when complete. | `false` | Gateway release owner | Remove with the transitional Server field after supported installations finish capture. |
+| `provider_accounts_enabled` | Enables runtime provider-account integration, including the per-slot adapter writer lock and guarded Claude catalog refresh. | `false` | Gateway | Remove after both harnesses pass account-lifecycle, disconnect, and upgrade acceptance. |
+
+Startup schema setup always creates the provider-account and account writer lease
+tables and adds the nullable `turns.accountId` column. These remain in the
+database when `provider_accounts_enabled` is off.
