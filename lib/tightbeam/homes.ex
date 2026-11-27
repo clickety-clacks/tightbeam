@@ -226,6 +226,9 @@ defmodule Tightbeam.Homes do
     Path.join([base_dir, "homes", machine, Atom.to_string(harness) <> "-accounts", slot])
   end
 
+  @doc false
+  def account_writer_lock(home), do: Path.join([home, ".tightbeam", "account-writer.lock"])
+
   @doc "Project an account home and link its conversation directory to the shared home."
   def project_account(target, desired, slot) do
     harness = Harness.module!(desired.harness)

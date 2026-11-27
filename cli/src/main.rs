@@ -116,6 +116,19 @@ fn main() {
         }
     }
 
+    if args
+        .first()
+        .is_some_and(|arg| arg == "harness-writer-revoke")
+    {
+        match harness_process::revoke_writer(&args[1..]) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if args.first().is_some_and(|arg| arg == "command-exec") {
         match command_execution::run(&args[1..]) {
             Ok(status) => std::process::exit(status),

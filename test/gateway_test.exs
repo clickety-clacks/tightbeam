@@ -64,7 +64,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup)
+        ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup people-wait)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 

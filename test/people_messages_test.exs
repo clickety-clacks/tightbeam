@@ -1,7 +1,7 @@
 defmodule Tightbeam.PeopleMessagesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Escalation, Model, Org, PeopleMessages}
+  alias Tightbeam.{DB, Devices, Escalation, Model, Org, PeopleMessages, PeopleReadiness}
 
   @sender "agent:people:sender"
   @relay "agent:people:relay"
@@ -14,6 +14,7 @@ defmodule Tightbeam.PeopleMessagesTest do
 
     db = :people_messages_test_db
     start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!(PeopleReadiness)
     :ok = Tightbeam.Schema.ensure_all(db)
 
     Devices.pair(db, %{
@@ -38,6 +39,87 @@ defmodule Tightbeam.PeopleMessagesTest do
       )
 
     %{db: db}
+  end
+
+  test "blocking collect returns committed enqueue and reconnect replays the same ID", %{db: db} do
+    caller = Task.async(fn -> call(db, @relay, "wait", %{"timeout_ms" => 5_000}) end)
+    id = send_request(db, %{})
+
+    assert %{records: [%{"id" => ^id} = record]} = Task.await(caller)
+    assert %{records: [^record]} = call(db, @relay, "wait", %{"timeout_ms" => 0})
+    assert %{records: [^record]} = call(db, @relay, "collect", %{})
+  end
+
+  test "an enqueue between the empty read and park is not lost", %{db: db} do
+    caller = wait_after_empty_read(db)
+    assert_receive {:empty_snapshot, waiting_pid}
+    id = send_request(db, %{})
+    send(waiting_pid, :park)
+
+    assert %{records: [%{"id" => ^id}]} = Task.await(caller)
+  end
+
+  test "a committed report signals when the next operation can be collected", %{db: db} do
+    first = send_request(db, %{})
+
+    assert %{"record" => %{"id" => next}} =
+             call(db, @sender, "reply", %{"conversation_id" => first, "body" => "Next"})
+
+    assert %{records: [%{"id" => ^first}]} = call(db, @relay, "collect", %{})
+    assert %{} == :sys.get_state(PeopleReadiness)
+    caller = wait_after_empty_read(db)
+    assert_receive {:empty_snapshot, waiting_pid}
+    bind_remote(db, first)
+    send(waiting_pid, :park)
+
+    assert %{records: [%{"id" => ^next, "server_id" => "service"}]} = Task.await(caller)
+  end
+
+  test "timeout and caller cancellation leave no claim and reconnect can read", %{db: db} do
+    assert %{records: []} = call(db, @relay, "wait", %{"timeout_ms" => 10})
+    assert %{code: "invalid"} = call(db, @relay, "wait", %{"timeout_ms" => 20_001})
+    assert %{code: "forbidden"} = call(db, @sender, "wait", %{})
+
+    caller = wait_after_empty_read(db)
+    assert_receive {:empty_snapshot, waiting_pid}
+    Task.shutdown(caller, :brutal_kill)
+
+    id = send_request(db, %{})
+    assert %{records: [%{"id" => ^id}]} = call(db, @relay, "wait", %{"timeout_ms" => 500})
+    refute Process.alive?(waiting_pid)
+  end
+
+  test "broker exit ends a parked call without changing queued records", %{db: db} do
+    caller = wait_after_empty_read(db)
+    assert_receive {:empty_snapshot, waiting_pid}
+    assert :ok = stop_supervised(PeopleReadiness)
+    send(waiting_pid, :park)
+
+    assert %{code: "people_readiness_unavailable"} = Task.await(caller)
+    id = send_request(db, %{})
+    start_supervised!(PeopleReadiness)
+    assert %{records: [%{"id" => ^id}]} = call(db, @relay, "wait", %{})
+  end
+
+  defp wait_after_empty_read(db) do
+    parent = self()
+
+    Task.async(fn ->
+      # A captured empty snapshot makes the otherwise tiny read-to-park
+      # window deterministic. Every later read uses the real durable outbox.
+      Process.put(:first_read, true)
+
+      PeopleReadiness.wait(5_000, fn ->
+        if Process.delete(:first_read) do
+          send(parent, {:empty_snapshot, self()})
+          receive do
+            :park -> %{records: []}
+          end
+        else
+          call(db, @relay, "collect", %{})
+        end
+      end)
+    end)
   end
 
   test "the owner default remains visible while queued and a whole refusal is durable", %{db: db} do

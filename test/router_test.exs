@@ -1013,7 +1013,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert {:ok, []} = DB.query(ctx.db, "SELECT name FROM sqlite_master WHERE name GLOB 'people_*'")
 
     verbs =
-      ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup)
+      ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup people-wait)
 
     for verb <- verbs do
       response = dispatch_cli(ctx, session.cli_token, %{verb: verb})
@@ -1071,6 +1071,12 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dispatch_cli(ctx, sender.cli_token, %{verb: "people-collect"}).status == 403
     assert dispatch_cli(ctx, relay.cli_token, %{verb: "people-collect"}).status == 200
+
+    wait = %{verb: "people-wait", params: %{timeout_ms: 0}}
+    assert dispatch_cli(ctx, sender.cli_token, wait).status == 403
+    response = dispatch_cli(ctx, relay.cli_token, wait)
+    assert response.status == 200
+    assert %{"result" => %{"records" => [^record]}} = JSON.decode!(response.resp_body)
 
     report = %{
       verb: "people-report",

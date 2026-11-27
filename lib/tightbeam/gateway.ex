@@ -347,11 +347,15 @@ defmodule Tightbeam.Gateway do
 
     (credential_children(config, db) ++
        [
-         {ModelCatalog, base_dir: config.base_dir, db: db},
+         {ModelCatalog,
+          base_dir: config.base_dir,
+          db: db,
+          account_writer_config: if(Map.get(config, :provider_accounts_enabled), do: config)},
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ArtifactBlobStore, blob_options},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+         if(Tightbeam.PeopleMessages.enabled?(), do: Tightbeam.PeopleReadiness),
          {Task, fn -> DB.owed_work(fn -> HarnessHealth.resume_other_routes(db) end) end},
          {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db},
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
@@ -1156,6 +1160,7 @@ defmodule Tightbeam.Gateway do
       {"people-report", []} => people_dispatch,
       {"people-event", []} => people_dispatch,
       {"people-lookup", []} => people_dispatch,
+      {"people-wait", []} => people_dispatch,
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
