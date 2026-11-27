@@ -340,9 +340,27 @@ defmodule Tightbeam.RowReactions.Plan do
 
     Enum.reduce(rail.bindings, %{"event" => evaluated_event, "facts" => facts}, fn binding,
                                                                                    context ->
-      Map.put(context, binding["name"], Expression.evaluate(binding["value"], context))
+      value = Expression.evaluate(binding["value"], context)
+      value = slate_attempt_binding(rail, binding["name"], value, facts)
+      Map.put(context, binding["name"], value)
     end)
   end
+
+  # A transport retry retains the same elected notice identity. Older served
+  # rails compare the saved pointer with their wake_id binding; resolve that
+  # binding to the current attempt without changing recorded source facts.
+  defp slate_attempt_binding(%{family: "r05-work-item"}, "wake_id", value, facts) do
+    Enum.find_value(Map.get(facts, "reaction_actions", []), value, fn action ->
+      result = action["result"] || %{}
+
+      if action["family"] == "r05-work-item" and action["slot"] == "notice" and
+           result["intent_wake_id"] == value and is_binary(result["wake_id"]) and
+           result["wake_id"] == get_in(facts, ["work_item", "slateWakeId"]),
+         do: result["wake_id"]
+    end)
+  end
+
+  defp slate_attempt_binding(_rail, _name, value, _facts), do: value
 
   defp item_wait_resume_event(
          rail,

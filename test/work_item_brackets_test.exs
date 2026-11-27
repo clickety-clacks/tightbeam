@@ -591,6 +591,111 @@ defmodule Tightbeam.WorkItemBracketsTest do
     end
   end
 
+  test "flag-off retries survive old served rules through recovery and real delivery", ctx do
+    Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
+
+    File.cp!(
+      Path.join(__DIR__, "fixtures/work_items/pre_followthrough_rules.toml"),
+      Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    )
+
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    {item, first} = followthrough_item(ctx)
+
+    {:ok, {:canceled, _}} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.undeliverable_delivery_in_txn(
+          txn,
+          first,
+          "recipient unavailable",
+          System.system_time(:millisecond)
+        )
+      end)
+
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != first
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert slate_wake_id(ctx.db, item.id) == retry
+    assert item_wake_count(ctx.db, item.id) == 1
+    _ = NoticeBatcher.recover(ctx.db, Wakes.get(ctx.db, retry).due_at + 1000)
+    assert [%{delivery_wake_id: carrier}] = NoticeBatcher.source_refs(ctx.db, retry)
+    {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "old-rule-retry")
+    assert turn.wake_id == carrier
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert :ok = Wakes.reconcile_turn_delivered_sources(ctx.db, turn.seq)
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+  end
+
+  test "oversized rendered slate becomes one paced compact retry without an owner miss", ctx do
+    Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
+    rules_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    oversized = String.duplicate("x", 1_100_000)
+    rules = File.read!(rules_path)
+
+    rules =
+      Regex.replace(
+        ~r/prompt = .*?, replace_wake_id =/,
+        rules,
+        fn _ -> "prompt = \"#{oversized}\", replace_wake_id =" end
+      )
+
+    File.write!(rules_path, rules)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey='holder'", [])
+    {item, first} = followthrough_item(ctx)
+    assert byte_size(Wakes.get(ctx.db, first).prompt) == 1_100_000
+    at = System.system_time(:millisecond)
+    _ = NoticeBatcher.recover(ctx.db, at + 1000)
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != first
+    assert Wakes.get(ctx.db, first).state == "canceled"
+    compact = Wakes.get(ctx.db, retry)
+    assert compact.due_at >= at + 30_000
+    assert compact.prompt =~ item.id
+    assert compact.prompt =~ "exceeded the delivery limit"
+    assert byte_size(compact.prompt) < 1000
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert Wakes.get(ctx.db, retry).prompt == compact.prompt
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1",
+               [first]
+             )
+
+    _ = NoticeBatcher.recover(ctx.db, compact.due_at + 1000)
+    assert [%{delivery_wake_id: carrier}] = NoticeBatcher.source_refs(ctx.db, retry)
+    {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "compact-retry")
+    assert turn.wake_id == carrier
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert :ok = Wakes.reconcile_turn_delivered_sources(ctx.db, turn.seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
   @tag persistent_db: true
   test "database restart retains the episode and single pending follow-up", ctx do
     enable_followthrough()

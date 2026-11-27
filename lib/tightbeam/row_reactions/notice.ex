@@ -90,7 +90,15 @@ defmodule Tightbeam.RowReactions.Notice do
 
   def execute(txn, action, at) do
     value = action["plan"]["value"]
-    value = Map.put(value, "prompt", render(txn, value, at))
+    compact = compact_slate?(txn, action, value)
+
+    prompt =
+      if compact,
+        do:
+          "Work item #{value["work_item_id"]} still needs a disposition. The previous reminder exceeded the delivery limit. Read the item, then close or fail it, assign the next work, or record its real dependency wait.",
+        else: render(txn, value, at)
+
+    value = Map.put(value, "prompt", prompt)
 
     unless is_map(value) and is_binary(value["wake_id"]) and is_binary(value["prompt"]) and
              is_binary(value["origin"]) and is_binary(value["owner_user_id"]) and
@@ -175,6 +183,7 @@ defmodule Tightbeam.RowReactions.Notice do
               get_in(action, ["result", "intent_wake_id"]) ||
                 get_in(action, ["result", "wake_id"]) || id,
             "delivery" => "queued",
+            "compact_slate" => compact,
             "requested_due_at" => input.due_at,
             "emitted" => Map.new(input, fn {key, value} -> {Atom.to_string(key), value} end)
           })
@@ -266,6 +275,16 @@ defmodule Tightbeam.RowReactions.Notice do
       end)
 
     Tightbeam.Reminders.render(txn, template, values)
+  end
+
+  defp compact_slate?(txn, action, value) do
+    slate_reference?(value["reference"]) and
+      (get_in(action, ["result", "compact_slate"]) == true or
+         Txn.q(
+           txn,
+           "SELECT 1 FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1 LIMIT 1",
+           [get_in(action, ["result", "wake_id"])]
+         ) == [[1]])
   end
 
   defp slate_reference?(%{"resource" => "work_item", "field" => "slateWakeId"}), do: true

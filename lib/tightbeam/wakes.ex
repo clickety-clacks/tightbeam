@@ -3936,7 +3936,7 @@ defmodule Tightbeam.Wakes do
       """
       SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId
       WHERE w.wakeId=?1 AND w.state='canceled' AND w.deliveredTurnSeq IS NULL
-        AND c.reasonKind='target_unresolvable'
+        AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
         AND EXISTS (SELECT 1 FROM lifecycle_events e WHERE e.kind='wake_undeliverable' AND e.subject=w.wakeId)
       """,
       [id]
