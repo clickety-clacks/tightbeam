@@ -15,6 +15,48 @@ defmodule Tightbeam.HomesTest do
     %{base_dir: base_dir}
   end
 
+  for {harness, provider, directory} <- [
+        {:codex, :openai, "sessions"},
+        {:claude, :anthropic, "projects"}
+      ] do
+    test "account home for #{harness} shares only the conversation directory", %{base_dir: base} do
+      host = "fixture-host"
+      harness = unquote(harness)
+      slot = "acct_" <> Tightbeam.Id.uuid4()
+      path = Homes.home_path(base, host, harness, slot)
+      shared = Homes.home_path(base, host, harness)
+      assert shared == Homes.home_path(base, host, harness, "shared")
+
+      target = %{base_dir: base, host_name: host, host_config: %{ssh: nil, base_dir: base}}
+      desired = %{machine: host, harness: harness, rails: nil}
+      credential = Tightbeam.Credentials.credential_path(base, host, unquote(provider))
+      File.mkdir_p!(shared)
+      File.write!(credential, "shared synthetic credential")
+
+      assert %{home_path: ^path} = Homes.project_account(target, desired, slot)
+      link = Path.join(path, unquote(directory))
+      assert File.read_link!(link) == Path.join(shared, unquote(directory))
+      File.write!(Path.join(link, "fixture-history"), "sentinel")
+      assert File.read!(Path.join([shared, unquote(directory), "fixture-history"])) == "sentinel"
+
+      account_credential = Path.join(path, Path.basename(credential))
+      refute File.exists?(account_credential)
+      File.write!(account_credential, "separate synthetic credential")
+      assert %{home_path: ^path} = Homes.project_account(target, desired, slot)
+      assert File.read!(credential) == "shared synthetic credential"
+      assert File.read!(account_credential) == "separate synthetic credential"
+
+      File.rm!(link)
+      File.mkdir!(link)
+
+      assert_raise RuntimeError, ~r/account conversation link conflicts/, fn ->
+        Homes.project_account(target, desired, slot)
+      end
+
+      assert File.dir?(link)
+    end
+  end
+
   @tag skip:
          if(is_nil(@projection_gid),
            do: "requires a distinct shared group for the projection directory",

@@ -1,7 +1,7 @@
 # Tightbeam installer
 
 Run `npx tightbeam --mode quick` to install and run setup on Apple Silicon
-macOS or x86-64 Linux. The installer requires Node.js 20 or newer and tar.
+macOS or x86-64 Linux. The installer requires Node.js 24 or newer and tar.
 Other arguments are passed through to `tightbeam setup`.
 
 npm's `latest` tag selects the newest published installer. Each installer

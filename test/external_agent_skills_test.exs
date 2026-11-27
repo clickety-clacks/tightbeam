@@ -166,22 +166,19 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     assert cli =~ "`decision_pending`"
   end
 
-  test "the README installs the matching skills with the CLI before verified-release-only installation" do
+  test "the README links to instructions for installing the matching external agent skills" do
     readme = File.read!(Path.join(repo_root(), "README.md"))
+    guide_path = "docs/AGENTS-AND-SETTINGS.md"
+    guide = File.read!(Path.join(repo_root(), guide_path))
 
-    section = "## External-agent operation skill"
-    install = "## Install only a verified release package"
-
-    assert {section_offset, _} = :binary.match(readme, section)
-    assert {install_offset, _} = :binary.match(readme, install)
-    assert section_offset < install_offset
-    assert readme =~ "priv/skills/tightbeam-cli/SKILL.md"
-    assert readme =~ "priv/skills/tightbeam-operator/SKILL.md"
-    assert readme =~ "tightbeam skill install"
-    assert readme =~ "~/.claude/skills"
-    assert readme =~ "~/.codex/skills"
-    assert readme =~ "Keep the directory name"
-    assert readme =~ "Start a fresh agent session"
+    assert readme =~ "](#{guide_path})"
+    assert guide =~ "priv/skills/tightbeam-cli/SKILL.md"
+    assert guide =~ "priv/skills/tightbeam-operator/SKILL.md"
+    assert guide =~ "tightbeam skill install"
+    assert guide =~ "~/.claude/skills"
+    assert guide =~ "~/.codex/skills"
+    assert guide =~ "Keep the directory name"
+    assert guide =~ "Start a fresh agent session"
   end
 
   defp assert_skill(name, expected_description) do

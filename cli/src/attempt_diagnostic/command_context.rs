@@ -73,6 +73,7 @@ impl CommandContext {
             }
             HarnessHealthRetry { .. } => ("cli.harness_health_retry", DispatchPath),
             ArtifactRecord { .. } => ("cli.artifact_record", DispatchPath),
+            PeopleMessage { .. } => ("cli.people_message", DispatchPath),
             HarklightSend { .. } => ("cli.harklight_send", DispatchPath),
             HarklightProgress { .. } => ("cli.harklight_progress", DispatchPath),
             HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
@@ -343,6 +344,11 @@ fn dispatch_effect(command: &Command) -> EffectContract {
     }
     match command {
         IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
+        PeopleMessage { verb, params } => match verb.as_str() {
+            "people-status" | "people-collect" | "people-lookup" | "people-wait" => Read,
+            "people-report" | "people-event" => WriteWithExistingIdempotency,
+            _ => keyed_write(params["key"].as_str()),
+        },
         Help
         | CommandHelp(_)
         | Doctor { .. }

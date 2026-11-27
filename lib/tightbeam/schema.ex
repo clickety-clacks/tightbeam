@@ -2129,6 +2129,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_effort_holder_activity_cancellation_v1(db)
     :ok = upgrade_row_reaction_cancellation_v1(db)
     :ok = upgrade_evidence_release(db)
+    if Tightbeam.PeopleMessages.enabled?(), do: :ok = Tightbeam.PeopleMessages.ensure_schema(db)
 
     sender_repair_counts = Tightbeam.Projection.repair_missing_human_senders(db)
 
@@ -2160,8 +2161,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_compactor_model_rate_limit_source(db)
     :ok = Tightbeam.Escalation.ensure_coordinator_operator_schema(db)
     :ok = Tightbeam.CoordinatorHoldDecisions.ensure_schema(db)
-    :ok = Tightbeam.ExecutionMapTurnVersions.ensure_schema(db)
-    :ok = Tightbeam.ExecutionMapRevision.ensure_schema(db)
+    if Tightbeam.ProviderAccounts.enabled?(), do: :ok = Tightbeam.ProviderAccounts.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok

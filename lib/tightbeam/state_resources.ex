@@ -261,6 +261,11 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_field_order %{
+    "provider accounts" =>
+      ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason enabled signedInAt updatedAt rowVersion),
+    "account serving" => ~w(harness host accountId revision reason sinceAt previousAccountId),
+    "account limits" =>
+      ~w(id accountId identityKey scope observedAt lastObservedAt resetAt resetSource standingId evidenceKind evidenceTurnSeq clearedAt clearCause),
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
@@ -312,6 +317,25 @@ defmodule Tightbeam.StateResources do
   # The normative R7/R7a value schema. Field order remains owned by
   # @item_field_order; these categories own JSON type and nullability.
   @item_wire_categories %{
+    "provider accounts" => %{
+      strings:
+        ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason),
+      integers: ~w(signedInAt updatedAt rowVersion),
+      booleans: ~w(enabled),
+      nullable: ~w(identityKey identityReason signedInAt)
+    },
+    "account serving" => %{
+      strings: ~w(harness host accountId reason previousAccountId),
+      integers: ~w(revision sinceAt),
+      booleans: [],
+      nullable: ~w(accountId previousAccountId)
+    },
+    "account limits" => %{
+      strings: ~w(id accountId identityKey scope resetSource standingId evidenceKind clearCause),
+      integers: ~w(observedAt lastObservedAt resetAt evidenceTurnSeq clearedAt),
+      booleans: [],
+      nullable: ~w(identityKey resetAt evidenceTurnSeq clearedAt clearCause)
+    },
     "work items" => %{
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
@@ -624,9 +648,21 @@ defmodule Tightbeam.StateResources do
 
   @doc "Return one bounded, principal-visible work-item page in creation order."
   def query_work_item_page(db, filters, call, boundary, limit) do
+    {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
-    {visibility, visibility_params} = work_item_page_visibility(call)
+
+    {visibility, visibility_params} =
+      cond do
+        is_admin ->
+          {"1 = 1", []}
+
+        principal_kind == "user" ->
+          {"wi.ownerUserId = ?", [principal_id]}
+
+        principal_kind == "session" ->
+          {"1 = 1", []}
+      end
 
     {where, params} =
       append_work_item_filters(
@@ -653,36 +689,38 @@ defmodule Tightbeam.StateResources do
       "work_items AS wi LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
         "LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id"
 
-    with_read_transaction(db, fn txn ->
-      query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
+    case DB.read_transaction(db, fn txn ->
+           query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
 
-      page =
-        Keyset.page(
-          query,
-          select_from,
-          probe_from,
-          where,
-          params,
-          ["wi.createdAt", "wi.id"],
-          boundary,
-          limit,
-          fn row -> [Enum.at(row, 14), hd(row)] end
-        )
+           page =
+             Keyset.page(
+               query,
+               select_from,
+               probe_from,
+               where,
+               params,
+               ["wi.createdAt", "wi.id"],
+               boundary,
+               limit,
+               fn row -> [Enum.at(row, 14), hd(row)] end
+             )
 
-      rows =
-        page.rows
-        |> Enum.map(&work_item_query_row/1)
-        |> then(&attach_work_item_summaries(txn, &1, :page, call))
+           rows =
+             page.rows
+             |> Enum.map(&work_item_query_row/1)
+             |> then(&WorkItemSummary.attach_many(txn, &1))
 
-      %{rows: rows, has_more_before: page.has_more_before, has_more_after: page.has_more_after}
-    end)
-  end
+           %{page | rows: rows}
+         end) do
+      {:ok, page} ->
+        %{
+          rows: page.rows,
+          has_more_before: page.has_more_before,
+          has_more_after: page.has_more_after
+        }
 
-  defp work_item_page_visibility(call) do
-    case detail_principal(call) do
-      {_kind, _id, true} -> {"1 = 1", []}
-      {"user", id, false} -> {"wi.ownerUserId = ?", [id]}
-      {"session", _id, false} -> {"1 = 1", []}
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -1918,8 +1956,7 @@ defmodule Tightbeam.StateResources do
           {"ownerUserId", "wi.ownerUserId"},
           {"createdBySession", "wi.createdBySession"},
           {"createdByUser", "wi.createdByUser"},
-          {"specRefName", "wi.specRefName"},
-          {"specRefSha256", "wi.specRefSha256"}
+          {"specRefName", "wi.specRefName"}
         ],
         {where, params},
         fn {field, column}, {where, params} ->
@@ -1934,19 +1971,6 @@ defmodule Tightbeam.StateResources do
         "false" -> 0
       end)
       |> then(&append_in_filter(where, params, "wi.isBug", &1))
-
-    where =
-      case filters["executionMapOrigin"] do
-        "user" -> where <> " AND wi.createdByUser IS NOT NULL"
-        "session" -> where <> " AND wi.createdByUser IS NULL"
-        _ -> where
-      end
-
-    {where, params} =
-      case filters["createdBefore"] do
-        nil -> {where, params}
-        timestamp -> {where <> " AND wi.createdAt < ?", params ++ [timestamp]}
-      end
 
     holder_keys = Map.get(filters, "holderKey", [])
 
@@ -2146,6 +2170,10 @@ defmodule Tightbeam.StateResources do
   end
 
   def production(row), do: row |> public() |> correlate("eventId", "seq")
+
+  def provider_account(row), do: row |> public() |> closed_projection("provider accounts")
+  def account_serving(row), do: row |> public() |> closed_projection("account serving")
+  def account_limit(row), do: row |> public() |> closed_projection("account limits")
 
   def turn(row) do
     case value(row, :prompt) do

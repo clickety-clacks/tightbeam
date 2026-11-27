@@ -5,6 +5,8 @@ config :tightbeam, :escalation_decision_deadline_ms, 86_400_000
 # Compaction uses the host's existing gateway ACP access. The selected model
 # must be offered in the exact host/harness catalog and cheaper than the source.
 config :tightbeam, :harness_switch_context_enabled, true
+config :tightbeam, :harklight_pending_open_enabled, false
+config :tightbeam, :harklight_grouped_outage_notices_enabled, false
 
 source = %{
   source_model: "gpt-6-sol",

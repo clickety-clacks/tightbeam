@@ -12,6 +12,16 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
   alias Tightbeam.DB.Txn
 
+  # Top-level fact names exposed to reaction expressions. Fields below a name
+  # belong to the event's runtime record projection.
+  @fact_roots ~w(assignment assignment_owner_user_id assignments attests child
+    configured_triage_deadline_ms coordination_parent current_opener delivery_owner
+    hold open_assignment_count opener_responsibility parent_activity_at personal_session_key
+    process_notification_recipient recovery_check request ruling_result_recipients
+    scope_participant_archetypes scope_record_session_groups sessions terminal_sources
+    wakes work_item)
+  def fact_reference?(path), do: hd(String.split(path, ".", parts: 2)) in @fact_roots
+
   @assignment ~w(id holderKey workItemId reviewsAssignmentId openedBySession currentOpenerSessionKey openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
   def assignment(txn, id), do: one(txn, "assignments", @assignment, "id=?1", [id])
 

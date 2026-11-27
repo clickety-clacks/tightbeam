@@ -197,6 +197,10 @@ pub enum Command {
         work_item_id: Option<String>,
         session_key: Option<String>,
     },
+    PeopleMessage {
+        verb: String,
+        params: serde_json::Value,
+    },
     HarklightSend {
         identity: Identity,
         session: String,
@@ -572,8 +576,6 @@ pub enum Command {
         identity: Identity,
         filters: ToplineFilters,
         tree: bool,
-        limit: Option<u32>,
-        after: Option<String>,
     },
     Topline {
         identity: Identity,
@@ -1067,6 +1069,26 @@ COMMANDS:
       --status received|applied|refused [--op-id <uuid>]
       Report what happened to a delivered Harklight answer. If uncertain, retry with
       unchanged inputs and the operation ID returned in the response.
+  people-send --json '<object>'
+      Queue a message. Omitted or empty addresses use the work-item owner.
+  people-update --json '<object>'
+      Update a conversation at its current revision.
+  people-reply --json '<object>'
+      Reply to everyone, optionally mentioning one address.
+  people-withdraw --json '<object>'
+      Withdraw a conversation as its sender.
+  people-status --json '<object>'
+      Read delivery status, waiting records and per-address outcomes.
+  people-collect --json '<object>'
+      Collect waiting operations using the configured relay session.
+  people-report --json '<object>'
+      Report the outcome of a collected operation.
+  people-event --json '<object>'
+      Submit a stable inbound event.
+  people-wait --json '<object>'
+      Wait for eligible operations as the relay, up to timeout_ms (default 15000, max 20000).
+  people-lookup --json '<object>'
+      Read the neutral conversation and its delivered revision mappings as the relay.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
@@ -1237,7 +1259,7 @@ COMMANDS:
       fail clearly. Text alone also works with older gateways.
   execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
-           [--session <key>] [--tree | --limit <1..500> [--after <cursor>]]
+           [--session <key>] [--tree]
       The work telemetry the substrate already knows: every work item you can
       see, with its assignment/job/attest/turn counts, who holds it, whether
       anything is running, and how long it has been quiet. --tree renders the
@@ -1245,8 +1267,6 @@ COMMANDS:
       turn that was RUNNING when each item was created, so they record
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
-      --limit pages the flat roster in its existing order. Pass page.nextCursor
-      from the response to --after to get the next page.
       No percentages and no completion estimates: the rows do not support them.
         tightbeam execution-map --origin user --state open --as-user sample-user
         tightbeam execution-map --quiet-over 2h --as-user sample-user
@@ -1517,6 +1537,9 @@ COMMANDS:
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
+
+  setup [--mode quick|full] [--yes] [--dry-run]
+      Set up this machine from a verified Tightbeam release.
 
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId> | --as-process <name>]
       Check the local Tightbeam installation and report its health, with each
@@ -1957,7 +1980,7 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree | --limit <1..500> [--after <cursor>]]";
+const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
 const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
@@ -2885,6 +2908,28 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 work_item_id: nonempty(flags, "work-item"),
                 session_key: nonempty(flags, "session"),
+            })
+        }
+        verb @ ("people-send" | "people-update" | "people-reply" | "people-withdraw"
+        | "people-status" | "people-collect" | "people-report" | "people-event"
+        | "people-lookup" | "people-wait") => {
+            let params = match parsed.positional.as_slice() {
+                [_, encoded]
+                    if flags.len() == 1
+                        && flags.contains_key("json")
+                        && parsed.duplicates.is_empty() =>
+                {
+                    serde_json::from_str::<serde_json::Value>(encoded)
+                        .map_err(|error| format!("invalid JSON: {error}"))?
+                }
+                _ => return Err(format!("{verb} requires --json '<object>'")),
+            };
+            if !params.is_object() {
+                return Err(format!("{verb} requires a JSON object"));
+            }
+            Ok(Command::PeopleMessage {
+                verb: verb.to_owned(),
+                params,
             })
         }
         "harklight-send" => {
@@ -4221,31 +4266,10 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
-            let limit = nonempty(flags, "limit")
-                .map(|value| {
-                    value
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|limit| (1..=500).contains(limit))
-                        .ok_or("--limit must be an integer from 1 to 500")
-                })
-                .transpose()?;
-
-            let after = nonempty(flags, "after");
-            let tree = flags.contains_key("tree");
-            if after.is_some() && limit.is_none() {
-                return Err("--after requires --limit".to_owned());
-            }
-            if tree && limit.is_some() {
-                return Err("--limit is supported only for the flat execution map".to_owned());
-            }
-
             Ok(Command::Toplines {
                 identity: identity(flags)?,
                 filters: topline_filters(flags)?,
-                tree,
-                limit,
-                after,
+                tree: flags.contains_key("tree"),
             })
         }
         "execution-map-select" => {
@@ -4735,7 +4759,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, people-send, people-update, people-reply, people-withdraw, people-status, people-collect, people-report, people-event, people-lookup, people-wait, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -7766,10 +7790,21 @@ mod tests {
                 "decision-request",
                 "decision-requests",
                 "dispatch",
+                "setup",
                 "doctor",
                 "session-diagnose",
                 "harness-process",
                 "harklight-briefings-catchup",
+                "people-send",
+                "people-update",
+                "people-reply",
+                "people-withdraw",
+                "people-status",
+                "people-collect",
+                "people-report",
+                "people-event",
+                "people-lookup",
+                "people-wait",
                 "harklight-send",
                 "harklight-progress",
                 "harklight-revise",
@@ -8144,31 +8179,6 @@ mod tests {
                 "--key",
                 "unused",
             ],
-        ] {
-            assert!(parse(strings(&args)).is_err());
-        }
-    }
-
-    #[test]
-    fn execution_map_paging_is_opt_in() {
-        let command = parse(strings(&[
-            "execution-map",
-            "--as-user",
-            "sample-user",
-            "--limit",
-            "25",
-            "--after",
-            "123:wi_example",
-        ]))
-        .unwrap();
-        let body = crate::dispatch::build_request(&command).unwrap().body_json;
-        assert!(body.contains(r#""limit":25"#));
-        assert!(body.contains(r#""after":"123:wi_example""#));
-
-        for args in [
-            vec!["execution-map", "--limit", "0"],
-            vec!["execution-map", "--after", "123:wi_example"],
-            vec!["execution-map", "--tree", "--limit", "25"],
         ] {
             assert!(parse(strings(&args)).is_err());
         }
@@ -9075,7 +9085,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "sample-user"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, people-send, people-update, people-reply, people-withdraw, people-status, people-collect, people-report, people-event, people-lookup, people-wait, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
