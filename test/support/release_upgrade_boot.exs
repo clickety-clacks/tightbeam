@@ -1,18 +1,23 @@
 alias Tightbeam.LiveBaseAdmission
 
-[base, expected_stamp] = System.argv()
+[payload, base, expected_stamp] = System.argv()
+^payload = Path.expand(Application.app_dir(:tightbeam))
 base = LiveBaseAdmission.canonical!(base)
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :cwd, base)
 Application.put_env(:tightbeam, :local_host_name, "fixture")
+Application.put_env(:tightbeam, :port, 0)
+Application.put_env(:tightbeam, :fixture_harness, true)
+Application.put_env(:tightbeam, :default_harness, :fixture)
+Application.put_env(:tightbeam, :default_model, Tightbeam.Model.new("fixture-model"))
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 
 # A SQL export has no build-owner marker. Supply the usual exact transition
 # for this disposable base from the independently observed checkout identity.
 unless File.exists?(Path.join(base, "build-owner.json")) do
   %{identity: target} =
-    LiveBaseAdmission.prepare!(base <> "-unpopulated", payload_root: Application.app_dir(:tightbeam))
+    LiveBaseAdmission.prepare!(base <> "-unpopulated", payload_root: payload)
 
   transition =
     JSON.encode!(%{

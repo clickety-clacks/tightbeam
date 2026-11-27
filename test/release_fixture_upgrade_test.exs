@@ -2,7 +2,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
   use ExUnit.Case, async: false
 
   @fixtures Path.join(__DIR__, "fixtures/releases")
-  @boot Path.join(__DIR__, "support/release_upgrade_boot.exs")
+  @boot "release_upgrade_boot.exs"
   @predecessor "0.1.17+5505.sql"
   # Add a filename here when direct skip-release upgrades are supported.
   @direct_upgrades []
@@ -18,12 +18,12 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
         @fixtures |> Path.join("*.sql") |> Path.wildcard() |> Enum.min() |> Path.basename()
       end
 
-    {base, db} = restore(filename)
+    {runtime, db} = restore(filename)
     original = preserved_rows(db)
     schema_existed? = provider_schema?(db)
     if filename == @predecessor, do: refute(schema_existed?)
 
-    port = boot(base, true)
+    port = boot(runtime, db, true)
     pid = await_checkpoint(port)
     assert {_, 0} = System.cmd("kill", ["-KILL", pid])
     assert {137, false, _output} = await_exit(port)
@@ -32,42 +32,46 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     assert intact?(db)
     assert preserved_rows(db) == original
 
-    assert_upgrade(base, db, original)
+    assert_upgrade(runtime, db, original)
   end
 
   for filename <- @direct_upgrades do
     @tag timeout: 120_000
     test "can upgrade #{filename} directly" do
-      {base, db} = restore(unquote(filename))
-      assert_upgrade(base, db, preserved_rows(db))
+      {runtime, db} = restore(unquote(filename))
+      assert_upgrade(runtime, db, preserved_rows(db))
     end
   end
 
   defp restore(filename) do
-    base = Path.join(System.tmp_dir!(), "release-upgrade-#{Tightbeam.Id.uuid4()}")
-    File.mkdir_p!(base)
-    on_exit(fn -> File.rm_rf!(base) end)
-    db = Path.join(base, "state.db")
-    assert {"", 0} = System.cmd("sqlite3", ["-batch", "-bail", db, ".read \"#{Path.join(@fixtures, filename)}\""])
+    tmp = Path.join(System.tmp_dir!(), "release-upgrade-#{Tightbeam.Id.uuid4()}")
+    on_exit(fn -> File.rm_rf!(tmp) end)
+    runtime = Tightbeam.GuardRuntimeFixture.prepare!(tmp, @boot)
+    File.mkdir_p!(runtime.base)
+    db = Path.join(runtime.base, "state.db")
+    dump = Path.join(@fixtures, filename)
+    assert {"", 0} = System.cmd("sqlite3", ["-batch", "-bail", db, ".read \"#{dump}\""])
     assert intact?(db)
-    {base, db}
+    {runtime, db}
   end
 
-  defp boot(base, interrupt?) do
-    executable = System.find_executable("mix")
-    stamp = base |> Path.join("state.db") |> sqlite("SELECT shape FROM schema_stamp") |> String.trim()
+  defp boot(runtime, db, interrupt?) do
+    stamp = db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim()
 
-    Port.open({:spawn_executable, executable}, [
+    env =
+      runtime.env ++
+        [{"npm_config_offline", "true"}, {"TB_UPGRADE_INTERRUPT", if(interrupt?, do: "1", else: "0")}]
+
+    Port.open({:spawn_executable, runtime.executable}, [
       :binary,
       :exit_status,
       :stderr_to_stdout,
       {:line, 8192},
-      {:args, ["run", "--no-start", "--no-compile", @boot, base, stamp]},
-      {:env, [
-        {~c"MIX_ENV", ~c"test"},
-        {~c"npm_config_offline", ~c"true"},
-        {~c"TB_UPGRADE_INTERRUPT", if(interrupt?, do: ~c"1", else: ~c"0")}
-      ]}
+      {:args, runtime.args ++ [stamp]},
+      {:env, Enum.map(env, fn
+        {key, nil} -> {String.to_charlist(key), false}
+        {key, value} -> {String.to_charlist(key), String.to_charlist(value)}
+      end)}
     ])
   end
 
@@ -96,8 +100,8 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
 
   defp boot_log(output), do: output |> Enum.take(30) |> Enum.reverse() |> Enum.join("\n")
 
-  defp assert_upgrade(base, db, original) do
-    {status, ready?, output} = await_exit(boot(base, false))
+  defp assert_upgrade(runtime, db, original) do
+    {status, ready?, output} = await_exit(boot(runtime, db, false))
     assert {status, ready?} == {0, true}, "restart did not complete:\n#{output}"
     assert provider_schema?(db)
     assert intact?(db)
