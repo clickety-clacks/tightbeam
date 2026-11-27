@@ -9,6 +9,7 @@ on:
       - "packaging/relay-payload.py"
       - "packaging/stage-optional-relay.sh"
       - "packaging/smoke/relay-*"
+      - "packaging/smoke/named-relay/**"
       - "priv/guidance/operating-manual.md"
 
 permissions:
@@ -71,6 +72,16 @@ jobs:
             bash packaging/smoke/relay-install-boundary.sh "$archive"
           done | tee "$RUNNER_TEMP/relay-boundary.log"
 
+      - name: Pair the packaged relay with released Agent and Server
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for archive in _build/npm/tightbeam-*.tgz; do
+            bash packaging/smoke/named-relay/run-named-archive-evidence.sh "$archive" packaging/gateway-smoke.py
+          done | tee "$RUNNER_TEMP/relay-pair.log"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -78,3 +89,4 @@ jobs:
           path: |
             ${{ runner.temp }}/relay-archive.log
             ${{ runner.temp }}/relay-boundary.log
+            ${{ runner.temp }}/relay-pair.log
