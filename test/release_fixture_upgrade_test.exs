@@ -17,7 +17,22 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     assert {status, ready?} == {0, true}, "default boot did not complete:\n#{output}"
     assert intact?(db)
     assert preserved_rows(db) == original
+    assert_default_schema(db)
+  end
 
+  @tag timeout: 120_000
+  test "fresh default boot leaves optional storage absent" do
+    runtime = fixture_runtime()
+    db = Path.join(runtime.base, "state.db")
+    refute File.exists?(db)
+
+    {status, ready?, output} = await_exit(boot(runtime, db, false, false))
+    assert {status, ready?} == {0, true}, "fresh boot did not complete:\n#{output}"
+    assert intact?(db)
+    assert_default_schema(db)
+  end
+
+  defp assert_default_schema(db) do
     assert sqlite(db, """
            SELECT name FROM sqlite_schema
            WHERE name IN (
@@ -68,13 +83,18 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     end
   end
 
-  defp restore(filename) do
+  defp fixture_runtime do
     tmp = Path.join(System.tmp_dir!(), "release-upgrade-#{Tightbeam.Id.uuid4()}")
     on_exit(fn -> File.rm_rf!(tmp) end)
     runtime = Tightbeam.GuardRuntimeFixture.prepare!(tmp, @boot)
     File.mkdir_p!(runtime.base)
     File.write!(Path.join(runtime.base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
     Tightbeam.RecoveryFixture.place_adapter!(runtime.base, seed_credential: false)
+    runtime
+  end
+
+  defp restore(filename) do
+    runtime = fixture_runtime()
     db = Path.join(runtime.base, "state.db")
     dump = Path.join(@fixtures, filename)
     assert {"", 0} = System.cmd("sqlite3", ["-batch", "-bail", db, ".read \"#{dump}\""])
@@ -83,7 +103,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
   end
 
   defp boot(runtime, db, interrupt?, accounts? \\ true) do
-    stamp = db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim()
+    stamp = if File.exists?(db), do: db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim(), else: ""
 
     env =
       runtime.env ++

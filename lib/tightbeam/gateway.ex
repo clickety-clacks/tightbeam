@@ -428,8 +428,7 @@ defmodule Tightbeam.Gateway do
                do: [ip: {127, 0, 0, 1}],
                else: []
              )
-         ),
-         Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
+         )
        ])
     |> Enum.reject(&is_nil/1)
   end

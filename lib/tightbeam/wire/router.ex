@@ -4872,7 +4872,7 @@ defmodule Tightbeam.Wire.Router do
     "decision-requests" => ~w(status)a,
     "dispatch" =>
       ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id parent_assignment_id work_item_id workdir_root owner_user_id)a,
-    "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over limit after)a,
+    "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
     "facts-read" => ~w(after kind limit scope)a,
