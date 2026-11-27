@@ -1,0 +1,7 @@
+{
+  "connection": "/path/to/enrolled/harklight-agent/identity",
+  "sender": "service:people-relay",
+  "users": {
+    "example-user": "opaque-harklight-person-id"
+  }
+}

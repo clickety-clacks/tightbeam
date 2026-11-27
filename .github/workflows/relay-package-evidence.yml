@@ -1,47 +1,80 @@
 name: optional relay package evidence
+
 on:
   pull_request:
     paths:
       - ".github/workflows/relay-package-evidence.yml"
+      - "packaging/assemble.sh"
+      - "packaging/relay-*/**"
       - "packaging/relay-payload.py"
-      - "packaging/relay-runtime/**"
       - "packaging/stage-optional-relay.sh"
+      - "packaging/smoke/relay-*"
+      - "priv/guidance/operating-manual.md"
 
 permissions:
   contents: read
 
+concurrency:
+  group: relay-package-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  layout-fixture:
+  package:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-15]
+        runner: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
         with:
-          repository: clickety-clacks/harklight-tightbeam-pack
-          ref: 883d44b201177e77315c675d8f96de4d77692f82
-          path: layout-fixture
-          persist-credentials: false
-      - name: Exercise the importer and archive verifier on the layout fixture
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Assemble and verify the standard package
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          fixture=883d44b201177e77315c675d8f96de4d77692f82
-          tree=d183dcadf33e83bd7435f9f93ad3341c8ee22c32
-          test "$(git -C layout-fixture rev-parse HEAD)" = "$fixture"
-          python3 packaging/relay-payload.py import layout-fixture "$fixture" "$tree" "$RUNNER_TEMP/vendor"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git config user.name "Relay package smoke"
+          git config user.email relay-smoke@example.invalid
+          mix deps.get
+          sh packaging/assemble.sh
           platform=$(uname -s | tr 'A-Z' 'a-z')
-          sh packaging/stage-optional-relay.sh "$RUNNER_TEMP/tightbeam" "$platform" "$RUNNER_TEMP/vendor"
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/layout-fixture.tgz" tightbeam
-          python3 packaging/relay-payload.py verify-archive "$RUNNER_TEMP/layout-fixture.tgz" "$platform"
-          printf 'mutation\n' >> "$RUNNER_TEMP/vendor/relay.py"
-          if python3 packaging/relay-payload.py assemble "$RUNNER_TEMP/vendor" "$RUNNER_TEMP/refused"; then
-            echo "A changed relay member was accepted" >&2
-            exit 1
-          fi
-          test ! -e "$RUNNER_TEMP/refused"
+          for archive in _build/npm/tightbeam-*.tgz; do
+            shasum -a 256 "$archive"
+            sh packaging/verify-payload.sh "$archive"
+            python3 packaging/relay-payload.py verify-archive "$archive" "$platform" \
+              --manual priv/guidance/operating-manual.md
+            python3 packaging/smoke/relay-state-owner.py \
+              _build/npm/tightbeam/optional/harklight-people-relay/source/relay.py
+          done | tee "$RUNNER_TEMP/relay-archive.log"
+
+      - name: Verify the explicit lifecycle and ordinary setup boundary
+        run: |
+          set -euo pipefail
+          for archive in _build/npm/tightbeam-*.tgz; do
+            bash packaging/smoke/relay-install-boundary.sh "$archive"
+          done | tee "$RUNNER_TEMP/relay-boundary.log"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relay-package-evidence-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/relay-archive.log
+            ${{ runner.temp }}/relay-boundary.log

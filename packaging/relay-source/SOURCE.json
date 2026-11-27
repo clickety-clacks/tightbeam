@@ -1,0 +1,23 @@
+{
+  "commit": "17a5d6fa34f173da79ef369745413c6deac4059a",
+  "repository": "https://github.com/clickety-clacks/harklight-tightbeam-pack",
+  "sha256": {
+    "LICENSE": "37cda6bea6eb928340b19c10c743a5b21b62765ce29a382666a8ce3ef79ddb42",
+    "README.md": "c19f3d50bec31d1b6a83dba5128de090406f53edbdb7306d3f88ea010569d747",
+    "addresses.py": "bdaf1e70dd4ea162e80e1c24f4b8eb3d130d0989f78d37c9a1f24be9da50cdde",
+    "agent_cli.py": "dfe18c2d244fff31843b614128246d57ac4f955bc918ce82f555fcd50ca42f2b",
+    "config.example.json": "ca4766e97407235cb8ec139adfc9f1d4a3c27a33b950f2385cc2fed8567513ef",
+    "harklight-people-relay.service": "ac868e9f3cd1c6613ab540c367661cf5da4a927889532ef2886534ba9cc21510",
+    "harklight-people-relay.timer": "14528762dc692ff4430fa3b0399844fbfdfafb53d700660e82e4082e453d19ba",
+    "harklight_agent.py": "544665f944ca6195360e401d9a76dcb2c10fc49b8525bfca82bdb4a7bb4e453d",
+    "outgoing.py": "812444bf994b123e1b3331c1772cc0c8614c97ca65ef57b3aa9fc4ab9fc68348",
+    "projection.py": "39a016cb46560a55a79c87136ad583beb0139e64bb7f0e97eba9af9c8ca4bbb5",
+    "relay.py": "3ad9d812e4c74f0246da81ea9ab86fa47d8aa65001b2e66eff581adcfb85e246",
+    "relay_process.py": "9aa243bd00a2ff62e96a78be73b531f851d39f2c7d79849400b4df5d2820068c",
+    "relay_state.py": "88ae2ec44287faa5f958c34561e4602a8d39e3169671de3eafaddbfb907c9e4e",
+    "relay_watch.py": "a882505930a65cb012b178b4865a0fefb1f3a65f0937e432b86866478c3cc825",
+    "tightbeam_people.py": "731c729b64fd3e17fb3500ed51cc5e898b880cb52cbb868790901fa2f041f34e"
+  },
+  "tree": "0266df678aab4f482cc0cfae88c98a23220d8282",
+  "tree_path": "pack/relay"
+}

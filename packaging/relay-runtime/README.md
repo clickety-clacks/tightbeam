@@ -3,7 +3,10 @@
 Tightbeam setup, upgrades, and gateway startup leave this relay and any
 existing relay installation alone. Run it only from a dedicated operator
 account with Tightbeam relay permissions and an enrolled, supported
-Harklight Agent. The relay uses Python 3 and its standard library. Keep both
+Harklight Agent. The relay uses Python 3.10 or later and its standard library.
+Named-person messaging was verified with Harklight Agent 0.2.10 and Server
+0.2.34. Use the compatible Tightbeam CLI and gateway with the authenticated
+people-wait readiness capability. Keep both
 the normal tightbeam and harklight-agent executables on the relay's PATH.
 
 The upstream relay source, license, Git identity, and file checksums are

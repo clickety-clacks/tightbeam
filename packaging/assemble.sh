@@ -45,6 +45,7 @@ cp packaging/tightbeam-gateway "$OUT/bin/tightbeam-gateway"
 cp packaging/tightbeam-select "$OUT/bin/tightbeam-select"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
 cp -R packaging/release-install "$OUT/release-install"
+sh packaging/stage-optional-relay.sh "$OUT" "$OS" packaging/relay-source
 
 # This identifies packages assembled from a checkout for setup. It carries
 # no upgrade authority. Source archives must still assemble without Git.

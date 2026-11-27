@@ -29,7 +29,9 @@ RELAY_MEMBERS = {
     "outgoing.py": "100644",
     "projection.py": "100644",
     "relay.py": "100644",
+    "relay_process.py": "100644",
     "relay_state.py": "100644",
+    "relay_watch.py": "100644",
     "tightbeam_people.py": "100644",
 }
 

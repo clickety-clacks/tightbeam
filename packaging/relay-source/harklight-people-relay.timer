@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Harklight people relay periodically
+
+[Timer]
+OnStartupSec=15s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
