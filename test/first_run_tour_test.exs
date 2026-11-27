@@ -12,7 +12,18 @@ defmodule Tightbeam.FirstRunTourTest do
     flag = System.get_env(@flag)
     archetypes = :persistent_term.get(Archetypes, nil)
     base = Path.join(System.tmp_dir!(), "first-run-tour-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(base)
+    payload = Path.join(base, "fixture/release/lib/tightbeam-0.1.17")
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture beam")
+    File.write!(Path.join(payload, "priv/fixture"), "fixture content")
+    package = Path.join(base, "fixture")
+    File.mkdir_p!(Path.join(package, "bin"))
+    File.write!(Path.join(package, "package.json"), ~s({"name":"tightbeam"}))
+    File.write!(Path.join(package, "bin/tightbeam"), "fixture cli")
+    File.write!(Path.join(package, "bin/tightbeam-gateway"), "fixture gateway")
+    state = Path.join(base, "install")
+    File.mkdir_p!(state)
 
     default = Archetypes.builtin_default()
     tour = Archetypes.parse_manifest!("name = \"tour-guide\"", "tour-guide.toml")
@@ -28,20 +39,21 @@ defmodule Tightbeam.FirstRunTourTest do
       File.rm_rf!(base)
     end)
 
-    %{path: Path.join(base, "state.db")}
+    %{path: Path.join(state, "state.db"), payload: payload}
   end
 
   test "fresh bootstrap records eligibility and recovery keeps the exact seeded session", %{
-    path: path
+    path: path,
+    payload: payload
   } do
     System.put_env(@flag, "true")
-    db = open!(path)
+    db = open!(path, payload)
     assert :ok = Schema.ensure_all(db)
     assert Org.get_setting(db, @setting) == "pending"
     assert :ok = FirstRunTour.ensure(db, @defaults)
     GenServer.stop(db)
 
-    db = open!(path)
+    db = open!(path, payload)
     assert :ok = Schema.ensure_all(db)
     assert Org.get_setting(db, @setting) == "pending"
     main = create_main!(db)
@@ -54,22 +66,25 @@ defmodule Tightbeam.FirstRunTourTest do
     assert %{kind: "main", archetype: "default"} = Org.get(db, main.session_key)
     GenServer.stop(db)
 
-    db = open!(path)
+    db = open!(path, payload)
     assert :ok = Schema.ensure_all(db)
     assert :ok = FirstRunTour.ensure(db, @defaults)
     assert Org.get_setting(db, @setting) == tour
     assert [%{session_key: ^tour}] = Org.active_all_by_identity_name(db, "tour-guide")
   end
 
-  test "enabling after fresh bootstrap does not retrofit an installation", %{path: path} do
+  test "enabling after fresh bootstrap does not retrofit an installation", %{
+    path: path,
+    payload: payload
+  } do
     System.delete_env(@flag)
-    db = open!(path)
+    db = open!(path, payload)
     assert :ok = Schema.ensure_all(db)
     main = create_main!(db)
     GenServer.stop(db)
 
     System.put_env(@flag, "true")
-    db = open!(path)
+    db = open!(path, payload)
     assert :ok = Schema.ensure_all(db)
     assert :ok = FirstRunTour.ensure(db, @defaults)
     refute Org.get_setting(db, @setting)
@@ -77,9 +92,9 @@ defmodule Tightbeam.FirstRunTourTest do
     assert %{kind: "main", archetype: "default"} = Org.get(db, main.session_key)
   end
 
-  test "upgrading a predecessor does not make it eligible", %{path: path} do
+  test "upgrading a predecessor does not make it eligible" do
     System.put_env(@flag, "true")
-    db = open!(path)
+    db = open!(":memory:", nil)
     sql = File.read!(Path.join(__DIR__, "fixtures/artifact_durability_reparent_9082cb14.sql"))
     assert :ok = DB.execute(db, sql)
     assert :ok = Schema.ensure_all(db)
@@ -88,8 +103,8 @@ defmodule Tightbeam.FirstRunTourTest do
     assert [] = Org.active_all_by_identity_name(db, "tour-guide")
   end
 
-  defp open!(path) do
-    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [])
+  defp open!(path, payload) do
+    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [], payload_root: payload)
     db
   end
 
