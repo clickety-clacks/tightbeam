@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4f594b13fa33cfae90a5b226e756abb83870da75
+          ref: 1d9208ed128fd3b50dae3e3329ec3e56960f0b1b
           persist-credentials: false
       - uses: erlef/setup-beam@v1
         with:
@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Record tested versions
         run: |
-          test "$(git rev-parse HEAD)" = 4f594b13fa33cfae90a5b226e756abb83870da75
+          test "$(git rev-parse HEAD)" = 1d9208ed128fd3b50dae3e3329ec3e56960f0b1b
           elixir --version
           rustc --version
           sha256sum test/fixtures/releases/0.1.17+5505.sql
@@ -33,4 +33,4 @@ jobs:
           echo "$PWD/cli/target/release" >> "$GITHUB_PATH"
           mix deps.get
       - name: Run the interrupted startup scenario
-        run: scripts/verify_mix.sh test/release_fixture_upgrade_test.exs --trace
+        run: scripts/verify_mix.sh test/release_fixture_upgrade_test.exs test/test_case_test.exs --trace
