@@ -2631,9 +2631,11 @@ defmodule Tightbeam.HarklightWakes do
   def handle_call({:feed_start, handle}, from, state) do
     result =
       if valid_worker?(state, handle, from) do
-        case feed_start(state.db, handle) do
-          {:ok, start} -> {:ok, state.db, start}
-          _ -> {:error, "capture_unavailable"}
+        with :ok <- ensure_feed_item_ids(state.db, handle) do
+          case feed_start(state.db, handle) do
+            {:ok, start} -> {:ok, state.db, start}
+            _ -> {:error, "capture_unavailable"}
+          end
         end
       else
         {:error, "listener_fenced"}
@@ -3421,8 +3423,7 @@ defmodule Tightbeam.HarklightWakes do
     Process.flag(:trap_exit, true)
 
     with executable when is_binary(executable) <- System.find_executable("harklight-agent"),
-         {:ok, db, start} <- GenServer.call(manager, {:feed_start, handle}, :infinity),
-         :ok <- hydrate_feed_items(db, handle) do
+         {:ok, db, start} <- GenServer.call(manager, {:feed_start, handle}, :infinity) do
       case start do
         {:pending, open, older} ->
           open_pending(manager, db, executable, handle, open, older, state_delays)
@@ -3438,7 +3439,7 @@ defmodule Tightbeam.HarklightWakes do
     _ -> finish(manager, handle, "listener_failed")
   end
 
-  defp hydrate_feed_items(db, handle) do
+  defp ensure_feed_item_ids(db, handle) do
     if HarklightItemIds.enabled?(), do: HarklightItemIds.ensure_handle(db, handle), else: :ok
   end
 

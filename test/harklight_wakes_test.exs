@@ -5723,6 +5723,38 @@ defmodule Tightbeam.HarklightWakesTest do
       assert {:ok, []} = pending_row(db)
     end
 
+    test "an unmapped item leaves a stopped pending read and checkpoint intact", %{db: db} do
+      migrated_from_01!(db)
+      enable_item_id_matching!(db)
+      opened_under_02!(db)
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO harklight_pending_opens(handle,rev,token,stopped) VALUES(?1,30,'T1',1)",
+                 [@handle]
+               )
+
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+
+      assert eventually(fn ->
+               case DB.query(db, "SELECT lastError FROM harklight_wake_handles") do
+                 {:ok, [[reason]]} when is_binary(reason) ->
+                   reason =~ "harklight_item_id_unmapped"
+
+                 _ ->
+                   false
+               end
+             end)
+
+      assert {:ok, [[30, "T1", 0, 1]]} = pending_row(db)
+      assert {:ok, [[0]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      assert {:ok, []} = DB.query(db, "SELECT eventId FROM harklight_wake_entries")
+      assert pending_calls(agent) == []
+    end
+
     test "a finished conversation is not opened", %{db: db} do
       migrated_from_01!(db)
 
