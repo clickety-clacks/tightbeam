@@ -29,6 +29,7 @@ defmodule Tightbeam.Identity do
   @publish_step "A successful `tightbeam identity edit` publishes everything on main."
   @publish_step_later "Once it does, a successful `tightbeam identity edit` publishes everything on main."
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
+  @tour_guide_seed_path "archetypes/tour-guide.toml"
   @handoff_seed_path "rules/row-reaction-handoff.toml"
   @product_path_overrides ["guidance/operating-manual.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
@@ -208,24 +209,27 @@ defmodule Tightbeam.Identity do
   end
 
   @doc false
-  def init_after_admission!(base_dir, db) do
+  def init_after_admission!(base_dir, db, seed \\ :neutral)
+      when seed in [:neutral, :tour_guide] do
     :ok = Tightbeam.DB.assert_base_admitted!(db, base_dir)
-    init!(base_dir)
+    init_with_seed!(base_dir, seed)
   end
 
   @doc "Seed a new organization with the neutral identity substrate."
   @spec init!(String.t()) :: :initialized | :noop
-  def init!(base_dir) do
+  def init!(base_dir), do: init_with_seed!(base_dir, :neutral)
+
+  defp init_with_seed!(base_dir, seed) do
     identity_dir = identity_dir(base_dir)
 
     lock = {{__MODULE__, :init, Path.expand(identity_dir)}, self()}
 
     :global.trans(lock, fn ->
-      init_identity!(identity_dir)
+      init_identity!(identity_dir, seed)
     end)
   end
 
-  defp init_identity!(identity_dir) do
+  defp init_identity!(identity_dir, seed) do
     if File.dir?(Path.join(identity_dir, ".git")) do
       verify_required_refs!(identity_dir)
 
@@ -234,13 +238,17 @@ defmodule Tightbeam.Identity do
 
       :noop
     else
+      if seed == :tour_guide and File.lstat(identity_dir) != {:error, :enoent} do
+        raise ArgumentError, "Tour Guide seed requires an absent identity directory"
+      end
+
       candidate =
         identity_dir <> ".candidate-" <> Integer.to_string(System.unique_integer([:positive]))
 
       try do
         File.mkdir_p!(candidate)
         git!(candidate, ["init", "-b", "main"])
-        replace_with_entries!(candidate, seed_entries())
+        replace_with_entries!(candidate, seed_entries(seed))
         validate_tree!(candidate)
         git!(candidate, ["add", "-A"])
         git!(candidate, ["commit", "-m", "seed: neutral-identity"], "tightbeam")
@@ -1499,7 +1507,24 @@ defmodule Tightbeam.Identity do
     end)
   end
 
-  defp seed_entries, do: source_entries(seed_dir())
+  defp seed_entries(seed \\ :neutral)
+  defp seed_entries(:neutral), do: source_entries(seed_dir())
+
+  defp seed_entries(:tour_guide) do
+    overlay = Application.app_dir(:tightbeam, "priv/tour-guide-seed")
+
+    seed_entries(:neutral)
+    |> Map.new()
+    |> Map.merge(Map.new(source_entries(overlay)))
+    |> Enum.sort()
+  end
+
+  defp product_seed(dir, %{previous_baseline: baseline}) do
+    # The product baseline records the initial seed choice independently of org edits.
+    if baseline && tree_entry(dir, baseline, @tour_guide_seed_path),
+      do: :tour_guide,
+      else: :neutral
+  end
 
   defp product_guidance_entries do
     manual =
@@ -1820,7 +1845,7 @@ defmodule Tightbeam.Identity do
 
     # Retained files come first, so a shipped bundle's bytes win on a shared path.
     entries =
-      seed_entries() ++
+      seed_entries(product_seed(dir, product_base)) ++
         Enum.map(retained_files, fn {relative, bytes, _executable?} -> {relative, bytes} end) ++
         Enum.flat_map(shipped, fn name ->
           bundle = bundle_dir(name)
