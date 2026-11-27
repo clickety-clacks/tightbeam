@@ -4,7 +4,7 @@ Tightbeam is like a machined part for running models in their own harness and ta
 
 Just want to try it? [Use the quick install](#quick-install).
 
-Both install paths support macOS on Apple silicon and Linux on x86-64. Have a supported harness CLI on your PATH. Use one install method. The npx command requires Node.js 20 or newer and `tar`, and runs setup for you. With Homebrew, run setup after installing the package.
+Both install paths support macOS on Apple silicon and Linux on x86-64. Have a supported harness CLI on your PATH. Use one install method. The npx command requires Node.js 24 or newer and `tar`, and runs setup for you. With Homebrew, run setup after installing the package.
 
 ## Quick install
 
