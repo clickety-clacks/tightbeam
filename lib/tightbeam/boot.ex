@@ -27,7 +27,7 @@ defmodule Tightbeam.Boot do
 
   defp boot(%{base_dir: base_dir} = config) do
     :ok = Tightbeam.DB.assert_base_admitted!(Tightbeam.DB, base_dir)
-    Tightbeam.Identity.init_after_admission!(base_dir, Tightbeam.DB)
+    Tightbeam.FirstRunTour.init_identity!(base_dir, Tightbeam.DB)
     :ok = Schema.ensure_all(Tightbeam.DB)
     _ = Tightbeam.Identity.RailScopeMigration.run!(base_dir, Tightbeam.DB)
     Tightbeam.Gateway.load_law!(config)

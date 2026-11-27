@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -24,11 +25,34 @@ fn enabled() -> bool {
 }
 
 pub(crate) fn pending() -> bool {
+    let base = crate::base_dir::resolve();
+    let database = base.join("state.db");
     enabled()
-        && crate::base_dir::resolve()
+        && base
             .join(DONE_MARKER)
             .try_exists()
             .is_ok_and(|exists| !exists)
+        && match database.try_exists() {
+            Ok(false) => true, // Setup may run the probe before the Gateway starts.
+            Ok(true) => tour_target(&database).ok().flatten().is_some(),
+            Err(_) => false,
+        }
+}
+
+// Read the bootstrap receipt from this installation's own DB. A role can be
+// rebound later, so the role name cannot identify the recipient of this wake.
+fn tour_target(database: &Path) -> rusqlite::Result<Option<(String, Option<String>)>> {
+    let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.query_row(
+        "SELECT settings.value, sessions.ownerUserId
+           FROM org_settings AS settings
+           LEFT JOIN sessions ON sessions.sessionKey=settings.value AND sessions.state='active'
+           WHERE settings.key='first-run-tour'
+             AND (settings.value='pending' OR sessions.sessionKey IS NOT NULL)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
 }
 
 pub(crate) fn run() -> Result<(), String> {
@@ -55,6 +79,13 @@ pub(crate) fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    let target = tour_target(&base.join("state.db"))
+        .map_err(|error| format!("could not read the Tour Guide bootstrap receipt: {error}"))?;
+    let Some((session, owner)) = target else {
+        return Ok(());
+    };
+    let owner = owner.ok_or("the Gateway has not initialized the Tour Guide yet")?;
+    let session = session.as_str();
     let endpoint = dispatch::discover_from(&base)?;
     let chat = origin(
         &std::env::var("TIGHTBEAM_CHAT_URL")
@@ -97,24 +128,25 @@ pub(crate) fn run() -> Result<(), String> {
     if !mapped {
         return Err("Chat's configured Gateway does not map to this installation".into());
     }
-    let session = get("sessionKey")?;
-    let principal = get("principalKey")?;
-    let identity = Identity::User(principal.into());
+    if get("principalKey")? != owner {
+        return Err("Chat's configured user does not own this installation's Tour Guide".into());
+    }
+    let identity = Identity::User(owner);
     let fact_kind = format!(
         "installer.first-run-project-ready.{:x}",
         Sha256::digest(session.as_bytes())
     );
     let fact_read = dispatch::facts_read_request(&identity, &fact_kind);
     let signal = SessionSignalGuard::install()?;
-    let main_link = chat_link(&chat, &gateway, session);
+    let tour_link = chat_link(&chat, &gateway, session);
     let opened = base.join("first-run-onboarding.opened");
     if !opened.try_exists().map_err(|error| error.to_string())? {
         // Save the launch before dispatch so a refused wake can be retried without a second tab.
         fs::write(opened, b"")
-            .map_err(|error| format!("could not record Main Chat launch: {error}"))?;
-        open_browser(&main_link);
+            .map_err(|error| format!("could not record Tour Guide Chat launch: {error}"))?;
+        open_browser(&tour_link);
     }
-    println!("Open Tightbeam Chat (Main): {main_link}");
+    println!("Open Tightbeam Chat (Tour Guide): {tour_link}");
 
     let prompt = welcome_prompt(&chat, &gateway, &fact_kind);
     let wake = dispatch::build_request(&CliCommand::Wake {
@@ -235,7 +267,7 @@ fn gateway_maps_to_installation(
 fn wait_for_project(
     endpoint: &Endpoint,
     fact_read: &RequestSpec,
-    main_session: &str,
+    tour_session: &str,
     signal: &SessionSignalGuard,
     window: Duration,
 ) -> Option<String> {
@@ -245,7 +277,7 @@ fn wait_for_project(
         if let Ok(Some(response)) =
             dispatch::send_to_with_deadline(endpoint, fact_read, Some(read_deadline))
         {
-            if let Some(session) = ready_project(&response, main_session) {
+            if let Some(session) = ready_project(&response, tour_session) {
                 if !signal.interrupted() {
                     return Some(session.to_owned());
                 }
@@ -258,14 +290,14 @@ fn wait_for_project(
     None
 }
 
-fn ready_project<'a>(response: &'a Value, main_session: &str) -> Option<&'a str> {
+fn ready_project<'a>(response: &'a Value, tour_session: &str) -> Option<&'a str> {
     let fact = &response["fact"];
-    if fact["origin"].as_str()? != format!("agent:{main_session}") {
+    if fact["origin"].as_str()? != format!("agent:{tour_session}") {
         return None;
     }
     fact["scope"]
         .as_str()
-        .filter(|session| !session.trim().is_empty() && *session != main_session)
+        .filter(|session| !session.trim().is_empty() && *session != tour_session)
 }
 
 fn chat_link(chat: &Url, gateway: &Url, session: &str) -> Url {

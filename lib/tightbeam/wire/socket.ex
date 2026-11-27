@@ -635,7 +635,13 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp seed_main_stream_for_chat(subscriptions, user_id, state) do
-    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(user_id, state), else: :ok
+    if MapSet.member?(subscriptions, "chat") do
+      with :ok <- seed_main_stream(user_id, state) do
+        Tightbeam.FirstRunTour.ensure(db(state), Map.fetch!(state.deps, :defaults))
+      end
+    else
+      :ok
+    end
   end
 
   defp main_seed_error do

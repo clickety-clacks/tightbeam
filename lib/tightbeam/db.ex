@@ -818,8 +818,8 @@ defmodule Tightbeam.DB do
   ## Server
 
   @doc false
-  def prepare_schema(server),
-    do: observed_call(server, :prepare_schema, "schema.ensure", call_timeout())
+  def prepare_schema(server, tour_birth? \\ false),
+    do: observed_call(server, {:prepare_schema, tour_birth?}, "schema.ensure", call_timeout())
 
   @doc false
   def finish_schema(server),
@@ -1093,7 +1093,11 @@ defmodule Tightbeam.DB do
     error -> {:reply, {:error, error}, state}
   end
 
-  def handle_call(:prepare_schema, _from, %{conn: conn, admission: admission} = state) do
+  def handle_call(
+        {:prepare_schema, tour_birth?},
+        _from,
+        %{conn: conn, admission: admission} = state
+      ) do
     execute_sql!(conn, "BEGIN IMMEDIATE")
 
     try do
@@ -1107,6 +1111,14 @@ defmodule Tightbeam.DB do
         :ok = Tightbeam.Schema.qualify_guard_stamp!(admission.decision, rows)
       end
 
+      fresh_tour? =
+        tour_birth? and match?(%{stamp: :fresh}, admission) and
+          run_query(
+            conn,
+            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1",
+            []
+          ) == []
+
       :ok =
         execute_sql!(conn, """
         CREATE TABLE IF NOT EXISTS schema_stamp (
@@ -1114,6 +1126,10 @@ defmodule Tightbeam.DB do
           stampedAt INTEGER NOT NULL
         );
         """)
+
+      if fresh_tour? do
+        :ok = Tightbeam.Schema.record_fresh_tour_birth_in_txn(%Txn{conn: conn})
+      end
 
       execute_sql!(conn, "COMMIT")
       {:reply, :ok, state}

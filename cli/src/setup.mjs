@@ -437,7 +437,7 @@ async function setup() {
     if (mode === 'quick') variables.TIGHTBEAM_LOOPBACK_ONLY = 'true';
     if (receipt?.defaultHarness) variables.TIGHTBEAM_DEFAULT_HARNESS = receipt.defaultHarness;
     for (const key of ['TIGHTBEAM_DEFAULT_HARNESS', 'TIGHTBEAM_DEFAULT_MODEL', 'TIGHTBEAM_DEFAULT_EFFORT',
-      'TIGHTBEAM_DEFAULT_CONTEXT', 'TIGHTBEAM_CREDENTIALS_DIRECTORY', 'CODEX_PATH']) {
+      'TIGHTBEAM_DEFAULT_CONTEXT', 'TIGHTBEAM_CREDENTIALS_DIRECTORY', 'CODEX_PATH', 'TIGHTBEAM_FIRST_RUN_ONBOARDING']) {
       if (env[key]) variables[key] = env[key];
     }
 
@@ -538,7 +538,7 @@ async function setup() {
     add(writeChatMap, 'Connect local Chat over loopback and recognize the advertised gateway address as an alias.');
     add(writeChat || startChat, `Start local Tightbeam Chat as a user service.${logoutNote}`);
     add(readiness || pending.length, 'Check whether this installation can run a turn.');
-    add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
+    add(needsFirstRun, 'Open Tightbeam Chat and start the welcome with your Tour Guide.');
     for (const line of [...install, ...notes]) console.log(`- ${line}`);
     if (flags.dryRun || !install.length) return;
     if (!flags.yes && await ask(answers, 'Install yes or no') !== 'yes') return;
@@ -670,15 +670,21 @@ async function setup() {
         }
       }
       if (installChatPackage) installChat(scratch);
-      if (needsMain) {
+      if (needsMain || needsFirstRun) {
         const auth = await gatewayFrame(localOrigin, {
           type: 'auth', deviceId: state.deviceId, token: fs.readFileSync(credentials, 'utf8'), subscriptions: ['chat'],
-        }, 'auth_result');
-        if (!auth.success) throw new Error('Could not set up the main Tightbeam session.');
-        const streams = await getJson(`${localOrigin}/api/streams`, fs.readFileSync(credentials, 'utf8'));
-        state.main = streams?.streams?.find((stream) => stream.kind === 'main')?.sessionKey;
-        if (!state.main) throw new Error('Could not find the main Tightbeam session.');
-        save();
+        }, 'auth_result').catch((error) => {
+          if (needsMain) throw error;
+          console.error(`Could not retry Tour Guide initialization: ${error.message}`);
+          return { success: false };
+        });
+        if (needsMain) {
+          if (!auth.success) throw new Error('Could not set up the main Tightbeam session.');
+          const streams = await getJson(`${localOrigin}/api/streams`, fs.readFileSync(credentials, 'utf8'));
+          state.main = streams?.streams?.find((stream) => stream.kind === 'main')?.sessionKey;
+          if (!state.main) throw new Error('Could not find the main Tightbeam session.');
+          save();
+        }
       }
       if (writeChatMap) {
         const file = path.join(scratch, 'chat-gateways.json');
@@ -720,13 +726,13 @@ async function setup() {
       } else {
         console.log('NOT READY: Tightbeam could not read the gateway readiness check.');
       }
-      if (needsFirstRun && state.ready) {
-        run(targetCli, ['onboard', '--first-run'], {
-          cwd: home, env: onboardingEnv,
+      if (state.ready && command(targetCli, ['onboard', '--first-run', '--check'], { cwd: home, env: onboardingEnv }).status === 0) {
+        const welcome = command(targetCli, ['onboard', '--first-run'], {
+          cwd: home, env: onboardingEnv, stdio: 'inherit',
         });
-      } else {
-        console.log(`Open Main in Chat to get started with Uncle Enzo, the recommended kungfu: ${mainLink}`);
+        if (welcome.status === 0) return;
       }
+      console.log(`Open Main in Chat to get started with Uncle Enzo, the recommended kungfu: ${mainLink}`);
     } catch (error) {
       if (removedQuick && state.gatewayFile) {
         try {

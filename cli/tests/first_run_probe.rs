@@ -26,6 +26,21 @@ fn probe_is_silent_and_read_only_for_disabled_pending_and_completed_installs() {
     probe("false", false);
     probe("true", true);
     assert!(fs::read_dir(&base).unwrap().next().is_none());
+    let database = rusqlite::Connection::open(base.join("state.db")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE org_settings (key TEXT PRIMARY KEY, value TEXT);
+         CREATE TABLE sessions (sessionKey TEXT, ownerUserId TEXT, state TEXT);",
+        )
+        .unwrap();
+    probe("true", false);
+    database
+        .execute(
+            "INSERT INTO org_settings VALUES ('first-run-tour', 'pending')",
+            [],
+        )
+        .unwrap();
+    probe("true", true);
     fs::write(base.join("first-run-onboarding.done"), b"").unwrap();
     probe("true", false);
     fs::remove_dir_all(base).unwrap();

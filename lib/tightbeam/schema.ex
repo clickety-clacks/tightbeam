@@ -410,6 +410,13 @@ defmodule Tightbeam.Schema do
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
   @fresh_owner_link_origin_table "schema_bootstrap_origin"
+  @fresh_owner_link_origin_ddl """
+  CREATE TABLE IF NOT EXISTS #{@fresh_owner_link_origin_table} (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    origin TEXT NOT NULL CHECK(origin='fresh'),
+    createdAt INTEGER NOT NULL
+  );
+  """
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @session_custody_shape "session-custody-v1-0116"
   @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
@@ -6361,6 +6368,39 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  def prepare_tour_birth(db, base_dir) do
+    if Tightbeam.FirstRunTour.enabled?() and
+         File.lstat(Path.join(base_dir, "identity")) == {:error, :enoent} do
+      case DB.prepare_schema(DB.migration_context(db), true) do
+        :ok -> :ok
+        {:error, error} -> raise error
+      end
+    end
+
+    :ok
+  end
+
+  @doc false
+  def record_fresh_tour_birth_in_txn(%Txn{} = txn) do
+    at = System.system_time(:millisecond)
+    Txn.exec(txn, @fresh_owner_link_origin_ddl)
+
+    Txn.q(
+      txn,
+      "INSERT INTO #{@fresh_owner_link_origin_table}(id,origin,createdAt) VALUES(1,'fresh',?1)",
+      [at]
+    )
+
+    Txn.q(txn, "INSERT INTO schema_stamp(shape,stampedAt) VALUES(?1,?2)", [
+      @pre_liveness_shape,
+      at
+    ])
+
+    Txn.exec(txn, Tightbeam.Org.settings_ddl())
+    Tightbeam.FirstRunTour.mark_fresh_in_txn(txn)
+  end
+
   defp ensure_fresh_owner_link_origin(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, []} ->
@@ -6369,14 +6409,7 @@ defmodule Tightbeam.Schema do
                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_stamp', '#{@fresh_owner_link_origin_table}') LIMIT 1"
              ) do
           {:ok, []} ->
-            :ok =
-              DB.execute(db, """
-              CREATE TABLE IF NOT EXISTS #{@fresh_owner_link_origin_table} (
-                id INTEGER PRIMARY KEY CHECK(id=1),
-                origin TEXT NOT NULL CHECK(origin='fresh'),
-                createdAt INTEGER NOT NULL
-              );
-              """)
+            :ok = DB.execute(db, @fresh_owner_link_origin_ddl)
 
             {:ok, []} =
               DB.query(
