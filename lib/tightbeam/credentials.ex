@@ -49,6 +49,15 @@ defmodule Tightbeam.Credentials do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
+  @doc "Resolve an account's credential home on its owning host."
+  def account_target(config, %{"host" => host, "harness" => harness, "slot" => slot}) do
+    with {:ok, target} <- Tightbeam.Placement.account_target(config, host) do
+      module = Harness.parse!(harness)
+      home = Homes.home_path(target.host_config.base_dir, host, module.id(), slot)
+      {:ok, %{target: target, home: home}}
+    end
+  end
+
   @doc "Resolve the lifecycle owner registered for a machine."
   @spec server(String.t()) :: GenServer.server()
   def server(machine) do

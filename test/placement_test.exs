@@ -40,6 +40,23 @@ defmodule Tightbeam.PlacementTest do
     %{base_dir: base_dir, db: db}
   end
 
+  test "account targets resolve against the owning host", %{base_dir: base_dir, db: db} do
+    register_hosts(db, %{
+      "remote" => %{ssh: "worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
+    })
+
+    config = %{base_dir: base_dir, db: db}
+    slot = "acct_" <> Tightbeam.Id.uuid4()
+    account = %{"host" => "remote", "harness" => "claude", "slot" => slot}
+
+    assert {:ok, %{target: target, home: home}} = Credentials.account_target(config, account)
+    assert target.host_config.ssh == "worker"
+    assert home == Path.join("/srv/tightbeam/homes/remote/claude-accounts", slot)
+
+    assert {:error, :unknown_host} =
+             Credentials.account_target(config, %{account | "host" => "absent"})
+  end
+
   test "harness binary probe resolves versions and classifies missing and failed executables", %{
     base_dir: base_dir
   } do
