@@ -17,7 +17,7 @@ REQUIRED_TABLES = (
 )
 GENERATED_VALUE = re.compile(
     r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
-    r"|(?P<short>(?:wi|art|dr|asg|at)_[0-9a-f]{8,32})\b"
+    r"|(?P<short>(?:wi|art|dr|asg|att)_[0-9a-f]{8,32})\b"
     r"|(?P<token>tb[a-z]*_[A-Za-z0-9_-]{24,})"
 )
 
@@ -69,6 +69,7 @@ def generate(archive, faketime, output):
             "HOME": str(scratch / "home"),
             "TMPDIR": str(scratch),
             "LC_ALL": "C",
+            "npm_config_offline": "true",
             "TZ": "UTC",
             "TIGHTBEAM_BASE_DIR": str(scratch / "base"),
             "TIGHTBEAM_PORT": str(port),

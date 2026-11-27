@@ -56,13 +56,13 @@ end
   )
 
 %{artifact_id: _} =
-  Artifacts.record(call.("artifact-record", holder, %{
+  Artifacts.record(%{call.("artifact-record", holder, %{
     work_item_id: work,
     kind: "report",
     title: "Fixture artifact",
     origin_path: "/fixture/report.txt",
     allow_unpinned: true
-  }))
+  }) | session_key: holder})
 
 %{id: _} =
   Escalation.operator_ask(call.("operator-ask", holder, %{
