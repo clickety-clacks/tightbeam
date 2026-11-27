@@ -168,6 +168,15 @@ defmodule Tightbeam.HolderProdTest do
   end
 
   setup do
+    previous_item_wait_flag = Application.get_env(:tightbeam, :work_item_waits_enabled)
+    Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+
+    on_exit(fn ->
+      if is_nil(previous_item_wait_flag),
+        do: Application.delete_env(:tightbeam, :work_item_waits_enabled),
+        else: Application.put_env(:tightbeam, :work_item_waits_enabled, previous_item_wait_flag)
+    end)
+
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
     sql!(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('fixture-owner',0,1)")
@@ -252,6 +261,43 @@ defmodule Tightbeam.HolderProdTest do
     record_wait(ctx.db, "holder", "holder", threshold + @quiet, :fact)
     refute HolderProd.evidence(ctx.db, @assignment, "holder")
     assert %{state: "fired", delivered_turn_seq: ^seq} = Wakes.get(ctx.db, wake_id)
+  end
+
+  test "an item-only wait does not quiet the same session's assignment prods", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+
+    item =
+      handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        principal: {:session, "holder"},
+        origin: "session:holder",
+        params: %{title: "Separate item waiting on an event"}
+      })
+
+    handlers["work-item-update"].(%{
+      verb: "work-item-update",
+      principal: {:session, "holder"},
+      origin: "session:holder",
+      params: %{work_item_id: item.id, delivery_owner_session_key: "holder"}
+    })
+
+    assert %{wait: %{active: true}} =
+             handlers["work-item-wait"].(%{
+               verb: "work-item-wait",
+               principal: {:session, "holder"},
+               origin: "session:holder",
+               params: %{
+                 work_item_id: item.id,
+                 condition_kind: "upstream-ready",
+                 condition_scope: "dependency",
+                 after_ms: 12 * @quiet,
+                 wait_reason: "Waiting on a different item"
+               }
+             })
+
+    assert deadline(ctx.db) == ctx.opened + @quiet
+    sweep(ctx.db, ctx.opened + @quiet)
+    assert [[_, "holder", "pending"]] = notices(ctx.db)
   end
 
   for wait <- [:timed, :fact, :predicate, :after_turn] do
