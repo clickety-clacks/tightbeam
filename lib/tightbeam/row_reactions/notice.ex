@@ -21,7 +21,10 @@ defmodule Tightbeam.RowReactions.Notice do
         )
 
       %{state: "canceled"} ->
-        if Wakes.undelivered_notice_in_txn?(txn, id) do
+        if Wakes.undelivered_notice_in_txn?(txn, id,
+             consumer_unavailable:
+               slate_reference?(get_in(action, ["plan", "value", "reference"]))
+           ) do
           Store.record(
             txn,
             action,
@@ -156,7 +159,8 @@ defmodule Tightbeam.RowReactions.Notice do
               if (available or value["on_unavailable"] == "schedule") and
                    get_in(action, ["result", "delivery"]) == "undelivered" do
                 Wakes.retry_undelivered_notice_in_txn(txn, id, input, at,
-                  paced: slate_reference?(value["reference"])
+                  paced: slate_reference?(value["reference"]),
+                  consumer_unavailable: slate_reference?(value["reference"])
                 )
               else
                 raise ArgumentError, "reaction output identity is already terminal"

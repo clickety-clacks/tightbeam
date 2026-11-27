@@ -3930,16 +3930,16 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
-  def undelivered_notice_in_txn?(txn, id) do
+  def undelivered_notice_in_txn?(txn, id, opts \\ []) do
     Txn.q(
       txn,
       """
       SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId
       WHERE w.wakeId=?1 AND w.state='canceled' AND w.deliveredTurnSeq IS NULL
-        AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
+        AND (c.reasonKind='target_unresolvable' OR (?2=1 AND c.reasonKind='consumer_unavailable'))
         AND EXISTS (SELECT 1 FROM lifecycle_events e WHERE e.kind='wake_undeliverable' AND e.subject=w.wakeId)
       """,
-      [id]
+      [id, if(Keyword.get(opts, :consumer_unavailable, false), do: 1, else: 0)]
     ) == [[1]]
   end
 
@@ -3948,7 +3948,7 @@ defmodule Tightbeam.Wakes do
   # recipient and deadline in the same transaction.
   @doc false
   def retry_undelivered_notice_in_txn(txn, previous_id, input, at, opts \\ []) do
-    unless undelivered_notice_in_txn?(txn, previous_id),
+    unless undelivered_notice_in_txn?(txn, previous_id, opts),
       do: raise(ArgumentError, "notice has no undelivered attempt to resume")
 
     {root, attempt} = retry_identity_in_txn(txn, previous_id)

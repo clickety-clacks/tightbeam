@@ -633,6 +633,55 @@ defmodule Tightbeam.WorkItemBracketsTest do
              )
   end
 
+  test "oversized ordinary routing notice keeps its cancellation through general recovery", ctx do
+    Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
+    path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    oversized = String.duplicate("x", 1_100_000)
+
+    rules =
+      String.replace(
+        File.read!(path),
+        ~s(template = "work-item-routing",),
+        ~s(template = "work-item-routing", prompt = "#{oversized}",)
+      )
+
+    File.write!(path, rules)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    item = create(ctx, {:user, "flynn"}, %{title: "Ordinary routing size failure"})
+    first = routing_wake_id(ctx.db, item.id)
+    wake = Wakes.get(ctx.db, first)
+
+    DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey=?1", [wake.session_key])
+
+    assert byte_size(wake.prompt) == 1_100_000
+    _ = NoticeBatcher.recover(ctx.db, wake.due_at + 1000)
+    assert Wakes.get(ctx.db, first).state == "canceled"
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert routing_wake_id(ctx.db, item.id) == nil
+    assert item_wake_count(ctx.db, item.id) == 0
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [first]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_retry_attempts WHERE predecessorWakeId=?1",
+               [first]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1",
+               [first]
+             )
+  end
+
   test "oversized rendered slate becomes one paced compact retry without an owner miss", ctx do
     Application.delete_env(:tightbeam, :work_item_followthrough_enabled)
     rules_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
