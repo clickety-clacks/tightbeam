@@ -20,14 +20,20 @@ defmodule Tightbeam.FirstRunTourTest do
 
     on_exit(fn ->
       if flag, do: System.put_env(@flag, flag), else: System.delete_env(@flag)
-      if archetypes, do: :persistent_term.put(Archetypes, archetypes), else: :persistent_term.erase(Archetypes)
+
+      if archetypes,
+        do: :persistent_term.put(Archetypes, archetypes),
+        else: :persistent_term.erase(Archetypes)
+
       File.rm_rf!(base)
     end)
 
     %{path: Path.join(base, "state.db")}
   end
 
-  test "fresh bootstrap records eligibility and recovery keeps the exact seeded session", %{path: path} do
+  test "fresh bootstrap records eligibility and recovery keeps the exact seeded session", %{
+    path: path
+  } do
     System.put_env(@flag, "true")
     db = open!(path)
     assert :ok = Schema.ensure_all(db)
