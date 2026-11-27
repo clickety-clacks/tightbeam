@@ -26,7 +26,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     port = boot(base, true)
     pid = await_checkpoint(port)
     assert {_, 0} = System.cmd("kill", ["-KILL", pid])
-    assert await_exit(port) == {137, false}
+    assert {137, false, _output} = await_exit(port)
 
     assert provider_schema?(db) == schema_existed?
     assert intact?(db)
@@ -71,28 +71,34 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     ])
   end
 
-  defp await_checkpoint(port) do
+  defp await_checkpoint(port, output \\ []) do
     receive do
       {^port, {:data, {:eol, "UPGRADE_TRANSACTION_OPEN " <> pid}}} -> pid
-      {^port, {:data, _}} -> await_checkpoint(port)
-      {^port, {:exit_status, status}} -> flunk("first boot exited with #{status} before migration checkpoint")
+      {^port, {:data, {_, line}}} ->
+        await_checkpoint(port, [line | output])
+
+      {^port, {:exit_status, status}} ->
+        flunk("first boot exited with #{status} before migration checkpoint:\n#{boot_log(output)}")
     after
-      30_000 -> flunk("first boot did not enter the migration transaction")
+      30_000 -> flunk("first boot did not enter the migration transaction:\n#{boot_log(output)}")
     end
   end
 
-  defp await_exit(port, ready? \\ false) do
+  defp await_exit(port, ready? \\ false, output \\ []) do
     receive do
-      {^port, {:data, {:eol, "UPGRADE_READY"}}} -> await_exit(port, true)
-      {^port, {:data, _}} -> await_exit(port, ready?)
-      {^port, {:exit_status, status}} -> {status, ready?}
+      {^port, {:data, {:eol, "UPGRADE_READY"}}} -> await_exit(port, true, output)
+      {^port, {:data, {_, line}}} -> await_exit(port, ready?, [line | output])
+      {^port, {:exit_status, status}} -> {status, ready?, boot_log(output)}
     after
-      30_000 -> flunk("upgrade subprocess did not exit")
+      30_000 -> flunk("upgrade subprocess did not exit:\n#{boot_log(output)}")
     end
   end
+
+  defp boot_log(output), do: output |> Enum.take(30) |> Enum.reverse() |> Enum.join("\n")
 
   defp assert_upgrade(base, db, original) do
-    assert await_exit(boot(base, false)) == {0, true}
+    {status, ready?, output} = await_exit(boot(base, false))
+    assert {status, ready?} == {0, true}, "restart did not complete:\n#{output}"
     assert provider_schema?(db)
     assert intact?(db)
     assert preserved_rows(db) == original
