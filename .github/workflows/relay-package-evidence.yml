@@ -1,0 +1,45 @@
+name: optional relay package evidence
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/relay-package-evidence.yml"
+      - "packaging/relay-payload.py"
+
+permissions:
+  contents: read
+
+jobs:
+  layout-fixture:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: clickety-clacks/harklight-tightbeam-pack
+          ref: 883d44b201177e77315c675d8f96de4d77692f82
+          path: layout-fixture
+          persist-credentials: false
+      - name: Exercise the importer and archive verifier on the layout fixture
+        run: |
+          set -euo pipefail
+          fixture=883d44b201177e77315c675d8f96de4d77692f82
+          tree=d183dcadf33e83bd7435f9f93ad3341c8ee22c32
+          test "$(git -C layout-fixture rev-parse HEAD)" = "$fixture"
+          python3 packaging/relay-payload.py import layout-fixture "$fixture" "$tree" "$RUNNER_TEMP/vendor"
+          python3 packaging/relay-payload.py assemble "$RUNNER_TEMP/vendor" \
+            "$RUNNER_TEMP/tightbeam/optional/harklight-people-relay"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/layout-fixture.tgz" tightbeam
+          python3 packaging/relay-payload.py verify-archive "$RUNNER_TEMP/layout-fixture.tgz"
+          printf 'mutation\n' >> "$RUNNER_TEMP/vendor/relay.py"
+          if python3 packaging/relay-payload.py assemble "$RUNNER_TEMP/vendor" "$RUNNER_TEMP/refused"; then
+            echo "A changed relay member was accepted" >&2
+            exit 1
+          fi
+          test ! -e "$RUNNER_TEMP/refused"
