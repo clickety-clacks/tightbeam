@@ -25,3 +25,6 @@ This register is not an inventory of every existing configuration option.
 | `provider_accounts_enabled` | Creates the provider-account schema and enables shared-login backfill at gateway startup. | `false` | Gateway | Remove after provider-account lifecycle and upgrade acceptance. |
 
 | `work_item_followthrough_enabled` | Observes successful owner turns carrying the saved slate reminder and promptly replaces its pending reminder according to the existing r05 policy. Supervising-exec routing requires an explicit unique `work-item-followthrough-supervision` policy relation; no relation ships by default. No schema migration. | `false` | Work coordination | Remove after item-wait integration, isolated race/recovery acceptance, and release-owner soak acceptance. |
+| `work_item_waits_enabled` (`TIGHTBEAM_WORK_ITEM_WAITS_ENABLED=true`) | Records explicit item waits and quiets only their routing/slate reminders. | `false` | Work-item coordination | Remove after explicit rollout approval and release-soak acceptance. |
+
+The item-wait table is additive upgrade schema and is created even while the flag is off. Disabled commands refuse without writing rows; reads omit the wait field and reminder logic does not consult item waits. Enabling the flag requires an operator configuration change.

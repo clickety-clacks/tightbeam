@@ -74,6 +74,8 @@ defmodule Tightbeam.GatewayTest do
 
     expected = expected ++ ~w(memento-set mementos)
 
+    expected = expected ++ ~w(work-item-wait work-item-wait-withdraw)
+
     expected =
       expected ++ ~w(subtree-guidance-set subtree-guidance-withdraw subtree-guidance-show)
 

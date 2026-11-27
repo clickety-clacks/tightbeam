@@ -8,7 +8,8 @@ defmodule Tightbeam.WorkItemFollowthrough do
 
   # Carry the episode through the existing delivery replacement. This is not a
   # second reminder: the only actionable notice remains work_items.slateWakeId.
-  def delivery_context(txn, wake_id, session_key) do
+  def delivery_context(txn, wake_id, item_id) do
+    [[session_key]] = Txn.q(txn, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id=?1", [item_id])
     prior =
       case Store.output_event(txn, wake_id) do
         {event, _} -> get_in(event, ["sourceAfter", "followThrough"])
@@ -92,6 +93,7 @@ defmodule Tightbeam.WorkItemFollowthrough do
              [item_id]
            ),
          true <- is_binary(current),
+         false <- Tightbeam.WorkItemWaits.active_in_txn?(txn, item_id),
          [[1]] <-
            Txn.q(
              txn,

@@ -160,6 +160,9 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "open_assignment_count" => count,
       "work_item_followthrough_enabled" => Tightbeam.WorkItemFollowthrough.enabled?(),
       "work_item_supervision" => Tightbeam.WorkItemFollowthrough.route(txn, item),
+      "work_item_wait_active" => Tightbeam.WorkItemWaits.active_in_txn?(txn, id),
+      "has_assignments" =>
+        Txn.q(txn, "SELECT 1 FROM assignments WHERE workItemId=?1 LIMIT 1", [id]) != [],
       "personal_session_key" => personal,
       "sessions" =>
         sessions(txn, [

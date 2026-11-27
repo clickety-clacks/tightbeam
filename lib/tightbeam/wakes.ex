@@ -1874,6 +1874,50 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc false
+  def no_deadline, do: 253_402_300_799_000
+
+  @doc false
+  def register_work_item_wait_in_txn(txn, input, declaration) do
+    if Tightbeam.WorkItemWaits.enabled?() do
+      register_enabled_work_item_wait_in_txn(txn, input, declaration)
+    else
+      {:error, Tightbeam.WorkItemWaits.disabled_error()}
+    end
+  end
+
+  defp register_enabled_work_item_wait_in_txn(txn, input, declaration) do
+    with :ok <- Tightbeam.WaitReason.validate(input[:wait_reason], "--wait-reason"),
+         {:ok, _contracts} <- dependency_contracts(declaration.conditions),
+         {:ok, resolver} <-
+           item_resolver_in_txn(txn, declaration.resolver_ref, input.owner_user_id),
+         {:ok, evaluation} <-
+           RuleRuntime.evaluate_predicate_in_txn(txn, %{
+             owner_user_id: input.owner_user_id,
+             conditions: declaration.conditions,
+             bindings: declaration.bindings
+           }) do
+      :ok = activate_wait_recognition_in_txn(txn)
+
+      wake =
+        schedule_in_txn(
+          txn,
+          Map.merge(input, %{
+            obligation_ref: input.work_item_id,
+            wait_mode: "dependency",
+            predicate: evaluation.canonical,
+            resolver_kind: resolver.kind,
+            resolver_id: resolver.id,
+            resolver_holder: resolver.holder,
+            resolver_addressee: resolver.addressee
+          })
+        )
+
+      Tightbeam.WorkItemWaits.link_in_txn(txn, input.work_item_id, wake)
+      recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
+    end
+  end
+
   defp recheck_wait_admission_in_txn(txn, input) do
     call = %{
       verb: "wake",
@@ -2348,7 +2392,7 @@ defmodule Tightbeam.Wakes do
            id: id,
            holder: "user:" <> request_owner,
            addressee: addressee,
-           terminal: status in ~w(ruled consumed withdrawn superseded),
+           terminal: status in ~w(answered returned ruled consumed withdrawn superseded),
            disposition: status
          }}
 
@@ -2708,8 +2752,22 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  # A fact occurrence has a predicate and safety deadline, but no record
+  # resolver. Keep the existing nullable resolver columns rather than inventing
+  # an assignment or another scheduler for event waits.
+  defp item_resolver_in_txn(_txn, %{kind: kind}, _owner) when kind in [nil, "condition_fact"] do
+    {:ok, %{kind: nil, id: nil, holder: nil, addressee: nil, terminal: false, disposition: nil}}
+  end
+
+  defp item_resolver_in_txn(txn, ref, owner), do: resolver_in_txn(txn, ref, owner)
+
   defp resolver_for_wake_in_txn(txn, %{resolver_kind: kind, resolver_id: id} = wake) do
-    case resolver_in_txn(txn, %{kind: kind, id: id}, wake.owner_user_id) do
+    result =
+      if Tightbeam.WorkItemWaits.linked_in_txn?(txn, wake.wake_id),
+        do: item_resolver_in_txn(txn, %{kind: kind, id: id}, wake.owner_user_id),
+        else: resolver_in_txn(txn, %{kind: kind, id: id}, wake.owner_user_id)
+
+    case result do
       {:ok, resolver} -> resolver
       {:error, error} -> raise DB.Error, message: "stored wait resolver refused: #{error.message}"
     end
@@ -2755,6 +2813,7 @@ defmodule Tightbeam.Wakes do
 
     if Txn.changes(txn) == 1 do
       schedule_changed_in_txn(txn, :wake_ready)
+      Tightbeam.WorkItemWaits.release_in_txn(txn, wake.wake_id)
 
       EventLog.lifecycle_in_txn(
         txn,
@@ -2796,7 +2855,7 @@ defmodule Tightbeam.Wakes do
         value
 
       {"decision_request.status", value}
-      when value in ~w(ruled consumed withdrawn superseded) ->
+      when value in ~w(answered returned ruled consumed withdrawn superseded) ->
         value
 
       _ ->
@@ -4252,8 +4311,13 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   def readdress_accountability_notices_in_txn(%Txn{} = txn, work_item_id)
-      when is_binary(work_item_id),
-      do: Tightbeam.RowReactions.reconcile_work_item_in_txn(txn, work_item_id)
+      when is_binary(work_item_id) do
+    for [wake_id] <-
+          Txn.q(txn, "SELECT wakeId FROM work_item_waits WHERE workItemId=?1", [work_item_id]),
+        do: Tightbeam.WorkItemWaits.readdress_in_txn(txn, wake_id)
+
+    Tightbeam.RowReactions.reconcile_work_item_in_txn(txn, work_item_id)
+  end
 
   def readdress_accountability_notices_in_txn(%Txn{}, _), do: :ok
 
@@ -4604,6 +4668,8 @@ defmodule Tightbeam.Wakes do
       result = commit_cancellation(txn, wake, cancellation)
 
       if result != false do
+        Tightbeam.WorkItemWaits.release_in_txn(txn, wake.wake_id)
+
         Tightbeam.HarnessRecoveryNotice.settle_wake_cancellation_in_txn(
           txn,
           wake.wake_id,
@@ -4822,6 +4888,18 @@ defmodule Tightbeam.Wakes do
   end
 
   defp pending_wake(_txn, _command), do: :error
+
+  # The work-item command has checked owner/admin or current delivery custody.
+  # This withdraws that item's wait, not any other sender's notice.
+  defp authorize_cancel(
+         %{
+           requester: %{kind: kind},
+           reason_kind: "requester_withdrew",
+           item_wait_withdrawal: true
+         },
+         %{work_item_id: id, assignment_id: nil}
+       )
+       when kind in ["user", "session"] and is_binary(id), do: :ok
 
   defp authorize_cancel(
          %{
@@ -7429,6 +7507,8 @@ defmodule Tightbeam.Wakes do
   end
 
   defp deliver_wait_in_txn(txn, wake_id, delivery_opts) do
+    Tightbeam.WorkItemWaits.readdress_in_txn(txn, wake_id)
+
     case wait_in_txn(txn, wake_id) do
       %{state: "pending", recognition_path: path} = wake when is_binary(path) ->
         if wait_eligible_in_txn?(txn, wake) do

@@ -113,6 +113,44 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     %{db: db, db_opts: db_opts, scheduler: scheduler, registry: registry, lane: lane, base: base}
   end
 
+  for terminal <- [:answer, :return] do
+    @terminal terminal
+    test "ordinary holder wait recognizes agent #{@terminal} at the source write", ctx do
+      request =
+        Escalation.ask(ctx.db, %{
+          verb: "ask",
+          origin: "agent:resolver",
+          principal: {:session, "resolver"},
+          session_key: "holder",
+          params: %{question: "Proceed?"}
+        })
+
+      wait = register_wait(ctx.db, due_after(), decision_predicate(request.id, "answered"))
+
+      call = %{
+        verb: to_string(@terminal),
+        principal: {:session, "holder"},
+        origin: "agent:holder",
+        params: %{request: request.id, answer: "Proceed", reason: "Need context"}
+      }
+
+      result =
+        if @terminal == :answer,
+          do: Escalation.answer(ctx.db, call),
+          else: Escalation.return_request(ctx.db, call)
+
+      assert result.status == if(@terminal == :answer, do: "answered", else: "returned")
+      recognized = Wakes.get(ctx.db, wait.wake_id)
+
+      assert recognized.recognition_path ==
+               if(@terminal == :answer, do: "success", else: "reconsideration")
+
+      assert recognized.recognition_disposition == result.status
+      assert recognized.recognition_transition["domain"] == "decision_request"
+      assert recognized.recognition_transition["row_id"] == request.id
+    end
+  end
+
   test "a corrupt due dependency leaves its evidence untouched while another wait delivers",
        ctx do
     bad = register_wait(ctx.db, due_after(), predicate("R"))
