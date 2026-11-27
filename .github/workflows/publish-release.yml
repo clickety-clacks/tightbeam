@@ -329,6 +329,7 @@ jobs:
       id-token: write
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
     steps:
       - name: Check publication credentials
         env:
@@ -397,6 +398,15 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bash packaging/publish-install-channels.sh "$PWD/channels" "$PWD/homebrew-tap"
 
+      - uses: Homebrew/actions/setup-homebrew@main
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+
+      - name: Verify setup through the published npm and Homebrew commands
+        if: ${{ hashFiles('packaging/smoke/verify-setup-entrypoints.sh') != '' }}
+        shell: bash
+        run: |
+          source packaging/smoke/verify-setup-entrypoints.sh
+          verify_public_setup_entrypoints "$PWD/channels/npm/package.json" "$CANDIDATE_SHA"
   generate-fixture:
     needs: publish
     runs-on: ubuntu-24.04

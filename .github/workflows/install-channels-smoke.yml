@@ -7,6 +7,7 @@ on:
       - "packaging/npm/**"
       - "packaging/*install-channels*"
       - "packaging/smoke/install-channels.sh"
+      - "packaging/smoke/verify-setup-entrypoints.sh"
   workflow_dispatch:
     inputs:
       release_tag:
