@@ -32,9 +32,10 @@ Use a separate base directory and port for each gateway on the same machine. See
 Tightbeam ships two skills for external agents. [tightbeam-cli](../priv/skills/tightbeam-cli/SKILL.md) is for an agent holding an assignment and a Tightbeam session credential in its worktree. [tightbeam-operator](../priv/skills/tightbeam-operator/SKILL.md) is for an agent acting on behalf of a user.
 
 Run `tightbeam skill install` to install the versions carried by your CLI into
-existing `~/.claude/skills` and `~/.codex/skills` directories, or their equivalents
-under `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. Use `--skill <name>` to select a skill
-or `--dir <directory>` to choose a destination.
+`~/.claude/skills` and `~/.codex/skills` (under `CLAUDE_CONFIG_DIR` and
+`CODEX_HOME` when set), skipping a harness whose configuration directory
+does not exist. Use `--skill <name>` to select a skill or `--dir <directory>`
+to choose a destination.
 
 To install by hand, copy the entire skill directory from the release you run.
 Keep the directory name and `SKILL.md` filename unchanged. Start a fresh agent session
