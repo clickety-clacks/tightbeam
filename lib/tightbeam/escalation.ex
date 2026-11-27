@@ -1075,6 +1075,88 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc false
+  def validate_people_decision_in_txn(txn, request_id, sender, work, address, choices) do
+    with %{
+           kind: "operator",
+           status: "open",
+           owner_user_id: owner,
+           current_raiser_session_key: ^sender
+         } = request <- request_in_txn_optional(txn, request_id),
+         true <- address == "user:" <> owner,
+         true <-
+           Enum.all?(choices, fn choice ->
+             Enum.any?(request.options, &(&1["label"] == choice["label"]))
+           end),
+         true <- request.context["workItemId"] == work do
+      :ok
+    else
+      _ ->
+        error(
+          "invalid",
+          "decision must be open, belong to the sender, and name its owner as decider"
+        )
+    end
+  end
+
+  @doc false
+  def rule_people_decision_in_txn(txn, message, response, holder) do
+    request_id = message["decision_request_id"]
+    address = message["answer_rule"]["address"]
+    choice = Enum.find(message["choices"], &(&1["id"] == response))
+
+    with %{kind: "operator", status: "open", owner_user_id: owner} = request <-
+           request_in_txn_optional(txn, request_id),
+         true <- address == "user:" <> owner,
+         true <- message["choices"] == [] or is_map(choice) do
+      params = if choice, do: %{decision: choice["label"]}, else: %{response: response}
+
+      call = %{
+        verb: "operator-rule",
+        principal: {:user, owner},
+        origin: "process:tightbeam",
+        session_key: nil,
+        params: Map.put(params, :request_id, request_id)
+      }
+
+      with {:ok, answer} <- normalize_operator_answer(call),
+           {result, fact_id} <- operator_rule_in_txn(txn, call, request_id, answer, []),
+           false <- Map.has_key?(result, :code) do
+        unless coordinator_request?(request) do
+          transition =
+            changed_decision_transition(
+              request,
+              request_in_txn(txn, request_id),
+              call.origin,
+              "operator-rule"
+            )
+
+          Wakes.row_commit_in_txn(txn, List.wrap(transition))
+        end
+
+        wake_id =
+          case Txn.q(
+                 txn,
+                 """
+                 SELECT wakeId FROM wakes WHERE conditionKind=?1 AND conditionScope=?2
+                   AND sessionKey=?3 AND origin='process:tightbeam' AND prompt=?4
+                   AND state='pending'
+                 """,
+                 [@terminal_condition_kind, request_id, holder, terminal_notification(request_id)]
+               ) do
+            [[id]] -> id
+            _ -> nil
+          end
+
+        {:ok, wake_id, fact_id}
+      else
+        _ -> :ineligible
+      end
+    else
+      _ -> :ineligible
+    end
+  end
+
   defp warn_non_owner_ruling(%{code: _} = result, _db, _call, _request_id), do: result
 
   defp warn_non_owner_ruling(result, db, call, request_id) when is_map(result) do

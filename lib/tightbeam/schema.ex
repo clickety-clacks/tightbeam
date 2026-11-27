@@ -2129,6 +2129,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_effort_holder_activity_cancellation_v1(db)
     :ok = upgrade_row_reaction_cancellation_v1(db)
     :ok = upgrade_evidence_release(db)
+    if Tightbeam.PeopleMessages.enabled?(), do: :ok = Tightbeam.PeopleMessages.ensure_schema(db)
 
     sender_repair_counts = Tightbeam.Projection.repair_missing_human_senders(db)
 
