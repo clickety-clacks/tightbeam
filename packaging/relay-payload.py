@@ -14,7 +14,10 @@ import tarfile
 REPOSITORY = "https://github.com/clickety-clacks/harklight-tightbeam-pack"
 TREE_PATH = "pack/relay"
 SOURCE_RECORD = "SOURCE.json"
-ARCHIVE_ROOT = "tightbeam/optional/harklight-people-relay"
+RUNTIME_ROOT = "tightbeam/optional/harklight-people-relay"
+ARCHIVE_ROOT = RUNTIME_ROOT + "/source"
+RUNTIME_DOC = "README.md"
+UNIT = "harklight-people-relay-watch.service"
 RELAY_MEMBERS = {
     "README.md": "100644",
     "addresses.py": "100644",
@@ -123,12 +126,37 @@ def validate_members(files):
     return manifest
 
 
-def verify_archive(path):
+def verify_archive(path, operating_system):
     files = {}
+    support = {
+        RUNTIME_ROOT: (None, 0o755),
+        f"{RUNTIME_ROOT}/{RUNTIME_DOC}": (RUNTIME_DOC, 0o644),
+    }
+    if operating_system == "linux":
+        support[f"{RUNTIME_ROOT}/systemd"] = (None, 0o755)
+        support[f"{RUNTIME_ROOT}/systemd/{UNIT}"] = (UNIT, 0o644)
+    found_support = set()
     directory = False
     with tarfile.open(path, "r:gz") as archive:
         for member in archive:
-            if member.name == ARCHIVE_ROOT:
+            if member.name in support:
+                name, mode = support[member.name]
+                if member.name in found_support or member.mode != mode:
+                    raise ValueError(f"unexpected relay archive entry: {member.name}")
+                found_support.add(member.name)
+                if name is None:
+                    if not member.isdir():
+                        raise ValueError(f"expected a directory: {member.name}")
+                else:
+                    if not member.isfile():
+                        raise ValueError(f"expected a regular file: {member.name}")
+                    source = Path(__file__).with_name("relay-runtime") / name
+                    with archive.extractfile(member) as data:
+                        content = data.read()
+                    if content != source.read_bytes():
+                        raise ValueError(f"relay archive bytes do not match source: {member.name}")
+                    print(f"{mode:04o} {hashlib.sha256(content).hexdigest()} {member.name}")
+            elif member.name == ARCHIVE_ROOT:
                 if directory or not member.isdir() or member.mode != 0o755:
                     raise ValueError("relay archive root is duplicated or has an unexpected type or mode")
                 directory = True
@@ -138,8 +166,10 @@ def verify_archive(path):
                     raise ValueError(f"unexpected relay archive entry: {member.name}")
                 with archive.extractfile(member) as data:
                     files[name] = data.read()
-    if not directory:
-        raise ValueError("relay archive root is missing")
+            elif member.name.startswith(RUNTIME_ROOT + "/"):
+                raise ValueError(f"unexpected member under the relay runtime root: {member.name}")
+    if not directory or found_support != set(support):
+        raise ValueError("relay archive is missing a source or runtime member")
     manifest = validate_members(files)
     print(f"relay payload: commit={manifest['commit']} tree={manifest['tree']}")
     for name in sorted(files):
@@ -159,6 +189,7 @@ def main():
     assembler.add_argument("destination", type=Path)
     verifier = commands.add_parser("verify-archive")
     verifier.add_argument("archive", type=Path)
+    verifier.add_argument("platform", choices=["linux", "darwin"])
     args = parser.parse_args()
     try:
         if args.command == "import":
@@ -168,7 +199,7 @@ def main():
             validate_members(files)
             write_members(args.destination, files)
         else:
-            verify_archive(args.archive)
+            verify_archive(args.archive, args.platform)
     except (OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"relay payload: {error}\n")
 
