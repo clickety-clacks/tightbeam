@@ -46,6 +46,13 @@ cp packaging/tightbeam-select "$OUT/bin/tightbeam-select"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
 cp -R packaging/release-install "$OUT/release-install"
 
+# This identifies packages assembled from a checkout for setup. It carries
+# no upgrade authority. Source archives must still assemble without Git.
+if SOURCE=$(git rev-parse --verify HEAD 2>/dev/null); then
+  BUILD=$(git rev-list --count "$SOURCE")
+  printf '{"commit":"%s","tag":"v%s+%s"}\n' "$SOURCE" "$VERSION" "$BUILD" > "$OUT/setup-build.json"
+fi
+
 # Only the validated tagged push release carries automatic live-base adoption
 # authority. Candidate and manually dispatched workflows intentionally omit this
 # file, even when their ref happens to be a tag-shaped name.

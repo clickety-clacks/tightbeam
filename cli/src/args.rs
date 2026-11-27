@@ -197,6 +197,10 @@ pub enum Command {
         work_item_id: Option<String>,
         session_key: Option<String>,
     },
+    PeopleMessage {
+        verb: String,
+        params: serde_json::Value,
+    },
     HarklightSend {
         identity: Identity,
         session: String,
@@ -1053,6 +1057,24 @@ COMMANDS:
       --status received|applied|refused [--op-id <uuid>]
       Report what happened to a delivered Harklight answer. If uncertain, retry with
       unchanged inputs and the operation ID returned in the response.
+  people-send --json '<object>'
+      Queue a message. Omitted or empty addresses use the work-item owner.
+  people-update --json '<object>'
+      Update a conversation at its current revision.
+  people-reply --json '<object>'
+      Reply to everyone, optionally mentioning one address.
+  people-withdraw --json '<object>'
+      Withdraw a conversation as its sender.
+  people-status --json '<object>'
+      Read delivery status, waiting records and per-address outcomes.
+  people-collect --json '<object>'
+      Collect waiting operations using the configured relay session.
+  people-report --json '<object>'
+      Report the outcome of a collected operation.
+  people-event --json '<object>'
+      Submit a stable inbound event.
+  people-lookup --json '<object>'
+      Read the neutral conversation and its delivered revision mappings as the relay.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
@@ -1497,6 +1519,9 @@ COMMANDS:
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
+
+  setup [--mode quick|full] [--yes] [--dry-run]
+      Set up this machine from a verified Tightbeam release.
 
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId> | --as-process <name>]
       Check the local Tightbeam installation and report its health, with each
@@ -2865,6 +2890,28 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 work_item_id: nonempty(flags, "work-item"),
                 session_key: nonempty(flags, "session"),
+            })
+        }
+        verb @ ("people-send" | "people-update" | "people-reply" | "people-withdraw"
+        | "people-status" | "people-collect" | "people-report" | "people-event"
+        | "people-lookup") => {
+            let params = match parsed.positional.as_slice() {
+                [_, encoded]
+                    if flags.len() == 1
+                        && flags.contains_key("json")
+                        && parsed.duplicates.is_empty() =>
+                {
+                    serde_json::from_str::<serde_json::Value>(encoded)
+                        .map_err(|error| format!("invalid JSON: {error}"))?
+                }
+                _ => return Err(format!("{verb} requires --json '<object>'")),
+            };
+            if !params.is_object() {
+                return Err(format!("{verb} requires a JSON object"));
+            }
+            Ok(Command::PeopleMessage {
+                verb: verb.to_owned(),
+                params,
             })
         }
         "harklight-send" => {
@@ -4661,7 +4708,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, people-send, people-update, people-reply, people-withdraw, people-status, people-collect, people-report, people-event, people-lookup, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -7672,10 +7719,20 @@ mod tests {
                 "decision-request",
                 "decision-requests",
                 "dispatch",
+                "setup",
                 "doctor",
                 "session-diagnose",
                 "harness-process",
                 "harklight-briefings-catchup",
+                "people-send",
+                "people-update",
+                "people-reply",
+                "people-withdraw",
+                "people-status",
+                "people-collect",
+                "people-report",
+                "people-event",
+                "people-lookup",
                 "harklight-send",
                 "harklight-progress",
                 "harklight-revise",
@@ -8979,7 +9036,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "sample-user"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, people-send, people-update, people-reply, people-withdraw, people-status, people-collect, people-report, people-event, people-lookup, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

@@ -216,7 +216,17 @@ defmodule Tightbeam.Readiness do
   # injects it, so the summary stays hermetic in tests.
   defp binary_state(_module, false, _config), do: {:unknown, :not_probed_on_satellite}
 
-  defp binary_state(module, true, config) do
+  defp binary_state(Tightbeam.Harness.Codex = module, true, config) do
+    if Application.get_env(:tightbeam, :disable_local_codex, false) do
+      {:broken, :codex_sandbox_unavailable}
+    else
+      local_binary_state(module, config)
+    end
+  end
+
+  defp binary_state(module, true, config), do: local_binary_state(module, config)
+
+  defp local_binary_state(module, config) do
     probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
 
     case probe.(module.id(), Path.join(config.base_dir, "bin")) do

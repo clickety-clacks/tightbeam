@@ -86,6 +86,19 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end)
 
+    if tags[:grouped_outage_notices] do
+      flag = :harklight_grouped_outage_notices_enabled
+      previous = Application.fetch_env(:tightbeam, flag)
+      Application.put_env(:tightbeam, flag, true)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:tightbeam, flag, value)
+          :error -> Application.delete_env(:tightbeam, flag)
+        end
+      end)
+    end
+
     db = :"harklight_wakes_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
@@ -95,7 +108,7 @@ defmodule Tightbeam.HarklightWakesTest do
     Application.put_env(
       :tightbeam,
       :harklight_recovery_options,
-      Keyword.put(old_recovery_opts, :feed_custody_dir, custody)
+      Keyword.merge(old_recovery_opts, feed_custody_dir: custody, recovery_gather_ms: 0)
     )
 
     on_exit(fn ->
@@ -4438,6 +4451,209 @@ defmodule Tightbeam.HarklightWakesTest do
     assert count.("w_harklight_notice_recovery_%") == 2
   end
 
+  test "default outages are told individually and their recoveries are immediate", %{
+    db: db,
+    session: session
+  } do
+    alias Tightbeam.HarklightListenerOutage, as: Outage
+
+    other = "00000000-0000-4000-8000-000000000001"
+    seed_completion_handle(db, session.session_key, other, "other")
+
+    for handle <- [@handle, other] do
+      assert {:ok, [^handle, _, _, _]} =
+               DB.transaction(db, fn txn ->
+                 Outage.start_in_txn(txn, handle, {"down", nil, nil}, 1_000)
+               end)
+    end
+
+    for handle <- [@handle, other] do
+      assert {:ok, [[episode, nil]]} =
+               DB.query(
+                 db,
+                 "SELECT episode,noticeWakeId FROM harklight_listener_outages WHERE handle=?1",
+                 [
+                   handle
+                 ]
+               )
+
+      assert {:ok, :notified} = Outage.notify(db, handle, episode, 2_000, 1_000)
+      assert {:ok, :ok} = Outage.finish(db, handle, true, 3_000)
+
+      prompt = "Tightbeam is receiving Harklight updates again for conversation #{handle}."
+
+      assert {:ok, [[^prompt]]} =
+               DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [
+                 "w_harklight_listening_" <> episode
+               ])
+    end
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'"
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE name='harklight_outage_recoveries'"
+             )
+  end
+
+  @tag :grouped_outage_notices
+  test "outages that fall due together are told together, and later ones on their own", %{
+    db: db,
+    session: session
+  } do
+    alias Tightbeam.HarklightListenerOutage, as: Outage
+
+    start =
+      &({:ok, _} =
+          DB.transaction(db, fn txn -> Outage.start_in_txn(txn, &1, {"down", nil, nil}, &2) end))
+
+    extra = for n <- 1..12, do: "00000000-0000-4000-8000-0000000000#{10 + n}"
+
+    for {handle, n} <- Enum.with_index(extra),
+        do: seed_completion_handle(db, session.session_key, handle, "m#{n}")
+
+    [late, separate | together] = extra
+
+    wakes = fn pattern ->
+      {:ok, rows} =
+        DB.query(db, "SELECT prompt FROM wakes WHERE wakeId LIKE ?1 ORDER BY rowid", [pattern])
+
+      List.flatten(rows)
+    end
+
+    {:ok, [_, episode, _, _]} = start.(@handle, 1_000)
+    for handle <- together, do: start.(handle, 1_050)
+    {:ok, [_, late_episode, _, _]} = start.(late, 1_101)
+
+    assert {:ok, :notified} = Outage.notify(db, @handle, episode, 2_000, 1_000)
+    assert [prompt] = wakes.("w_harklight_notice_recovery_%")
+    assert prompt =~ "stopped for 11 of your conversations"
+    assert prompt =~ @handle
+    assert prompt =~ "and 1 more"
+    refute prompt =~ late
+
+    # Not yet due within the gathering window, so it has its own.
+    assert {:ok, :notified} = Outage.notify(db, late, late_episode, 2_101, 1_000)
+    assert length(wakes.("w_harklight_notice_recovery_%")) == 2
+
+    # One that stays out hides neither the others' recovery nor a new outage.
+    [stuck | recovered] = together
+    for handle <- [@handle | recovered], do: {:ok, :ok} = Outage.finish(db, handle, true, 3_000)
+    assert [] = wakes.("w_harklight_listening_%")
+    assert {:ok, _} = Outage.announce_recoveries(db, 3_000)
+    assert [back] = wakes.("w_harklight_listening_%")
+    assert back =~ "again for 10 of your conversations"
+    refute back =~ stuck
+    assert {:ok, _} = Outage.announce_recoveries(db, 3_001)
+    assert [_] = wakes.("w_harklight_listening_%")
+
+    {:ok, [_, separate_episode, _, _]} = start.(separate, 5_000)
+    assert {:ok, :notified} = Outage.notify(db, separate, separate_episode, 6_000, 1_000)
+    assert List.last(wakes.("w_harklight_notice_recovery_%")) =~ "handle #{separate} stopped"
+
+    # Back and out again before it is told: nothing is announced yet.
+    {:ok, :ok} = Outage.finish(db, separate, true, 7_000)
+    start.(separate, 7_001)
+    assert {:ok, _} = Outage.announce_recoveries(db, 7_002)
+    assert [_] = wakes.("w_harklight_listening_%")
+
+    # That second outage ends before it is due to be told. The first one's
+    # all-clear is still owed, and is sent once.
+    {:ok, :ok} = Outage.finish(db, separate, true, 8_000)
+    assert {:ok, _} = Outage.announce_recoveries(db, 8_001)
+    assert [_, back_again] = wakes.("w_harklight_listening_%")
+    assert back_again =~ "conversation #{separate}"
+    assert {:ok, _} = Outage.announce_recoveries(db, 8_002)
+    assert length(wakes.("w_harklight_listening_%")) == 2
+    assert {:ok, []} = DB.query(db, "SELECT handle FROM harklight_outage_recoveries")
+  end
+
+  @tag :grouped_outage_notices
+  test "a gathered recovery is told after a restart", %{db: db} do
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO harklight_outage_recoveries(handle,episode) VALUES('#{@handle}','e1')"
+      )
+
+    listener = fn _, _, _ -> receive(do: (:hold -> :ok)) end
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [[_]]},
+               DB.query(db, "SELECT prompt FROM wakes WHERE wakeId='w_harklight_listening_e1'")
+             )
+           end)
+
+    assert {:ok, []} = DB.query(db, "SELECT handle FROM harklight_outage_recoveries")
+  end
+
+  test "a receiver that is eligible again before its worker ends is listened to", %{
+    db: db,
+    session: session
+  } do
+    fake_harklight_session_end_agent!()
+    parent = self()
+
+    listener = fn manager, handle, _ ->
+      :ok = GenServer.call(manager, {:feed_ready, handle})
+      send(parent, {:listening, self()})
+      Process.flag(:trap_exit, true)
+      receive do: (:close -> :ok)
+    end
+
+    manager = start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive {:listening, worker}, 1_000
+    Org.set_host(db, session.session_key, "other-host")
+    GenServer.cast(manager, {:origin_changed, session.session_key})
+    assert MapSet.member?(:sys.get_state(manager).stopping, @handle)
+
+    # A pending gone request would start it again by itself.
+    assert eventually(fn -> :sys.get_state(manager).gone_tasks == %{} end)
+    assert Process.alive?(worker)
+    Org.set_host(db, session.session_key, Placement.local_host_name())
+    GenServer.cast(manager, {:origin_changed, session.session_key})
+    :sys.get_state(manager)
+    send(worker, :close)
+    assert_receive {:listening, replacement}, 2_000
+    refute replacement == worker
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state FROM harklight_wake_handles") == {:ok, [["active"]]}
+           end)
+  end
+
+  test "a child that outlived its wrapper does not block or pile up new wrappers" do
+    opts = Application.get_env(:tightbeam, :harklight_child_opts, [])
+    key = {:lock_test, System.unique_integer([:positive])}
+    sleep = System.find_executable("sleep")
+    # Names this test's own process and no other.
+    seconds = "600.#{System.unique_integer([:positive])}#{System.os_time(:microsecond)}"
+    {:ok, holder, _} = Tightbeam.HarklightChild.open(key, sleep, [seconds], opts)
+    true = Port.command(holder, "continue\n")
+    {:os_pid, wrapper} = Port.info(holder, :os_pid)
+    {_, 0} = System.cmd("kill", ["-KILL", to_string(wrapper)])
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, {:child_start_failed, 75}} =
+             Tightbeam.HarklightChild.open(key, sleep, [seconds], opts)
+
+    assert System.monotonic_time(:millisecond) - started < 15_000
+
+    # No wrapper is left waiting.
+    {left, _} = System.cmd("pgrep", ["-f", "harklight-child.* #{seconds}$"])
+    assert String.split(left) == []
+    System.cmd("pkill", ["-KILL", "-f", "^#{sleep} #{seconds}$"])
+    assert {:ok, next, _} = Tightbeam.HarklightChild.open(key, sleep, [seconds], opts)
+    Tightbeam.HarklightChild.request_stop(next)
+  end
+
   test "a feed that keeps catching up and ending is still reported", %{db: db} do
     :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
 
@@ -4991,7 +5207,10 @@ defmodule Tightbeam.HarklightWakesTest do
         retry_now = fn calls ->
           assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
           {timer, token} = :sys.get_state(manager).retry_timers[@handle]
-          assert Process.read_timer(timer) > 300_000
+          # read_timer returns false for a timer that has fired, and atoms sort
+          # above numbers.
+          remaining = Process.read_timer(timer)
+          assert is_integer(remaining) and remaining > 300_000
           assert length(pending_calls(agent)) == calls
           send(manager, {:retry_listener, @handle, token, :existing})
         end
@@ -6423,6 +6642,15 @@ defmodule Tightbeam.HarklightWakesTest do
     assert_receive :captured
     assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
 
+    assert eventually(fn ->
+             match?(
+               {:ok, [_]},
+               DB.query(db, "SELECT 1 FROM wakes WHERE wakeId=?1", [
+                 "w_harklight_listening_" <> episode
+               ])
+             )
+           end)
+
     assert {:ok, [[prompt]]} =
              DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [
                "w_harklight_listening_" <> episode
@@ -7069,10 +7297,11 @@ defmodule Tightbeam.HarklightWakesTest do
     File.write!(gate, "")
     assert eventually(fn -> Tightbeam.HarklightListenerOutage.pending(db) == {:ok, []} end)
 
-    assert {:ok, [[1]]} =
+    assert eventually(fn ->
              DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
                "w_harklight_listening_" <> episode
-             ])
+             ]) == {:ok, [[1]]}
+           end)
 
     assert {:ok, [[5]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
   end

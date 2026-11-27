@@ -302,7 +302,11 @@ defmodule Tightbeam.Gateway do
         cli_token: cli_token,
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
-        adapter_coordinator: Tightbeam.AdapterCoordinator
+        adapter_coordinator: Tightbeam.AdapterCoordinator,
+        setup_readiness: fn ->
+          readiness = Tightbeam.Readiness.summary(config, Tightbeam.ModelCatalog, Archetypes.all())
+          %{ready: readiness.runnable?, lines: Tightbeam.Readiness.render(readiness, config)}
+        end
       })
 
     # EDGE half of the heal trigger. Off the coordinator's process: the sweep
@@ -418,8 +422,11 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.SentinelSupervisor,
           db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
          Tightbeam.ListenerLifecycle.listener_spec(
-           plug: {Tightbeam.Wire.Router, router_deps},
-           port: config.port
+           [plug: {Tightbeam.Wire.Router, router_deps}, port: config.port] ++
+             if(Application.get_env(:tightbeam, :loopback_only, false),
+               do: [ip: {127, 0, 0, 1}],
+               else: []
+             )
          ),
          Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
        ])
@@ -847,6 +854,11 @@ defmodule Tightbeam.Gateway do
 
     item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
+    people_dispatch = fn call ->
+      relay = Application.get_env(:tightbeam, :people_message_relay_session)
+      Tightbeam.PeopleMessages.dispatch(db, call, relay)
+    end
+
     %{
       {"assess_attachments", []} => fn call ->
         case {call[:principal], Org.get(db, call.session_key)} do
@@ -1135,6 +1147,15 @@ defmodule Tightbeam.Gateway do
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
+      {"people-send", []} => people_dispatch,
+      {"people-update", []} => people_dispatch,
+      {"people-reply", []} => people_dispatch,
+      {"people-withdraw", []} => people_dispatch,
+      {"people-status", []} => people_dispatch,
+      {"people-collect", []} => people_dispatch,
+      {"people-report", []} => people_dispatch,
+      {"people-event", []} => people_dispatch,
+      {"people-lookup", []} => people_dispatch,
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
@@ -13110,6 +13131,8 @@ defmodule Tightbeam.Gateway do
       # Resolve receivers only after the whole retiring set is inactive. A
       # parent retiring in this transaction cannot take its child's conversation.
       Enum.each(retired, fn member ->
+        Tightbeam.PeopleMessages.retire_in_txn(txn, member.session_key)
+
         Txn.handoff(
           txn,
           Tightbeam.HarklightWakes,
@@ -13221,7 +13244,12 @@ defmodule Tightbeam.Gateway do
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal, defer_harklight: true)
+
+    Org.retire_in_txn(txn, session_key, principal,
+      defer_harklight: true,
+      defer_people_messages: true
+    )
+
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

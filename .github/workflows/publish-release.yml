@@ -188,6 +188,19 @@ jobs:
           linux_source="candidate-stage/tightbeam-$version-linux-x86_64-$short_sha.tgz"
           test -f "$darwin_source"
           test -f "$linux_source"
+          # Older candidates predate setup, and this job uses the candidate's checkout.
+          if git cat-file -e "$CANDIDATE_SHA:cli/src/setup.mjs" 2>/dev/null; then
+            for package in "$darwin_source" "$linux_source"; do
+              if ! tar -xOf "$package" tightbeam/setup-build.json |
+                jq -e --slurp --arg commit "$CANDIDATE_SHA" --arg tag "$RELEASE_TAG" \
+                  'length == 1 and .[0].commit == $commit and .[0].tag == $tag' >/dev/null; then
+                echo "release: missing or invalid setup build identity in $package" >&2
+                exit 1
+              fi
+            done
+          else
+            echo "The selected candidate predates setup build identity. Skipped the setup stamp check." >> "$GITHUB_STEP_SUMMARY"
+          fi
           python3 packaging/extract-payload.py --inventory-only "$darwin_source"
           python3 packaging/extract-payload.py --inventory-only "$linux_source"
 

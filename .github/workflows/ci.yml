@@ -247,6 +247,10 @@ jobs:
       - name: mix test
         run: scripts/verify_mix.sh
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: cargo test
         working-directory: cli
         run: cargo test
@@ -339,7 +343,13 @@ jobs:
 
       - name: Smoke the assembled gateway package
         run: |
+          if ! grep -Fq setup-build.json packaging/assemble.sh; then
+            echo "The selected source predates setup build identity. Skipped the setup stamp check." >> "$GITHUB_STEP_SUMMARY"
+          fi
           for package in _build/npm/tightbeam-*.tgz; do
+            if grep -Fq setup-build.json packaging/assemble.sh; then
+              sh packaging/verify-setup-build.sh "$package" "$CI_SOURCE_SHA" || exit
+            fi
             python3 packaging/gateway-smoke.py "$package" || exit
           done
 
