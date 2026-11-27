@@ -46,6 +46,12 @@ from optional/harklight-people-relay.
     install -m 0644 "systemd/$unit" "$HOME/.config/systemd/user/$unit"
     systemctl --user daemon-reload
 
+If you are replacing the upstream timer for this state directory, disable
+the timer and stop its running finite service before enabling the watcher.
+
+    systemctl --user disable --now harklight-people-relay.timer
+    systemctl --user stop harklight-people-relay.service
+
 To opt in to startup and run it now, run this separate command.
 
     systemctl --user enable --now harklight-people-relay-watch.service
@@ -69,6 +75,9 @@ The archive provides no launchd service. To start the relay in the foreground:
 
 Stop it with Ctrl-C before removing the code directory.
 
-On either platform, leave the config, connection, database and journal in
-place when removing the relay. Back up and restore the database and journal
+After stopping the relay, remove the copied code on either platform.
+
+    rm -r -- "$HOME/.local/share/tightbeam/people-relay"
+
+Keep the config, connection, database and journal in place. Back up and restore the database and journal
 together.
