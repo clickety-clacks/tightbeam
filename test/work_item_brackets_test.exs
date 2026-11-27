@@ -70,7 +70,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     db = :"brackets_db_#{System.unique_integer([:positive])}"
 
-    db_path =
+    db_opts =
       if context[:persistent_db] do
         base =
           Path.join(
@@ -78,14 +78,20 @@ defmodule Tightbeam.WorkItemBracketsTest do
             "tb-followthrough-restart-#{System.unique_integer([:positive])}"
           )
 
-        File.mkdir_p!(base)
         on_exit(fn -> File.rm_rf!(base) end)
-        Path.join(base, "state.db")
+        prepared = Tightbeam.GuardRuntimeFixture.prepare!(base, "schema_shape_runtime.exs")
+
+        [
+          path: Path.join(prepared.base, "state.db"),
+          name: db,
+          guard_inputs: [],
+          payload_root: prepared.payload
+        ]
       else
-        ":memory:"
+        [path: ":memory:", name: db]
       end
 
-    start_supervised!({DB, path: db_path, name: db, guard_inputs: []})
+    start_supervised!({DB, db_opts})
     start_supervised!({ConnRegistry, name: ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
@@ -119,7 +125,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     %{
       db: db,
-      db_path: db_path,
+      db_opts: db_opts,
       law_base: base,
       handlers: handlers,
       flynn_main: flynn_main,
@@ -453,7 +459,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     finish_notice(ctx, first)
     pending = slate_wake_id(ctx.db, item.id)
     stop_supervised!(DB)
-    start_supervised!({DB, path: ctx.db_path, name: ctx.db, guard_inputs: []})
+    start_supervised!({DB, ctx.db_opts})
     :ok = Tightbeam.Schema.ensure_all(ctx.db)
     :ok = Tightbeam.RowReactions.recover(ctx.db)
     assert slate_wake_id(ctx.db, item.id) == pending
