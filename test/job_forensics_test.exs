@@ -186,11 +186,10 @@ defmodule Tightbeam.JobForensicsTest do
     assert %{workItem: %{state: "closed"}} = dispose(db, "work-item-close", "wi_disp")
     assert length(CausalEvents.for_job(db, "wi_disp", [])) == 3
 
-    # The work-item row keeps its shape — this table ADDS history, it does not
-    # migrate the item.
+    # The transition log retains history while the item exposes its current state.
     assert_keys(
       fetch_item(db, "wi_disp").workItem,
-      ~w(body bodyUpdatedAt bodyUpdatedBySession bodyUpdatedByUser createdAt
+      ~w(body bodyUpdatedAt bodyUpdatedBySession bodyUpdatedByUser closeReason createdAt
          createdBySession createdByUser deliveryOwnerSessionKey failReason id isBug ownerUserId priority
          mementos rowVersion specRefName specRefSha256 state title started holders attestCounts
          verdictCounts effectiveCommitRefs landings)a

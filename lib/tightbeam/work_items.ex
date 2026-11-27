@@ -40,6 +40,10 @@ defmodule Tightbeam.WorkItems do
       do: "typed routing-bracket cancellation refused for #{wake_id}"
   end
 
+  @close_reasons ~w(completed canceled superseded)
+  @close_reason_column "closeReason TEXT CHECK (closeReason IS NULL OR " <>
+                         "(state = 'closed' AND closeReason IN ('completed', 'canceled', 'superseded')))"
+
   @ddl """
   CREATE TABLE IF NOT EXISTS work_items (
     id TEXT PRIMARY KEY,
@@ -50,6 +54,7 @@ defmodule Tightbeam.WorkItems do
     ownerUserId TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','iceboxed','closed','failed')),
     failReason TEXT NULL,
+    #{@close_reason_column},
     routingWakeId TEXT NULL,
     slateWakeId TEXT NULL,
     createdByUser TEXT NULL,
@@ -78,9 +83,21 @@ defmodule Tightbeam.WorkItems do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
     with :ok <- DB.execute(db, @ddl),
-         :ok <- DB.execute(db, @priority_ddl) do
+         :ok <- DB.execute(db, @priority_ddl),
+         {:ok, :ok} <- DB.transaction(db, &ensure_close_reason_in_txn/1) do
       :ok
     end
+  end
+
+  defp ensure_close_reason_in_txn(txn) do
+    unless Enum.any?(Txn.q(txn, "PRAGMA table_info(work_items)"), fn
+             [_, "closeReason" | _] -> true
+             _ -> false
+           end) do
+      Txn.q(txn, "ALTER TABLE work_items ADD COLUMN #{@close_reason_column}")
+    end
+
+    :ok
   end
 
   @doc false
@@ -787,7 +804,7 @@ defmodule Tightbeam.WorkItems do
 
   defp dispose_result(db, call, verb) do
     with :ok <- principal_allowed(call.principal),
-         :ok <- valid_icebox_reason(verb, call.params[:reason]),
+         :ok <- valid_disposition_reason(verb, call.params[:reason]),
          :ok <- ensure_body_schema_for_use(db) do
       id = call.params[:work_item_id]
       reason = call.params[:reason]
@@ -872,7 +889,7 @@ defmodule Tightbeam.WorkItems do
             stamp_version_in_txn(txn, id, now())
             disposed = fetch_in_txn(txn, id)
 
-            # The item keeps its CURRENT state only, and reopen nulls failReason;
+            # The item keeps its CURRENT disposition, and reopen clears both reasons;
             # work_item_events is a bare doorbell (kind is 'metadata' or
             # 'composition'), so it records that something changed, never from
             # what to what. jobRef IS the work-item id here, and a disposition
@@ -886,7 +903,8 @@ defmodule Tightbeam.WorkItems do
                 workItemId: id,
                 fromState: item.state,
                 toState: target,
-                failReason: disposed.failReason
+                failReason: disposed.failReason,
+                closeReason: disposed.closeReason
               }
             })
 
@@ -931,7 +949,12 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp apply_disposition(txn, item, :reopen, "open", _reason) do
-    Txn.q(txn, "UPDATE work_items SET state = 'open', failReason = NULL WHERE id = ?1", [item.id])
+    Txn.q(
+      txn,
+      "UPDATE work_items SET state = 'open', failReason = NULL, closeReason = NULL WHERE id = ?1",
+      [item.id]
+    )
+
     :ok
   end
 
@@ -939,24 +962,30 @@ defmodule Tightbeam.WorkItems do
     # icebox/close/fail all cancel BOTH brackets (after a last-close a slate
     # wake may exist, so every disposition must cancel bracket 2 too).
     fail_reason = if verb in [:icebox, :fail], do: reason, else: nil
+    close_reason = if verb == :close, do: reason, else: nil
 
     Txn.q(
       txn,
-      "UPDATE work_items SET state = ?2, failReason = ?3 WHERE id = ?1",
-      [item.id, target, fail_reason]
+      "UPDATE work_items SET state = ?2, failReason = ?3, closeReason = ?4 WHERE id = ?1",
+      [item.id, target, fail_reason, close_reason]
     )
   end
 
-  defp valid_icebox_reason(:icebox, reason) when is_binary(reason) do
+  defp valid_disposition_reason(:icebox, reason) when is_binary(reason) do
     if String.valid?(reason) and String.trim(reason) != "",
       do: :ok,
       else: error("missing_reason", "work-item-icebox requires a non-empty reason")
   end
 
-  defp valid_icebox_reason(:icebox, _reason),
+  defp valid_disposition_reason(:icebox, _reason),
     do: error("missing_reason", "work-item-icebox requires a non-empty reason")
 
-  defp valid_icebox_reason(_verb, _reason), do: :ok
+  defp valid_disposition_reason(:close, reason) when reason in [nil | @close_reasons], do: :ok
+
+  defp valid_disposition_reason(:close, _reason),
+    do: error("invalid_close_reason", "close reason must be completed, canceled, or superseded")
+
+  defp valid_disposition_reason(_verb, _reason), do: :ok
 
   defp target_state(:icebox), do: "iceboxed"
   defp target_state(:reopen), do: "open"
@@ -964,7 +993,7 @@ defmodule Tightbeam.WorkItems do
   defp target_state(:fail), do: "failed"
 
   defp transition_allowed?("open", "iceboxed"), do: true
-  defp transition_allowed?("iceboxed", "open"), do: true
+  defp transition_allowed?(from, "open") when from in ["iceboxed", "closed"], do: true
   defp transition_allowed?(from, "closed") when from in ["open", "iceboxed"], do: true
   defp transition_allowed?(from, "failed") when from in ["open", "iceboxed"], do: true
   defp transition_allowed?(_from, _target), do: false
@@ -1773,7 +1802,7 @@ defmodule Tightbeam.WorkItems do
   # The wake-id columns are INTERNAL substrate truth — never surfaced in a
   # response object (§Response shapes).
   defp columns do
-    "id, title, specRefName, specRefSha256, isBug, ownerUserId, deliveryOwnerSessionKey, state, failReason, " <>
+    "id, title, specRefName, specRefSha256, isBug, ownerUserId, deliveryOwnerSessionKey, state, failReason, closeReason, " <>
       "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt, " <>
       "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt), " <>
       "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
@@ -1794,6 +1823,7 @@ defmodule Tightbeam.WorkItems do
          delivery_owner_session_key,
          state,
          fail_reason,
+         close_reason,
          routing_wake_id,
          slate_wake_id,
          user,
@@ -1816,6 +1846,7 @@ defmodule Tightbeam.WorkItems do
       deliveryOwnerSessionKey: delivery_owner_session_key,
       state: state,
       failReason: fail_reason,
+      closeReason: close_reason,
       routingWakeId: routing_wake_id,
       slateWakeId: slate_wake_id,
       createdByUser: user,

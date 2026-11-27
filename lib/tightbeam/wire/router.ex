@@ -4953,7 +4953,7 @@ defmodule Tightbeam.Wire.Router do
     "unlearn" => ~w(idempotency_key name)a,
     "wake" =>
       ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate prod_id replace_queued reresolve reresolve_rung reresolve_seed nudge wait_reason)a,
-    "work-item-close" => ~w(work_item_id)a,
+    "work-item-close" => ~w(work_item_id reason)a,
     "work-item-create" =>
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,

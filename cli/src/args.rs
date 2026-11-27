@@ -595,6 +595,7 @@ pub enum Command {
     WorkItemClose {
         identity: Identity,
         work_item_id: String,
+        reason: Option<String>,
     },
     WorkItemFail {
         identity: Identity,
@@ -1279,7 +1280,7 @@ COMMANDS:
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; records the reason; work-item-reopen resumes it.
   work-item-reopen <workItemId>
-  work-item-close <workItemId>
+  work-item-close <workItemId> [--reason completed|canceled|superseded]
       Conclude an item (→ closed). Requires zero open assignments.
   work-item-fail <workItemId> [--reason <text>]
       Rule an item failed (→ failed); --reason is recorded on the item.
@@ -4366,12 +4367,20 @@ fn parse_with_optional_catalog(
             })
         }
         "work-item-close" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-close <workItemId>".to_owned());
+            let reason = flags.get("reason");
+            if parsed.positional.len() != 2
+                || parsed.missing_values.contains("reason")
+                || parsed.duplicates.contains("reason")
+                || reason.is_some_and(|value| {
+                    !matches!(value.as_str(), "completed" | "canceled" | "superseded")
+                })
+            {
+                return Err("usage: tightbeam work-item-close <workItemId> [--reason completed|canceled|superseded]".to_owned());
             }
             Ok(Command::WorkItemClose {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
+                reason: reason.cloned(),
             })
         }
         "work-item-fail" => {
@@ -7658,6 +7667,24 @@ mod tests {
             ],
         ] {
             assert_eq!(parse(strings(&argv)), Err(usage.to_owned()));
+        }
+    }
+
+    #[test]
+    fn work_item_close_rejects_invalid_or_missing_reason() {
+        for argv in [
+            vec!["work-item-close", "wi_1", "--reason"],
+            vec!["work-item-close", "wi_1", "--reason", "failed"],
+            vec![
+                "work-item-close",
+                "wi_1",
+                "--reason",
+                "completed",
+                "--reason",
+                "canceled",
+            ],
+        ] {
+            assert!(parse(strings(&argv)).is_err());
         }
     }
 

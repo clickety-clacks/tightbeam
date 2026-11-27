@@ -32,7 +32,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @r7_fields %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason closeReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "wakes" =>
@@ -52,7 +52,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @nullable_fields %{
     "work items" =>
-      ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq),
+      ~w(specRefName specRefSha256 ownerUserId failReason closeReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq),
     "assignments" =>
       ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider),
     "wakes" =>
@@ -3897,6 +3897,53 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   defp shuffle_json_maps(value) when is_list(value), do: Enum.map(value, &shuffle_json_maps/1)
   defp shuffle_json_maps(value), do: value
+
+  test "work item list and selected detail carry the same close reason", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Closed item readback"}
+      })
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.opts[:base_dir]})
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    close = fn reason ->
+      request =
+        JSON.encode!(%{
+          "verb" => "work-item-close",
+          "asUser" => "flynn",
+          "params" => %{"workItemId" => item.id, "reason" => reason}
+        })
+
+      conn(:post, "/agent/dispatch", request)
+      |> put_req_header("authorization", "Bearer #{ctx.opts[:cli_token]}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+    end
+
+    invalid = close.("failed")
+    assert %{"error" => %{"code" => "invalid_close_reason"}} = JSON.decode!(invalid.resp_body)
+
+    closed = close.("canceled")
+    assert closed.status == 200, closed.resp_body
+
+    assert %{"result" => %{"workItem" => %{"closeReason" => "canceled"}}} =
+             JSON.decode!(closed.resp_body)
+
+    detail = get(ctx, "/api/work-items/" <> item.id)
+    assert detail.status == 200
+
+    assert %{"item" => %{"state" => "closed", "closeReason" => "canceled"} = row} =
+             JSON.decode!(detail.resp_body)
+
+    list = get(ctx, "/api/work-items?state=closed")
+    assert list.status == 200
+    assert row in JSON.decode!(list.resp_body)["items"]
+  end
 
   test "B2 collection shares detail bytes and binds pagination to filters and principal", ctx do
     for priority <- [2, 7] do

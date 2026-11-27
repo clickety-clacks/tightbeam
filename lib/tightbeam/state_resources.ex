@@ -267,7 +267,7 @@ defmodule Tightbeam.StateResources do
     "account limits" =>
       ~w(id accountId identityKey scope observedAt lastObservedAt resetAt resetSource standingId evidenceKind evidenceTurnSeq clearedAt clearCause),
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason closeReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "attests" =>
@@ -338,11 +338,11 @@ defmodule Tightbeam.StateResources do
     },
     "work items" => %{
       strings:
-        ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
+        ~w(id title specRefName specRefSha256 ownerUserId state failReason closeReason routingWakeId slateWakeId createdByUser createdBySession),
       integers: ~w(createdInTurnSeq createdAt priority rowVersion),
       booleans: ~w(isBug createdContextKnown started),
       nullable:
-        ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
+        ~w(specRefName specRefSha256 ownerUserId failReason closeReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
     "assignments" => %{
       strings:
@@ -604,7 +604,7 @@ defmodule Tightbeam.StateResources do
                  CASE WHEN p.workItemId IS NULL THEN
                    CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
                  ELSE p.priority END,
-                 COALESCE(v.rowVersion, wi.createdAt)
+                 COALESCE(v.rowVersion, wi.createdAt), wi.closeReason
           FROM work_items AS wi
           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
           LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
@@ -667,7 +667,7 @@ defmodule Tightbeam.StateResources do
            CASE WHEN p.workItemId IS NULL THEN
              CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
            ELSE p.priority END,
-           COALESCE(v.rowVersion, wi.createdAt)
+           COALESCE(v.rowVersion, wi.createdAt), wi.closeReason
     FROM work_items AS wi
     LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
     LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
@@ -2013,7 +2013,8 @@ defmodule Tightbeam.StateResources do
          created_context_known,
          created_at,
          priority,
-         row_version
+         row_version,
+         close_reason
        ]) do
     %{
       id: id,
@@ -2024,6 +2025,7 @@ defmodule Tightbeam.StateResources do
       owner_user_id: owner_user_id,
       state: state,
       fail_reason: fail_reason,
+      close_reason: close_reason,
       routing_wake_id: routing_wake_id,
       slate_wake_id: slate_wake_id,
       created_by_user: created_by_user,
