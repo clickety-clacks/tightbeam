@@ -8,6 +8,10 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL must be true or false"
   end
 
+  if System.get_env("TIGHTBEAM_PI_TYPED_TURN_FAILURES") == "1" do
+    config :tightbeam, :pi_typed_turn_failures_enabled, true
+  end
+
   case System.get_env("TIGHTBEAM_COORDINATOR_HOLD_DECISIONS") do
     nil -> :ok
     "true" -> config :tightbeam, :coordinator_hold_decisions_enabled, true

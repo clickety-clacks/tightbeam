@@ -25,6 +25,194 @@ defmodule Tightbeam.Harness.Pi do
   @adapter_version "0.0.34"
   @adapter_package "pi-acp"
   @adapter_bundle "index.js"
+
+  # pi-acp 0.0.34 ends exhausted retries as end_turn: it prints "Retry finished,
+  # resuming." for a failed or exhausted auto-retry, ignores the final
+  # assistant error, and maps a rejected RPC prompt to end_turn. These
+  # replacements reject the ACP prompt with a typed JSON-RPC error instead.
+  @pi_turn_failure_helpers ~S"""
+  // Tightbeam: Pi retries a failed provider request itself and reports the
+  // outcome as events. A failed turn reaches the ACP client as a typed JSON-RPC
+  // error carrying Pi's logical attempt count, never as end_turn. Transport
+  // retries below Pi and provider billing are not observable here.
+  // Port of Tightbeam.ErrorDiagnostic.redact_text/1; harness_pi_test keeps the
+  // two equal. Redaction runs before whitespace collapse and the length bound.
+  function tightbeamPiFailuresEnabled() {
+    return process.env.PI_ACP_TIGHTBEAM_TURN_FAILURES === "1";
+  }
+  function tightbeamPiMaskValue(value) {
+    if (value[0] === '"' || value[0] === "'") return `${value[0]}[REDACTED:secret_field]${value[0]}`;
+    const scheme = /^(bearer|basic|token)(\s+)/i.exec(value);
+    return scheme ? `${scheme[1]}${scheme[2]}[REDACTED:secret_field]` : "[REDACTED:secret_field]";
+  }
+  function tightbeamPiRedact(text) {
+    return text
+      .replace(
+        /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gs,
+        () => "[REDACTED:private_key]"
+      )
+      .replace(
+        /\b((?:proxy[-_]?)?authorization|x[-_]api[-_]key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|token|password|passwd|secret|cookie)(["']?\s*(?:=>|[:=])\s*)((?:bearer|basic|token)\s+(?:\[REDACTED:secret_field\]|[^\s,;"'&}\]]+)|"(?:[^"\\]|\\(?:[\s\S]|$))*(?:"|$)|'(?:[^'\\]|\\(?:[\s\S]|$))*(?:'|$)|\[REDACTED:secret_field\]|[^\s,;&}\]"']+)/gi,
+        (_all, key, separator, value) => `${key}${separator}${tightbeamPiMaskValue(value)}`
+      )
+      .replace(
+        /\b(bearer)(\s+)[A-Za-z0-9._~+\/-]{12,}=*/gi,
+        (_all, scheme, space) => `${scheme}${space}[REDACTED:token]`
+      )
+      .replace(
+        /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\/\s:@\[]+(?::[^\/\s@]*)?@/g,
+        (_all, scheme) => `${scheme}[REDACTED:userinfo]@`
+      )
+      .replace(
+        /\b(?:github_pat_|gh[opusr]_|sk-|sk_|xox[abprs]-|tbc_|tbs_|tbt_|tbp_)[A-Za-z0-9_-]{8,}/g,
+        () => "[REDACTED:token]"
+      );
+  }
+  function tightbeamPiSafeError(raw) {
+    const text = tightbeamPiRedact(String(raw ?? ""))
+      .replace(/\s+/g, " ")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim();
+    if (!text) return "unknown error";
+    return text.length > 300 ? `${text.slice(0, 300)}...` : text;
+  }
+  function tightbeamPiTurnError(errorKind, piAttempts, raw) {
+    const finalError = tightbeamPiSafeError(raw);
+    const attempts = piAttempts === null ? "" : ` after ${piAttempts} attempts`;
+    const message =
+      errorKind === "pi_retry_exhausted"
+        ? `pi retry exhausted${attempts}: ${finalError}`
+        : `pi turn failed: ${finalError}`;
+    return RequestError.internalError(
+      { errorKind, piAttempts, transportAttempts: "unobserved", finalError },
+      message
+    );
+  }
+  function formatAutoRetryMessage(ev) {
+  """
+
+  @pi_start_turn ~S"""
+    startTurn(t) {
+      this.cancelRequested = false;
+      this.inAgentLoop = false;
+  """
+
+  @pi_start_turn_patched ~S"""
+    startTurn(t) {
+      this.cancelRequested = false;
+      this.inAgentLoop = false;
+      this.piRunError = null;
+      this.piRetryFailure = null;
+  """
+
+  @pi_prompt_rejected ~S"""
+          if (authErr) {
+            this.pendingTurn?.reject(authErr);
+          } else {
+            const reason = this.cancelRequested ? "cancelled" : "error";
+            this.pendingTurn?.resolve(reason);
+          }
+  """
+
+  @pi_prompt_rejected_patched ~S"""
+          if (authErr) {
+            this.pendingTurn?.reject(authErr);
+          } else if (tightbeamPiFailuresEnabled() && !this.cancelRequested) {
+            // Pi refused the prompt before its run started: no provider request.
+            this.pendingTurn?.reject(tightbeamPiTurnError("pi_turn_failed", 0, err?.message ?? err));
+          } else {
+            const reason = this.cancelRequested ? "cancelled" : "error";
+            this.pendingTurn?.resolve(reason);
+          }
+  """
+
+  @pi_auto_retry_end ~S"""
+        case "auto_retry_end": {
+          this.emit({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Retry finished, resuming." }
+          });
+          break;
+        }
+  """
+
+  @pi_auto_retry_end_patched ~S"""
+        case "auto_retry_end": {
+          let text = "Retry finished, resuming.";
+          if (tightbeamPiFailuresEnabled() && ev.success === false) {
+            const retries = Number(ev.attempt);
+            const piAttempts = Number.isInteger(retries) && retries >= 0 ? retries + 1 : null;
+            this.piRetryFailure = { piAttempts, finalError: ev.finalError };
+            const attempts = piAttempts === null ? "" : ` after ${piAttempts} attempts`;
+            text = this.cancelRequested
+              ? "Retry cancelled."
+              : `Retry exhausted${attempts}: ${tightbeamPiSafeError(ev.finalError)}`;
+          }
+          this.emit({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text }
+          });
+          break;
+        }
+  """
+
+  @pi_agent_end ~S"""
+        case "agent_end": {
+          this.inAgentLoop = false;
+          break;
+        }
+  """
+
+  @pi_agent_end_patched ~S"""
+        case "agent_end": {
+          this.inAgentLoop = false;
+          // Pi reports a failed retry chain after the agent_end of its last run,
+          // and a later run (retry or compaction) supersedes an earlier failure.
+          if (tightbeamPiFailuresEnabled()) {
+            const messages = Array.isArray(ev.messages) ? ev.messages : [];
+            const last = messages.findLast((message) => message?.role === "assistant");
+            this.piRunError = last?.stopReason === "error" ? { finalError: last.errorMessage } : null;
+            this.piRetryFailure = null;
+          }
+          break;
+        }
+  """
+
+  @pi_agent_settled ~S"""
+    async settleTurn() {
+      await this.publishContextUsage();
+      const reason = this.cancelRequested ? "cancelled" : "end_turn";
+      this.pendingTurn?.resolve(reason);
+  """
+
+  @pi_agent_settled_patched ~S"""
+    async settleTurn() {
+      await this.publishContextUsage();
+      const reason = this.cancelRequested ? "cancelled" : "end_turn";
+      const retryFailure = this.piRetryFailure;
+      const runError = this.piRunError;
+      this.piRetryFailure = null;
+      this.piRunError = null;
+      if (tightbeamPiFailuresEnabled() && !this.cancelRequested && retryFailure) {
+        this.pendingTurn?.reject(
+          tightbeamPiTurnError("pi_retry_exhausted", retryFailure.piAttempts, retryFailure.finalError)
+        );
+      } else if (tightbeamPiFailuresEnabled() && !this.cancelRequested && runError) {
+        this.pendingTurn?.reject(tightbeamPiTurnError("pi_turn_failed", 1, runError.finalError));
+      } else {
+        this.pendingTurn?.resolve(reason);
+      }
+  """
+
+  @adapter_replacements [
+    {"function formatAutoRetryMessage(ev) {\n", @pi_turn_failure_helpers},
+    {@pi_start_turn, @pi_start_turn_patched},
+    {@pi_prompt_rejected, @pi_prompt_rejected_patched},
+    {@pi_auto_retry_end, @pi_auto_retry_end_patched},
+    {@pi_agent_end, @pi_agent_end_patched},
+    {@pi_agent_settled, @pi_agent_settled_patched}
+  ]
+
   @credential_file "auth.json"
   @probe_model %Model{family: "opencode-go/gpt-5.6-luna", effort: "medium", context: nil}
   @identity_skill "served-identity"
@@ -70,6 +258,15 @@ defmodule Tightbeam.Harness.Pi do
   end
 
   @impl true
+  def preflight_launch(target, _home, opts) do
+    if typed_turn_failures_enabled?() do
+      with {:ok, _detail} <- ensure_adapter(target), do: {:ok, opts}
+    else
+      {:ok, opts}
+    end
+  end
+
+  @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
 
@@ -80,7 +277,15 @@ defmodule Tightbeam.Harness.Pi do
         Path.join(target.host_config.base_dir, "work/pi-readiness-home")
       )
 
-    controlled = ["HOME", "PI_REAL_HOME", "PI_CODING_AGENT_DIR", "PI_ACP_PI_COMMAND"]
+    failure_flag = if typed_turn_failures_enabled?(), do: "1", else: "0"
+
+    controlled = [
+      "HOME",
+      "PI_REAL_HOME",
+      "PI_CODING_AGENT_DIR",
+      "PI_ACP_PI_COMMAND",
+      "PI_ACP_TIGHTBEAM_TURN_FAILURES"
+    ]
 
     if Enum.any?(Keyword.fetch!(opts, :common_env), fn {name, _} -> name in controlled end) or
          Enum.any?(Keyword.fetch!(opts, :remote_env), fn entry ->
@@ -138,6 +343,7 @@ defmodule Tightbeam.Harness.Pi do
         [
           cmd: [binary],
           env: [
+            {"PI_ACP_TIGHTBEAM_TURN_FAILURES", failure_flag},
             {"PI_CODING_AGENT_DIR", home},
             {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)},
             {"HOME", private_home},
@@ -147,6 +353,7 @@ defmodule Tightbeam.Harness.Pi do
         ]
       else
         remote_env = [
+          "PI_ACP_TIGHTBEAM_TURN_FAILURES=#{failure_flag}",
           "PI_CODING_AGENT_DIR=#{Support.shell_quote(home)}",
           "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}",
           "PI_REAL_HOME=\"$HOME\"",
@@ -206,8 +413,21 @@ defmodule Tightbeam.Harness.Pi do
   defp gate_default?(%{family: family}) when family == @probe_model.family, do: true
   defp gate_default?(_entry), do: false
 
+  @doc false
+  def typed_turn_failures_enabled?,
+    do: Application.get_env(:tightbeam, :pi_typed_turn_failures_enabled, false)
+
   @impl true
   def ensure_adapter(target) do
+    target =
+      if typed_turn_failures_enabled?() do
+        target
+        |> Map.put_new(:patch_adapter, &patch_local/1)
+        |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
+      else
+        target
+      end
+
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target),
       verify_version: @adapter_version
     )
@@ -512,6 +732,7 @@ defmodule Tightbeam.Harness.Pi do
         private_home = Path.join(base, "work/pi-readiness-home")
 
         [
+          {"PI_ACP_TIGHTBEAM_TURN_FAILURES", "0"},
           {"PI_CODING_AGENT_DIR", home},
           {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)},
           {"HOME", private_home},
@@ -520,6 +741,7 @@ defmodule Tightbeam.Harness.Pi do
       end,
       remote_prefix: fn base, home, _kind ->
         [
+          "PI_ACP_TIGHTBEAM_TURN_FAILURES=0",
           "PI_CODING_AGENT_DIR=#{Support.shell_quote(home)}",
           "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}",
           "PI_REAL_HOME=\"$HOME\"",
@@ -709,6 +931,48 @@ defmodule Tightbeam.Harness.Pi do
         ".bin",
         "pi-acp"
       ])
+  end
+
+  @doc false
+  def patch_adapter_source(source) do
+    Tightbeam.Harness.AdapterPatch.patch(
+      source,
+      @adapter_replacements,
+      wire_name(),
+      @adapter_version
+    )
+  end
+
+  defp patch_local(path) do
+    Tightbeam.Harness.AdapterPatch.ensure!(
+      path,
+      @adapter_package,
+      @adapter_bundle,
+      @adapter_version,
+      @adapter_replacements,
+      wire_name(),
+      scope: :unscoped
+    )
+  end
+
+  defp patch_remote(target, path, detail) do
+    script =
+      Tightbeam.Harness.AdapterPatch.remote_script(
+        path,
+        @adapter_package,
+        @adapter_bundle,
+        @adapter_replacements,
+        wire_name(),
+        scope: :unscoped,
+        version: @adapter_version
+      )
+
+    command = "node -e " <> Support.shell_quote(script)
+
+    case target.sh.(Support.catalog_probe_argv(target.host_config.ssh, command)) do
+      {_output, 0} -> {:ok, detail <> "; pi adapter patched"}
+      {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
+    end
   end
 
   defp local_real_home, do: System.get_env("HOME") || System.user_home!()
