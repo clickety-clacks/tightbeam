@@ -48,15 +48,28 @@ defmodule Tightbeam.FirstRunTourTest do
   } do
     System.put_env(@flag, "true")
     db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
+    assert FirstRunTour.eligible?(db)
+    assert {:ok, [["fresh"]]} = DB.query(db, "SELECT origin FROM schema_bootstrap_origin")
+    assert :ok = Schema.ensure_all(db)
+    GenServer.stop(db)
+
+    db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
     assert :ok = Schema.ensure_all(db)
     assert Org.get_setting(db, @setting) == "pending"
+    Devices.add_user(db, @owner, true)
     assert :ok = FirstRunTour.ensure(db, @defaults)
+    assert Org.get_setting(db, @setting) == "pending"
     GenServer.stop(db)
 
     db = open!(path, payload)
     assert :ok = Schema.ensure_all(db)
-    assert Org.get_setting(db, @setting) == "pending"
     main = create_main!(db)
+    GenServer.stop(db)
+
+    db = open!(path, payload)
+    assert :ok = Schema.ensure_all(db)
     assert :ok = FirstRunTour.ensure(db, @defaults)
     tour = Org.get_setting(db, @setting)
     assert tour != main.session_key
@@ -79,17 +92,69 @@ defmodule Tightbeam.FirstRunTourTest do
   } do
     System.delete_env(@flag)
     db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
     assert :ok = Schema.ensure_all(db)
     main = create_main!(db)
     GenServer.stop(db)
 
     System.put_env(@flag, "true")
     db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
     assert :ok = Schema.ensure_all(db)
     assert :ok = FirstRunTour.ensure(db, @defaults)
     refute Org.get_setting(db, @setting)
     assert [] = Org.active_all_by_identity_name(db, "tour-guide")
     assert %{kind: "main", archetype: "default"} = Org.get(db, main.session_key)
+  end
+
+  test "an older interrupted bootstrap cannot acquire tour eligibility", %{
+    path: path,
+    payload: payload
+  } do
+    System.delete_env(@flag)
+    base = Path.dirname(path)
+    %{identity: identity} = Tightbeam.LiveBaseAdmission.prepare!(base, payload_root: payload)
+    db = open!(path, payload)
+    assert :ok = DB.prepare_schema(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO schema_stamp(shape,stampedAt) VALUES('row-driven-admission-pre-liveness-v1-019',1);
+             CREATE TABLE schema_bootstrap_origin (
+               id INTEGER PRIMARY KEY CHECK(id=1),
+               origin TEXT NOT NULL CHECK(origin='fresh'),
+               createdAt INTEGER NOT NULL
+             );
+             INSERT INTO schema_bootstrap_origin VALUES(1,'fresh',1);
+             """)
+
+    GenServer.stop(db)
+
+    File.write!(
+      Path.join(base, "build-owner.json"),
+      JSON.encode!(%{"format" => "tightbeam-build-owner/v1", "buildIdentity" => identity})
+    )
+
+    System.put_env(@flag, "true")
+    db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
+    assert :ok = Schema.ensure_all(db)
+    create_main!(db)
+    assert :ok = FirstRunTour.ensure(db, @defaults)
+    refute FirstRunTour.eligible?(db)
+    assert [] = Org.active_all_by_identity_name(db, "tour-guide")
+  end
+
+  test "a new database beside an existing identity cannot acquire tour eligibility", %{
+    path: path,
+    payload: payload
+  } do
+    System.put_env(@flag, "true")
+    File.mkdir!(Path.join(Path.dirname(path), "identity"))
+    db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
+    assert :ok = Schema.ensure_all(db)
+    refute FirstRunTour.eligible?(db)
   end
 
   test "upgrading a predecessor does not make it eligible" do
@@ -109,7 +174,7 @@ defmodule Tightbeam.FirstRunTourTest do
   end
 
   defp create_main!(db) do
-    Devices.add_user(db, @owner, true)
+    if is_nil(Devices.user(db, @owner)), do: Devices.add_user(db, @owner, true)
 
     Org.create(db, %{
       session_key: Org.personal_session_key(@owner),

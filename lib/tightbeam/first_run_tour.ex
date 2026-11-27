@@ -11,8 +11,8 @@ defmodule Tightbeam.FirstRunTour do
 
   def enabled?, do: System.get_env("TIGHTBEAM_FIRST_RUN_ONBOARDING") == "true"
 
-  # Only the fresh schema bootstrap may call this, in the transaction that
-  # consumes its bootstrap receipt. Existing databases never get this row.
+  # Only the DB birth transaction may call this. Existing installations and
+  # bootstrap receipts left by older binaries never get this row.
   def mark_fresh_in_txn(%Txn{} = txn) do
     if enabled?() do
       Txn.q(txn, "INSERT INTO org_settings(key,value,updatedAt) VALUES(?1,?2,?3)", [
@@ -23,6 +23,13 @@ defmodule Tightbeam.FirstRunTour do
     end
 
     :ok
+  end
+
+  def eligible?(db) do
+    case DB.query(db, "SELECT value FROM org_settings WHERE key=?1", [@setting]) do
+      {:ok, [[_receipt]]} -> true
+      _ -> false
+    end
   end
 
   def ensure(db, defaults) do

@@ -292,6 +292,17 @@ defmodule Tightbeam.Org do
   @doc false
   def retirement_parent_moves_schema_objects, do: @retirement_parent_moves_schema_objects
 
+  @settings_ddl """
+  CREATE TABLE IF NOT EXISTS org_settings (
+    key       TEXT PRIMARY KEY,
+    value     TEXT NOT NULL,
+    updatedAt INTEGER NOT NULL
+  );
+  """
+
+  @doc false
+  def settings_ddl, do: @settings_ddl
+
   @ddl """
   CREATE TABLE IF NOT EXISTS sessions (
     sessionKey    TEXT PRIMARY KEY,
@@ -339,11 +350,7 @@ defmodule Tightbeam.Org do
     createdAt        INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
-  CREATE TABLE IF NOT EXISTS org_settings (
-    key       TEXT PRIMARY KEY,
-    value     TEXT NOT NULL,
-    updatedAt INTEGER NOT NULL
-  );
+  #{@settings_ddl}
   CREATE TABLE IF NOT EXISTS rail_scope_migrations (
     migrationId TEXT PRIMARY KEY,
     reportJson  TEXT NOT NULL,
@@ -394,11 +401,7 @@ defmodule Tightbeam.Org do
     createdAt        INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
-  CREATE TABLE IF NOT EXISTS org_settings (
-    key       TEXT PRIMARY KEY,
-    value     TEXT NOT NULL,
-    updatedAt INTEGER NOT NULL
-  );
+  #{@settings_ddl}
   """
 
   @doc false
