@@ -125,13 +125,7 @@ defmodule Tightbeam.ProviderAccounts do
                  message: "incompatible provider account schema stamp: #{inspect(rows)}"
            end
 
-           if Mix.env() == :test do
-             # The crash test stops this VM after the schema writes, before COMMIT.
-             if checkpoint = Application.get_env(:tightbeam, :provider_schema_checkpoint) do
-               checkpoint.()
-             end
-           end
-
+           schema_checkpoint()
            :ok
          end) do
       {:ok, :ok} ->
@@ -260,6 +254,17 @@ defmodule Tightbeam.ProviderAccounts do
 
       :ok
     end)
+  end
+
+  if Mix.env() == :test do
+    # The crash test stops this VM after the schema writes, before COMMIT.
+    defp schema_checkpoint do
+      if checkpoint = Application.get_env(:tightbeam, :provider_schema_checkpoint) do
+        checkpoint.()
+      end
+    end
+  else
+    defp schema_checkpoint, do: :ok
   end
 
   defp account_row(values) do
