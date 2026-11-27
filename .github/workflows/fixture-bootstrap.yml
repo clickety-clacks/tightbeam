@@ -18,7 +18,7 @@ jobs:
           github-token: ${{ github.token }}
       - name: Generate twice from the verified candidate
         run: |
-          sudo apt-get update
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
           sudo apt-get install -y sqlite3 libfaketime
           archive=candidate/packages/linux-x86_64/tightbeam-0.1.17-linux-x86_64.tgz
           echo "1ce35cf3a76d53b15bf617c3665000544c0a0396a9340373c5cbac0f158d86f8  $archive" | sha256sum -c
