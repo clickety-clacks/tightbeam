@@ -157,6 +157,87 @@ defmodule Tightbeam.FirstRunTourTest do
     refute FirstRunTour.eligible?(db)
   end
 
+  test "a failed role write rolls the Guide back and retries independently of Main", %{
+    path: path,
+    payload: payload
+  } do
+    System.put_env(@flag, "true")
+    db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, Path.dirname(path))
+    assert :ok = Schema.ensure_all(db)
+    main = create_main!(db)
+    assert %{name: "tour-guide"} = Roles.create!(db, "tour-guide", @owner, main.session_key)
+
+    assert :ok = FirstRunTour.ensure(db, @defaults)
+    assert Org.get_setting(db, @setting) == "pending"
+    assert [] = Org.active_all_by_identity_name(db, "tour-guide")
+    assert %{kind: "main"} = Org.get(db, main.session_key)
+
+    assert :ok = DB.execute(db, "DELETE FROM roles WHERE name='tour-guide'")
+    assert :ok = FirstRunTour.ensure(db, @defaults)
+    tour = Org.get_setting(db, @setting)
+    assert {:ok, ^tour, false} = Roles.resolve(db, "tour-guide")
+    assert [%{session_key: ^tour, handle: nil}] = Org.active_all_by_identity_name(db, "tour-guide")
+  end
+
+  test "pre-owner-publication interruptions still require admission recovery", %{
+    path: path,
+    payload: payload
+  } do
+    System.put_env(@flag, "true")
+    base = Path.dirname(path)
+    db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, base)
+    assert FirstRunTour.eligible?(db)
+    GenServer.stop(db)
+
+    assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+      Tightbeam.LiveBaseAdmission.prepare!(base, payload_root: payload)
+    end
+  end
+
+  test "a persisted birth may finish identity initialization after an admitted restart", %{
+    path: path,
+    payload: payload
+  } do
+    System.put_env(@flag, "true")
+    base = Path.dirname(path)
+    db = open!(path, payload)
+    assert :ok = Schema.prepare_tour_birth(db, base)
+    assert :ok = Schema.ensure_all(db)
+    GenServer.stop(db)
+    refute File.exists?(Path.join(base, "identity"))
+
+    db = open!(path, payload)
+    assert :initialized = FirstRunTour.init_identity!(base, db)
+    guide = Path.join(base, "identity/archetypes/tour-guide.toml")
+    assert File.regular?(guide)
+    assert :noop = FirstRunTour.init_identity!(base, db)
+    assert File.regular?(guide)
+  end
+
+  test "default-off initialization retains neutral identity even after enabling", %{
+    path: path,
+    payload: payload
+  } do
+    System.delete_env(@flag)
+    base = Path.dirname(path)
+    db = open!(path, payload)
+    assert :initialized = FirstRunTour.init_identity!(base, db)
+    assert :ok = Schema.ensure_all(db)
+    neutral = Path.join(base, "identity/archetypes/default.toml")
+    before = File.read!(neutral)
+    refute File.exists?(Path.join(base, "identity/archetypes/tour-guide.toml"))
+    GenServer.stop(db)
+
+    System.put_env(@flag, "true")
+    db = open!(path, payload)
+    assert :noop = FirstRunTour.init_identity!(base, db)
+    assert File.read!(neutral) == before
+    refute FirstRunTour.eligible?(db)
+    refute File.exists?(Path.join(base, "identity/archetypes/tour-guide.toml"))
+  end
+
   test "upgrading a predecessor does not make it eligible" do
     System.put_env(@flag, "true")
     db = open!(":memory:", nil)

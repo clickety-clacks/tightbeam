@@ -2,7 +2,7 @@ defmodule Tightbeam.FirstRunTour do
   @moduledoc false
 
   require Logger
-  alias Tightbeam.{Archetypes, DB, Org, Placement, Roles}
+  alias Tightbeam.{Archetypes, DB, Identity, Org, Placement, Roles, Schema}
   alias Tightbeam.DB.Txn
 
   @setting "first-run-tour"
@@ -30,6 +30,12 @@ defmodule Tightbeam.FirstRunTour do
       {:ok, [[_receipt]]} -> true
       _ -> false
     end
+  end
+
+  def init_identity!(base_dir, db) do
+    :ok = Schema.prepare_tour_birth(db, base_dir)
+    seed = if enabled?() and eligible?(db), do: :tour_guide, else: :neutral
+    Identity.init_after_admission!(base_dir, db, seed)
   end
 
   def ensure(db, defaults) do
@@ -60,7 +66,6 @@ defmodule Tightbeam.FirstRunTour do
           owner_user_id: owner,
           origin: "process:tightbeam",
           spawned_by: main,
-          handle: @role,
           archetype: @role,
           host: Placement.local_host_name(),
           harness: defaults |> Map.fetch!(:harness) |> to_string(),

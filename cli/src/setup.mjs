@@ -670,15 +670,21 @@ async function setup() {
         }
       }
       if (installChatPackage) installChat(scratch);
-      if (needsMain) {
+      if (needsMain || needsFirstRun) {
         const auth = await gatewayFrame(localOrigin, {
           type: 'auth', deviceId: state.deviceId, token: fs.readFileSync(credentials, 'utf8'), subscriptions: ['chat'],
-        }, 'auth_result');
-        if (!auth.success) throw new Error('Could not set up the main Tightbeam session.');
-        const streams = await getJson(`${localOrigin}/api/streams`, fs.readFileSync(credentials, 'utf8'));
-        state.main = streams?.streams?.find((stream) => stream.kind === 'main')?.sessionKey;
-        if (!state.main) throw new Error('Could not find the main Tightbeam session.');
-        save();
+        }, 'auth_result').catch((error) => {
+          if (needsMain) throw error;
+          console.error(`Could not retry Tour Guide initialization: ${error.message}`);
+          return { success: false };
+        });
+        if (needsMain) {
+          if (!auth.success) throw new Error('Could not set up the main Tightbeam session.');
+          const streams = await getJson(`${localOrigin}/api/streams`, fs.readFileSync(credentials, 'utf8'));
+          state.main = streams?.streams?.find((stream) => stream.kind === 'main')?.sessionKey;
+          if (!state.main) throw new Error('Could not find the main Tightbeam session.');
+          save();
+        }
       }
       if (writeChatMap) {
         const file = path.join(scratch, 'chat-gateways.json');
@@ -721,12 +727,12 @@ async function setup() {
         console.log('NOT READY: Tightbeam could not read the gateway readiness check.');
       }
       if (state.ready && command(targetCli, ['onboard', '--first-run', '--check'], { cwd: home, env: onboardingEnv }).status === 0) {
-        run(targetCli, ['onboard', '--first-run'], {
-          cwd: home, env: onboardingEnv,
+        const welcome = command(targetCli, ['onboard', '--first-run'], {
+          cwd: home, env: onboardingEnv, stdio: 'inherit',
         });
-      } else {
-        console.log(`Open Main in Chat to get started with Uncle Enzo, the recommended kungfu: ${mainLink}`);
+        if (welcome.status === 0) return;
       }
+      console.log(`Open Main in Chat to get started with Uncle Enzo, the recommended kungfu: ${mainLink}`);
     } catch (error) {
       if (removedQuick && state.gatewayFile) {
         try {

@@ -189,8 +189,7 @@ defmodule Tightbeam.Gateway do
       })
 
     :ok = DB.assert_base_admitted!(db, config.base_dir)
-    :ok = Schema.prepare_tour_birth(db, config.base_dir)
-    Identity.init_after_admission!(config.base_dir, db)
+    Tightbeam.FirstRunTour.init_identity!(config.base_dir, db)
     prod_limit = Map.get(config, :prod_limit, 3)
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
