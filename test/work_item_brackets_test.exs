@@ -58,7 +58,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     def handle_info({:push, payload}, received), do: {:noreply, [payload | received]}
   end
 
-  setup do
+  setup context do
     previous_item_wait_flag = Application.get_env(:tightbeam, :work_item_waits_enabled)
     Application.put_env(:tightbeam, :work_item_waits_enabled, true)
 
@@ -69,7 +69,23 @@ defmodule Tightbeam.WorkItemBracketsTest do
     end)
 
     db = :"brackets_db_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
+
+    db_path =
+      if context[:persistent_db] do
+        base =
+          Path.join(
+            System.tmp_dir!(),
+            "tb-followthrough-restart-#{System.unique_integer([:positive])}"
+          )
+
+        File.mkdir_p!(base)
+        on_exit(fn -> File.rm_rf!(base) end)
+        Path.join(base, "state.db")
+      else
+        ":memory:"
+      end
+
+    start_supervised!({DB, path: db_path, name: db, guard_inputs: []})
     start_supervised!({ConnRegistry, name: ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
@@ -103,6 +119,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     %{
       db: db,
+      db_path: db_path,
       law_base: base,
       handlers: handlers,
       flynn_main: flynn_main,
@@ -429,15 +446,14 @@ defmodule Tightbeam.WorkItemBracketsTest do
              System.system_time(:millisecond) + 60_000
   end
 
+  @tag persistent_db: true
   test "database restart retains the episode and single pending follow-up", ctx do
     enable_followthrough()
     {item, first} = followthrough_item(ctx)
     finish_notice(ctx, first)
     pending = slate_wake_id(ctx.db, item.id)
-    path = Path.join(ctx.law_base, "restart-state.db")
-    assert {:ok, _} = DB.query(ctx.db, "VACUUM INTO ?1", [path])
     stop_supervised!(DB)
-    start_supervised!({DB, path: path, name: ctx.db})
+    start_supervised!({DB, path: ctx.db_path, name: ctx.db, guard_inputs: []})
     :ok = Tightbeam.Schema.ensure_all(ctx.db)
     :ok = Tightbeam.RowReactions.recover(ctx.db)
     assert slate_wake_id(ctx.db, item.id) == pending
