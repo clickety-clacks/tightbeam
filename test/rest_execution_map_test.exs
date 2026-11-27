@@ -870,6 +870,8 @@ defmodule Tightbeam.RestExecutionMapTest do
                })
     end
 
+    :ok = Tightbeam.ExecutionMapTurnVersions.ensure_schema(ctx.db)
+
     # Model an upgrade before any historical batches have committed.
     assert :ok =
              DB.execute(ctx.db, """

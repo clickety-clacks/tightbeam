@@ -7,6 +7,8 @@ defmodule Tightbeam.ProviderAccounts do
   alias Tightbeam.{DB, Id, Schema}
   alias Tightbeam.DB.Txn
 
+  def enabled?, do: Application.get_env(:tightbeam, :provider_accounts_enabled, false) == true
+
   @shape "provider-accounts-v1"
   @account_fields ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason enabled signedInAt updatedAt rowVersion)
   @serving_fields ~w(harness host accountId revision reason sinceAt previousAccountId)

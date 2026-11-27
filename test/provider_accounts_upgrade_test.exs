@@ -3,6 +3,18 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
 
   alias Tightbeam.{Credentials, DB, Placement, ProviderAccounts, Schema, StateResources}
 
+  setup do
+    previous = Application.fetch_env(:tightbeam, :provider_accounts_enabled)
+    Application.put_env(:tightbeam, :provider_accounts_enabled, true)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, enabled} -> Application.put_env(:tightbeam, :provider_accounts_enabled, enabled)
+        :error -> Application.delete_env(:tightbeam, :provider_accounts_enabled)
+      end
+    end)
+  end
+
   @host "test-host"
   # The second fixture is the same synthetic 0.1.16 DB opened by Schema.ensure_all/1
   # at 3123c3cb (pre-account 0.1.17 source), then dumped from SQLite.

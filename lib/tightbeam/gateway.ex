@@ -470,7 +470,7 @@ defmodule Tightbeam.Gateway do
     opts =
       [
         name: Tightbeam.Credentials.server(machine),
-        provider_accounts_db: db,
+        provider_accounts_db: if(Tightbeam.ProviderAccounts.enabled?(), do: db),
         provider_accounts_registration:
           if(machine != Placement.local_host_name(), do: {host.base_dir, host.ssh}),
         base_dir: host.base_dir,

@@ -121,7 +121,8 @@ defmodule Tightbeam.ExecutionMapTurnVersions do
 
   def indexed_read?(txn), do: enabled?() and ready?(txn)
 
-  defp enabled? do
+  @doc false
+  def enabled? do
     Application.get_env(:tightbeam, :execution_map_turn_backfill_enabled, false) == true
   end
 
