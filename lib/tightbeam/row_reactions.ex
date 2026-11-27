@@ -374,7 +374,12 @@ defmodule Tightbeam.RowReactions do
   end
 
   def admit(txn, event) do
-    facts = event_scope_facts(event, Snapshot.current(txn, event, %{}))
+    facts =
+      event_scope_facts(
+        txn,
+        event,
+        Snapshot.subtree_facts(txn, event, Snapshot.current(txn, event, %{}))
+      )
     actions = Store.admit(txn, event, facts)
     Enum.each(actions, &execute_action(txn, event, &1, event["at"]))
     Store.actions(txn, event["org"], event["id"])
@@ -496,7 +501,11 @@ defmodule Tightbeam.RowReactions do
     {_event, original} = Store.event(txn, event["org"], event["id"])
 
     facts =
-      event_scope_facts(event, Snapshot.current(txn, event, original))
+      event_scope_facts(
+        txn,
+        event,
+        Snapshot.subtree_facts(txn, event, Snapshot.current(txn, event, original))
+      )
       |> Map.put("transition", transition)
       |> Map.put(
         "reaction_actions",
@@ -716,7 +725,7 @@ defmodule Tightbeam.RowReactions do
   defp attest_principal(_attest, principal),
     do: raise(ArgumentError, "attest source has unsupported principal: #{inspect(principal)}")
 
-  defp event_scope_facts(event, facts) do
+  defp event_scope_facts(txn, event, facts) do
     record_keys =
       case event["kind"] do
         "assignment" ->
@@ -752,6 +761,87 @@ defmodule Tightbeam.RowReactions do
     facts
     |> Map.put("scope_participant_archetypes", participant_archetypes)
     |> Map.put("scope_record_session_groups", record_groups)
+    |> put_subtree_facts(txn, event, participant_keys)
+  end
+
+  # Subtree rules read who holds which role now and where the work's owner
+  # sits in the session tree. They are recomputed at every evaluation,
+  # including the re-check before a delayed notice is delivered, and are never
+  # stored with the event.
+  defp put_subtree_facts(facts, txn, event, participant_keys) do
+    if Tightbeam.FeatureFlags.subtree_rules?() do
+      main = Tightbeam.Org.personal_session_key(event["org"])
+      anchors = active_anchors(txn, main)
+
+      Map.put(facts, Tightbeam.RowReactions.Plan.subtree_facts_key(), %{
+        "participants" => participant_keys,
+        "role_bindings" => Tightbeam.SubtreeScope.role_bindings(txn),
+        "anchors" => anchors,
+        "holder_archetypes" =>
+          Map.new(anchors, fn {_, anchor} ->
+            {anchor["session_key"], anchor["archetype"]}
+          end),
+        "owner_lineage" =>
+          case Tightbeam.SubtreeScope.work_owner(txn, subtree_refs(event)) do
+            key when is_binary(key) -> Tightbeam.SubtreeScope.lineage(txn, key)
+            _ -> []
+          end
+      })
+    else
+      facts
+    end
+  end
+
+  defp active_anchors(txn, main) do
+    Txn.q(
+      txn,
+      """
+      SELECT r.name, s.sessionKey, s.displayName, s.archetype FROM roles r
+      JOIN sessions s ON s.sessionKey = r.boundSessionKey
+      WHERE s.state = 'active'
+      UNION ALL
+      SELECT NULL, sessionKey, displayName, archetype FROM sessions
+      WHERE sessionKey = ?1 AND state = 'active'
+      """,
+      [main]
+    )
+    |> Map.new(fn [role, key, name, archetype] ->
+      {role, %{"session_key" => key, "name" => name, "archetype" => archetype}}
+    end)
+  end
+
+  defp subtree_refs(event) do
+    caller =
+      if get_in(event, ["principal", "kind"]) == "session",
+        do: get_in(event, ["principal", "id"])
+
+    assignment_id =
+      case event["kind"] do
+        "assignment" ->
+          get_in(event, ["terminal", "assignment_id"])
+
+        kind when kind in ["assignment_attest", "assignment_start"] ->
+          get_in(event, ["after", "assignment", "id"])
+
+        "wake_delivery" ->
+          get_in(event, ["after", "assignmentId"])
+
+        _ ->
+          nil
+      end
+
+    work_item_id =
+      case event["kind"] do
+        "work_item_observation" -> event["workItemId"]
+        "assignment" -> get_in(event, ["terminal", "work_item_id"])
+        _ -> nil
+      end
+
+    %{
+      assignment_id: assignment_id,
+      work_item_id: work_item_id,
+      caller: caller || get_in(event, ["delivery", "sessionKey"])
+    }
   end
 
   defp stringify(map),

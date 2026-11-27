@@ -1,0 +1,12 @@
+{
+  "name": "tightbeam",
+  "version": "0.0.0",
+  "description": "Install and set up Tightbeam from a verified GitHub release",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clickety-clacks/tightbeam.git"
+  },
+  "bin": { "tightbeam": "install.mjs" },
+  "engines": { "node": ">=24" },
+  "files": ["install.mjs", "release.mjs"]
+}

@@ -7,6 +7,10 @@ defmodule Tightbeam.Retention do
   The walk is paced so other writers keep the database: after each batch it
   waits `pace_factor` times as long as that batch took (at least `min_yield_ms`,
   at most a minute), and batches are small.
+
+  The cleanup is off unless the `:rail_sweep_cleanup` application setting is
+  `true` (or `enabled: true` is passed). When off, the process starts but never
+  runs a batch, so it neither reads nor writes the database.
   """
   use GenServer
 
@@ -29,11 +33,15 @@ defmodule Tightbeam.Retention do
 
   @impl true
   def init(opts) do
-    Process.send_after(self(), :trim, @boot_delay)
+    enabled =
+      Keyword.get(opts, :enabled, Application.get_env(:tightbeam, :rail_sweep_cleanup, false))
+
+    if enabled, do: Process.send_after(self(), :trim, @boot_delay)
 
     {:ok,
      %{
        db: Keyword.get(opts, :db, DB),
+       enabled: enabled,
        cursor: 0,
        complete: false,
        batch: Keyword.get(opts, :batch, @batch),
@@ -44,6 +52,7 @@ defmodule Tightbeam.Retention do
   end
 
   @impl true
+  def handle_info(:trim, %{enabled: false} = state), do: {:noreply, state}
   def handle_info(:trim, %{complete: true} = state), do: {:noreply, state}
 
   def handle_info(:trim, state) do

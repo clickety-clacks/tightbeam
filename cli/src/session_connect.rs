@@ -34,12 +34,16 @@ extern "C" fn session_signal_handler(signal: libc::c_int) {
     let _ = SESSION_SIGNAL.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-struct SessionSignalGuard {
+pub(crate) struct SessionSignalGuard {
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 
 impl SessionSignalGuard {
-    fn install() -> Result<Self, String> {
+    pub(crate) fn interrupted(&self) -> bool {
+        SESSION_SIGNAL.load(Ordering::SeqCst) != 0
+    }
+
+    pub(crate) fn install() -> Result<Self, String> {
         let mut previous = Vec::new();
         for signal in [libc::SIGINT, libc::SIGTERM] {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };

@@ -219,7 +219,9 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
-  setup do
+  setup tags do
+    if tags[:people_messaging], do: Application.put_env(:tightbeam, :people_messaging_enabled, true)
+
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -501,6 +503,23 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["resource"] == "sessions"
     assert Enum.map(body["items"], & &1["sessionKey"]) == [visible.session_key]
     assert body["items"] == [Tightbeam.StateResources.session(visible)]
+  end
+
+  test "setup readiness is available to the paired administrator", ctx do
+    report = %{ready: true, lines: ["READY: fixture can run turns."]}
+    opts = Keyword.put(ctx.opts, :setup_readiness, fn -> report end)
+
+    assert conn(:get, "/api/setup-readiness")
+           |> Router.call(Router.init(opts))
+           |> Map.fetch!(:status) == 401
+
+    response =
+      conn(:get, "/api/setup-readiness")
+      |> put_req_header("authorization", "Bearer " <> ctx.device.token)
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == %{"ready" => true, "lines" => report.lines}
   end
 
   test "core device detail preserves authorization order and canonical envelope", ctx do
@@ -983,6 +1002,100 @@ defmodule Tightbeam.Wire.RouterTest do
     handler_keys = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir}) |> Map.keys()
 
     assert agent_verbs -- handler_keys == []
+  end
+
+  test "people messaging defaults off before storage and refuses both agent and relay verbs", ctx do
+    session = create_session(ctx.db, "people-disabled", ctx.device.user_id)
+    Application.put_env(:tightbeam, :people_message_relay_session, session.session_key)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT name FROM sqlite_master WHERE name GLOB 'people_*'")
+
+    verbs =
+      ~w(people-send people-update people-reply people-withdraw people-status people-collect people-report people-event people-lookup people-wait)
+
+    for verb <- verbs do
+      response = dispatch_cli(ctx, session.cli_token, %{verb: verb})
+      assert response.status == 403
+
+      assert %{"error" => %{"code" => "people_messaging_not_enabled"}} =
+               JSON.decode!(response.resp_body)
+    end
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT name FROM sqlite_master WHERE name GLOB 'people_*'")
+  end
+
+  @tag people_messaging: true
+  test "people messaging uses the authenticated session and preserves relay acknowledgments",
+       ctx do
+    sender = create_session(ctx.db, "people-sender", ctx.device.user_id)
+    relay = create_session(ctx.db, "people-relay", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+    previous = Application.fetch_env(:tightbeam, :people_message_relay_session)
+    Application.put_env(:tightbeam, :people_message_relay_session, relay.session_key)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, session} -> Application.put_env(:tightbeam, :people_message_relay_session, session)
+        :error -> Application.delete_env(:tightbeam, :people_message_relay_session)
+      end
+    end)
+
+    work = "wi-people-wire"
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt)
+        VALUES(?1,'Fixture work',?2,?2,1)
+        """,
+        [work, ctx.device.user_id]
+      )
+
+    response =
+      dispatch_cli(ctx, sender.cli_token, %{
+        verb: "people-send",
+        params: %{title: "News", body: "Message", work_item_id: work}
+      })
+
+    assert response.status == 200
+
+    assert %{"result" => %{"relay_configured" => true, "record" => record}} =
+             JSON.decode!(response.resp_body)
+
+    assert record["sender_session"] == sender.session_key
+    assert record["addresses"] == ["user:" <> ctx.device.user_id]
+
+    assert dispatch_cli(ctx, sender.cli_token, %{verb: "people-collect"}).status == 403
+    assert dispatch_cli(ctx, relay.cli_token, %{verb: "people-collect"}).status == 200
+
+    wait = %{verb: "people-wait", params: %{timeout_ms: 0}}
+    assert dispatch_cli(ctx, sender.cli_token, wait).status == 403
+    response = dispatch_cli(ctx, relay.cli_token, wait)
+    assert response.status == 200
+    assert %{"result" => %{"records" => [^record]}} = JSON.decode!(response.resp_body)
+
+    report = %{
+      verb: "people-report",
+      params: %{
+        id: record["id"],
+        outcomes: [
+          %{address: hd(record["addresses"]), status: "reached"}
+        ],
+        server_id: "service",
+        remote_conversation_id: "conversation",
+        remote_revision: 1
+      }
+    }
+
+    assert %{"result" => %{"accepted" => true, "duplicate" => false}} =
+             dispatch_cli(ctx, relay.cli_token, report).resp_body |> JSON.decode!()
+
+    assert %{"result" => %{"accepted" => true, "duplicate" => true}} =
+             dispatch_cli(ctx, relay.cli_token, report).resp_body |> JSON.decode!()
   end
 
   test "existing sentinel unsubscribe remains available through agent dispatch", ctx do

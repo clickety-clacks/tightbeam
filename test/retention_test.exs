@@ -27,7 +27,7 @@ defmodule Tightbeam.RetentionTest do
     ]
 
     for {ts, kind} <- rows, do: insert_row(db, ts, kind)
-    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, enabled: true)
     drain(pid)
 
     assert {:ok, retained} = DB.query(db, "SELECT ts,kind FROM lifecycle_events ORDER BY id")
@@ -48,13 +48,13 @@ defmodule Tightbeam.RetentionTest do
     db: db
   } do
     insert_row(db, @first, "rail_sweep")
-    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, enabled: true)
     drain(pid)
     assert count(db) == 0
     GenServer.stop(pid)
 
     insert_row(db, @first, "rail_sweep")
-    {:ok, restarted} = Retention.start_link(db: db, name: nil)
+    {:ok, restarted} = Retention.start_link(db: db, name: nil, enabled: true)
     drain(restarted)
     assert count(db) == 1
     GenServer.stop(restarted)
@@ -62,7 +62,7 @@ defmodule Tightbeam.RetentionTest do
 
   test "large history is processed in bounded batches without blocking other reads", %{db: db} do
     for _ <- 1..201, do: insert_row(db, @first, "rail_sweep")
-    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 1)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, enabled: true, min_yield_ms: 1)
     assert count(db) == 201
 
     send(pid, :trim)
@@ -77,7 +77,7 @@ defmodule Tightbeam.RetentionTest do
   test "a long history still finishes in small batches and writes the marker", %{db: db} do
     for _ <- 1..1_050, do: insert_row(db, @first, "rail_sweep")
     for _ <- 1..30, do: insert_row(db, @first, "rail_remedy")
-    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 1)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, enabled: true, min_yield_ms: 1)
 
     drain(pid)
 
@@ -90,7 +90,7 @@ defmodule Tightbeam.RetentionTest do
 
   test "the walk waits between batches before taking the writer again", %{db: db} do
     for _ <- 1..450, do: insert_row(db, @first, "rail_sweep")
-    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 2_000)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, enabled: true, min_yield_ms: 2_000)
 
     send(pid, :trim)
     assert %{cursor: 200, last_pause_ms: pause} = :sys.get_state(pid)
@@ -109,10 +109,25 @@ defmodule Tightbeam.RetentionTest do
 
   test "a failed pass leaves the process alive and does not mark cleanup complete", %{db: db} do
     assert :ok = DB.execute(db, "DROP TABLE lifecycle_events")
-    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, enabled: true)
     send(pid, :trim)
     assert %{complete: false} = :sys.get_state(pid)
     assert Process.alive?(pid)
+    assert {:ok, []} = DB.query(db, "SELECT id FROM rail_sweep_cleanup")
+    GenServer.stop(pid)
+  end
+
+  test "by default the cleanup is off: no batch runs and the database is untouched", %{db: db} do
+    insert_row(db, @first, "rail_sweep")
+    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    send(pid, :trim)
+
+    state = :sys.get_state(pid)
+    refute state.enabled
+    refute state.complete
+    assert state.cursor == 0
+    assert state.last_pause_ms == nil
+    assert count(db) == 1
     assert {:ok, []} = DB.query(db, "SELECT id FROM rail_sweep_cleanup")
     GenServer.stop(pid)
   end

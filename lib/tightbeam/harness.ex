@@ -81,6 +81,8 @@ defmodule Tightbeam.Harness do
   @callback wire_projection() :: binary()
   @callback preflight_launch(target(), String.t(), keyword()) :: preflight_result()
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
+  @callback check_launch(launch_plan(), String.t(), ([String.t()] -> {String.t(), integer()})) ::
+              launch_result()
   @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
   @doc "Optional harness-owned metadata for loading an existing ACP session."
@@ -94,6 +96,7 @@ defmodule Tightbeam.Harness do
   @doc "The harness-owned leaf entries of a projected home."
   @callback owned_home_entries() :: [String.t()]
   @callback reconcile_home(target(), String.t(), desired_home()) :: map()
+  @callback conversation_directory() :: String.t()
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
   @callback credential_live?(target(), String.t(), keyword()) :: credential_liveness()
@@ -131,7 +134,9 @@ defmodule Tightbeam.Harness do
   @doc "Whether a running turn accepts model tuning without replacing its conversation."
   @callback running_model_tuning_supported?() :: boolean()
 
-  @optional_callbacks preflight_launch: 3,
+  @optional_callbacks conversation_directory: 0,
+                      preflight_launch: 3,
+                      check_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
@@ -161,6 +166,13 @@ defmodule Tightbeam.Harness do
       plan when is_list(plan) ->
         {:ok, plan}
     end
+  end
+
+  @doc "Check a completed launch plan before the coordinator starts an adapter."
+  def check_launch(module, opts, host, run) do
+    if function_exported?(module, :check_launch, 3),
+      do: module.check_launch(opts, host, run),
+      else: {:ok, opts}
   end
 
   @spec ensure_adapter(module(), target()) :: ensure_result()

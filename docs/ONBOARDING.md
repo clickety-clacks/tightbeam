@@ -203,7 +203,7 @@ Login status and file presence are not liveness.
 Run these checks when model-catalog or credential-home code changes. They use
 fixture credentials and never contact a provider.
 
-0. Complete the README's [From source](../README.md#from-source) setup through
+0. Complete the [development setup](DEVELOPMENT.md#from-source) through
    the release CLI build.
 
    PASS: every prerequisite command exits zero, including `mix deps.get` and

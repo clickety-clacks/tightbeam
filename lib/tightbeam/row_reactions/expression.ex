@@ -5,6 +5,7 @@ defmodule Tightbeam.RowReactions.Expression do
   @binary ~w(eq ne gt gte lt lte in add)
   @unary ~w(not is_null count first unique json sha256)
   @variadic ~w(and or coalesce concat)
+  @subtree_binary ~w(contains)
 
   def validate!(value)
       when is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value),
@@ -31,8 +32,12 @@ defmodule Tightbeam.RowReactions.Expression do
   end
 
   def validate!(%{"op" => op, "args" => args} = value) do
+    # `contains` exists only while role-scoped rules are switched on.
+    if op in @subtree_binary and not Tightbeam.FeatureFlags.subtree_rules?(),
+      do: raise(ArgumentError, "unsupported reaction operation or arity: #{inspect(op)}")
+
     unless map_size(value) == 2 and is_list(args) and
-             ((op in @binary and length(args) == 2) or
+             ((op in (@binary ++ @subtree_binary) and length(args) == 2) or
                 (op in @unary and length(args) == 1) or
                 (op in @variadic and args != []) or (op == "if" and length(args) == 3)),
            do: raise(ArgumentError, "unsupported reaction operation or arity: #{inspect(op)}")
@@ -48,6 +53,38 @@ defmodule Tightbeam.RowReactions.Expression do
       validate!(expression)
     end)
   end
+
+  def archetype_comparisons(expression) do
+    expression
+    |> terms()
+    |> Enum.flat_map(fn
+      %{"op" => op, "args" => [left, right | _]} when op in ~w(eq ne in not_in) ->
+        case {left, right} do
+          {%{"ref" => name}, value} -> archetype_comparison(name, op, value)
+          {value, %{"ref" => name}} when op in ~w(eq ne) -> archetype_comparison(name, op, value)
+          _ -> []
+        end
+
+      _ ->
+        []
+    end)
+  end
+
+  def fact_references(expression) do
+    for %{"ref" => "facts." <> path} <- terms(expression), do: path
+  end
+
+  defp terms(value) when is_map(value),
+    do: [value | Enum.flat_map(Map.values(value), &terms/1)]
+
+  defp terms(value) when is_list(value), do: Enum.flat_map(value, &terms/1)
+  defp terms(_value), do: []
+
+  defp archetype_comparison(name, op, value) when is_binary(name) do
+    if String.ends_with?(name, ".archetype"), do: [{name, op, value}], else: []
+  end
+
+  defp archetype_comparison(_name, _op, _value), do: []
 
   def evaluate(%{"ref" => path}, facts), do: get_in(facts, String.split(path, "."))
 
@@ -99,6 +136,7 @@ defmodule Tightbeam.RowReactions.Expression do
   defp apply_operation("lte", [a, b]) when is_number(a) and is_number(b), do: a <= b
   defp apply_operation("add", [a, b]) when is_number(a) and is_number(b), do: a + b
   defp apply_operation("in", [a, b]) when is_list(b), do: a in b
+  defp apply_operation("contains", [a, b]), do: Tightbeam.SubtreeRules.contains?(a, b)
   defp apply_operation("not", [a]) when is_boolean(a), do: not a
   defp apply_operation("is_null", [a]), do: is_nil(a)
   defp apply_operation("count", [a]) when is_list(a), do: length(a)

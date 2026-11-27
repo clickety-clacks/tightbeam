@@ -13,7 +13,10 @@ defmodule Tightbeam.Rules do
   A nil fact never satisfies any operator, including `ne` and `not_in`.
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
   for a caller holding no roles, and `assignment.verdicts not_in
-  ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
+  ["reviewed-clean"]` fires for an assignment with no verdicts. With the
+  `subtree_rules` switch on, `contains` is also accepted on text and list
+  facts: it holds when any item contains any of the given texts, ignoring
+  case, as plain text (no patterns). List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
   `assignment.qualifying_review_verdict_kinds`,
@@ -54,13 +57,15 @@ defmodule Tightbeam.Rules do
     Devices,
     Escalation,
     EventLog,
+    FeatureFlags,
     ObligationFacts,
     Org,
     RailEpisodes,
     RailRemedy,
     RailScript,
     RuleRuntime,
-    Roles
+    Roles,
+    SubtreeScope
   }
 
   import Bitwise
@@ -239,6 +244,8 @@ defmodule Tightbeam.Rules do
     "verifier.holder_is_other" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
+  # Admitted only while role-scoped rules are switched on.
+  @subtree_operators ~w(contains)
   @predicate_binding_keys ~w(
     workItemId assignmentId decisionRequestId artifact
     conditionKind conditionScope conditionAfterId conditionFactId
@@ -488,7 +495,11 @@ defmodule Tightbeam.Rules do
             reason: "duplicate name"
           })
 
-          mark_unavailable([rule.verb], rule.source, unavailable_scope(law_base, rule.owner))
+          mark_unavailable(
+            [rule.verb],
+            rule.source,
+            unavailable_scope(law_base, rule.owner, Map.get(rule, :roles, []))
+          )
 
           true
         else
@@ -499,7 +510,11 @@ defmodule Tightbeam.Rules do
     policies =
       Enum.reject(policies, fn policy ->
         if duplicates[policy.name] > 1 do
-          mark_unavailable(verbs, policy.source, unavailable_scope(law_base, policy.owner))
+          mark_unavailable(
+            verbs,
+            policy.source,
+            unavailable_scope(law_base, policy.owner, Map.get(policy, :roles, []))
+          )
 
           Enum.each(verbs, fn verb ->
             record_unavailable_verb(%{
@@ -538,7 +553,11 @@ defmodule Tightbeam.Rules do
               reason: Exception.message(error)
             })
 
-            mark_unavailable([rule.verb], rule.source, unavailable_scope(law_base, rule.owner))
+            mark_unavailable(
+              [rule.verb],
+              rule.source,
+              unavailable_scope(law_base, rule.owner, Map.get(rule, :roles, []))
+            )
 
             false
         end
@@ -1274,7 +1293,40 @@ defmodule Tightbeam.Rules do
           _ -> nil
         end
     }
+    |> put_anchor_binding(db, rule, call)
   end
+
+  # `{anchor_session}`: the active holder, or Main for an omitted scope.
+  defp put_anchor_binding(bindings, db, rule, call) do
+    if FeatureFlags.subtree_rules?() do
+      target =
+        case rule[:scope_role] do
+          nil ->
+            with owner when is_binary(owner) <- notice_org_owner(db, call) do
+              active_notice_session(db, Org.personal_session_key(owner))
+            end
+
+          role ->
+            SubtreeScope.anchor_holder(db, role)
+        end
+
+      Map.put(bindings, :anchor_session, target)
+    else
+      bindings
+    end
+  end
+
+  defp notice_org_owner(_db, %{predicate_owner_user_id: owner}), do: owner
+  defp notice_org_owner(_db, %{principal: {:user, owner}}), do: owner
+
+  defp notice_org_owner(db, %{principal: {:session, key}}) do
+    case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [key]) do
+      {:ok, [[owner]]} -> owner
+      _ -> nil
+    end
+  end
+
+  defp notice_org_owner(_db, _call), do: nil
 
   # Row-commit notices already execute in the DB owner transaction.
   defp current_delivery_owner(%DB.Txn{} = txn, work_item_id),
@@ -1606,11 +1658,41 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  # Subtree rules (behind the flag) add two optional keys. Neither is accepted,
+  # and the rule maps carry neither field, while the flag is off.
+  defp subtree_keys(keys) do
+    if FeatureFlags.subtree_rules?(),
+      do: keys |> MapSet.put("scope") |> MapSet.put("roles"),
+      else: keys
+  end
+
+  defp subtree_declarations!(entry, _owner, fail) do
+    if FeatureFlags.subtree_rules?(), do: SubtreeScope.parse!(entry, fail), else: %{}
+  end
+
+  # With subtree rules on, an org-written entry that names neither agent types
+  # nor roles concerns every session, matching its default scope at the root.
+  # A kungfu entry keeps naming its own agent types, as rail isolation requires.
+  defp default_archetypes(entry, :substrate, []) do
+    if FeatureFlags.subtree_rules?() and not Map.has_key?(entry, "archetypes") and
+         not Map.has_key?(entry, "roles"),
+       do: ["*"],
+       else: []
+  end
+
+  defp default_archetypes(_entry, _owner, archetypes), do: archetypes
+
+  defp binding_tokens do
+    if FeatureFlags.subtree_rules?(),
+      do: ["anchor_session" | @binding_tokens],
+      else: @binding_tokens
+  end
+
   # An org-written entry without `archetypes` names no agent, so it can only
   # apply to records that involve no agent at all. Say so at load rather than
   # leaving it to be discovered when the entry never fires.
   defp warn_omitted_archetypes(entry, :substrate, path, label) do
-    unless Map.has_key?(entry, "archetypes") do
+    unless Map.has_key?(entry, "archetypes") or FeatureFlags.subtree_rules?() do
       require Logger
 
       Logger.warning(
@@ -1647,20 +1729,127 @@ defmodule Tightbeam.Rules do
   end
 
   defp policy_scope_matches?(rail, db, call) do
-    case participant_archetypes(db, call) do
-      [_ | _] = participants ->
-        Tightbeam.RailScope.matches_agents?(rail.archetypes, participants)
+    who? =
+      case participant_entries(db, call) do
+        [_ | _] = participants ->
+          participants_match?(rail, db, participants)
 
-      [] ->
-        if rail.owner == :substrate,
-          do: true,
-          else: zero_agent_belongs?(rail, db, call)
-    end
+        [] ->
+          if rail.owner == :substrate,
+            do: true,
+            else: zero_agent_belongs?(rail, db, call)
+      end
+
+    who? and where_matches?(rail, db, call)
   rescue
     _ -> false
   end
 
-  defp participant_archetypes(db, call) do
+  # Who: every participant must pass. Without a `roles` list this is exactly
+  # agent-type matching; with one, a participant also passes by holding a
+  # matching role at this moment.
+  defp participants_match?(rail, db, participants) do
+    case Map.get(rail, :roles, []) do
+      [] ->
+        Tightbeam.RailScope.matches_agents?(
+          rail.archetypes,
+          Enum.map(participants, &elem(&1, 1))
+        )
+
+      roles ->
+        Tightbeam.RailScope.matches_participants?(
+          rail.archetypes,
+          roles,
+          Enum.map(participants, fn {key, archetype} ->
+            %{archetype: archetype, roles: SubtreeScope.held_roles(db, key)}
+          end)
+        )
+    end
+  end
+
+  # Where: a rule anchored to a role covers only work owed to that role's
+  # current holder or to a session under it. An unanchored rule covers all.
+  defp where_matches?(rail, db, call) do
+    case Map.get(rail, :scope_role) do
+      nil -> true
+      role -> SubtreeScope.covers?(db, role, scope_refs(db, call))
+    end
+  end
+
+  defp scope_refs(db, call) do
+    params = Map.get(call, :params, %{}) || %{}
+    param = fn key -> present(Map.get(params, key) || Map.get(params, Atom.to_string(key))) end
+
+    caller =
+      case Map.get(call, :principal) do
+        {:session, key} when is_binary(key) -> key
+        _ -> nil
+      end
+
+    case call do
+      %{edge: :row_commit, transition: transition} when is_map(transition) ->
+        domain = Map.get(transition, :domain) || Map.get(transition, "domain")
+        row_id = Map.get(transition, :row_id) || Map.get(transition, "row_id")
+
+        {assignment_id, work_item_id} =
+          row_scope_ids(db, domain, row_id, param.(:assignment_id), param.(:work_item_id))
+
+        %{assignment_id: assignment_id, work_item_id: work_item_id, caller: caller}
+
+      %{verb: verb} when verb in ["assign", "dispatch"] ->
+        # The assignment does not exist yet; its opener is the caller. A
+        # person or process opening it leaves the holder as its owner.
+        %{caller: caller || param.(:session_key) || param.(:holder_key) || call[:session_key]}
+
+      _ ->
+        %{
+          assignment_id: param.(:assignment_id),
+          work_item_id: param.(:work_item_id),
+          caller: caller
+        }
+    end
+  end
+
+  defp row_scope_ids(_db, "assignment", id, _assignment_id, _work_item_id) when is_binary(id),
+    do: {id, nil}
+
+  defp row_scope_ids(_db, "work_item", id, _assignment_id, _work_item_id) when is_binary(id),
+    do: {nil, id}
+
+  defp row_scope_ids(db, domain, id, assignment_id, work_item_id)
+       when domain in ["attest", "artifact", "decision_request"] and is_binary(id) do
+    sql =
+      case domain do
+        "attest" ->
+          "SELECT assignmentId, NULL FROM attests WHERE id=?1"
+
+        "artifact" ->
+          "SELECT producedByAssignmentId, workItemId FROM artifacts WHERE artifactId=?1"
+
+        "decision_request" ->
+          "SELECT assignmentId, NULL FROM decision_requests WHERE id=?1"
+      end
+
+    case DB.query(db, sql, [id]) do
+      {:ok, [[row_assignment, row_work_item]]} ->
+        if domain == "artifact",
+          do: {nil, present(row_work_item) || work_item_id},
+          else: {present(row_assignment) || assignment_id, work_item_id}
+
+      _ ->
+        {assignment_id, work_item_id}
+    end
+  end
+
+  defp row_scope_ids(_db, _domain, _id, assignment_id, work_item_id),
+    do: {assignment_id, work_item_id}
+
+  defp present(value) when is_binary(value) and value != "", do: value
+  defp present(_value), do: nil
+
+  # Each participant as {session_key | nil, archetype}. A spawn's new session
+  # has no key yet.
+  defp participant_entries(db, call) do
     principal_keys =
       case Map.get(call, :principal) do
         {:session, key} when is_binary(key) -> [key]
@@ -1706,11 +1895,11 @@ defmodule Tightbeam.Rules do
     session_archetypes =
       (principal_keys ++ explicit_keys ++ target_keys ++ assignment_keys)
       |> Enum.uniq()
-      |> Enum.map(&session_archetype(db, &1))
+      |> Enum.map(&{&1, session_archetype(db, &1)})
 
     spawn_archetypes =
       if Map.get(call, :verb) == "spawn" do
-        [spawn_archetype(db, params)]
+        [{nil, spawn_archetype(db, params)}]
       else
         []
       end
@@ -1759,14 +1948,14 @@ defmodule Tightbeam.Rules do
   end
 
   defp effect_scope_result(rail, effect, db, call) do
-    base = participant_archetypes(db, call)
-    recipients = effect_recipient_archetypes(rail, effect, db, call)
+    base = participant_entries(db, call)
+    recipients = effect_recipient_entries(rail, effect, db, call)
     participants = base ++ recipients
 
     matches? =
       cond do
         participants != [] ->
-          Tightbeam.RailScope.matches_agents?(rail.archetypes, participants)
+          participants_match?(rail, db, participants)
 
         rail.owner == :substrate ->
           true
@@ -1775,21 +1964,21 @@ defmodule Tightbeam.Rules do
           zero_agent_belongs?(rail, db, call)
       end
 
-    {:ok, matches?}
+    {:ok, matches? and where_matches?(rail, db, call)}
   rescue
     error -> {:error, error}
   catch
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp effect_recipient_archetypes(rail, "notice", db, call) do
+  defp effect_recipient_entries(rail, "notice", db, call) do
     case RailRemedy.resolve_notice(db, rail.notice, notice_bindings(db, call, rail)) do
-      {:ok, %{bound_session: key}} when is_binary(key) -> [session_archetype(db, key)]
+      {:ok, %{bound_session: key}} when is_binary(key) -> [{key, session_archetype(db, key)}]
       _ -> []
     end
   end
 
-  defp effect_recipient_archetypes(%{remedy: remedy} = rail, "remedy", db, call)
+  defp effect_recipient_entries(%{remedy: remedy} = rail, "remedy", db, call)
        when is_map(remedy) do
     bindings = notice_bindings(db, call, rail)
     target = Map.get(remedy, :target, %{})
@@ -1797,11 +1986,11 @@ defmodule Tightbeam.Rules do
     case remedy.action do
       "spawn" ->
         value = interpolate_scope_value(target[:archetype], bindings)
-        [spawn_archetype(db, %{archetype: value})]
+        [{nil, spawn_archetype(db, %{archetype: value})}]
 
       action when action in ["wake", "assign"] ->
         case remedy_target_session(db, remedy, bindings, action) do
-          key when is_binary(key) -> [session_archetype(db, key)]
+          key when is_binary(key) -> [{key, session_archetype(db, key)}]
           _ -> []
         end
 
@@ -1810,7 +1999,7 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  defp effect_recipient_archetypes(_rail, _effect, _db, _call), do: []
+  defp effect_recipient_entries(_rail, _effect, _db, _call), do: []
 
   defp remedy_target_session(db, remedy, bindings, action) do
     target = Map.get(remedy, :target, %{})
@@ -1849,19 +2038,25 @@ defmodule Tightbeam.Rules do
 
   defp interpolate_scope_value(value, _bindings), do: value
 
-  defp zero_agent_belongs?(%{owner: {:kungfu, name}, base_dir: base_dir}, db, call) do
+  defp zero_agent_belongs?(%{owner: {:kungfu, name}, base_dir: base_dir} = rail, db, call) do
     groups = interaction_record_session_groups(db, call)
 
     own_archetypes = owned_archetypes(base_dir, {:kungfu, name})
+    roles = Map.get(rail, :roles, [])
 
     groups != [] and
       Enum.all?(groups, fn sessions ->
         sessions != [] and
           Enum.all?(sessions, fn key ->
-            case session_archetype(db, key) do
-              archetype when is_binary(archetype) -> MapSet.member?(own_archetypes, archetype)
-              _ -> false
-            end
+            own? =
+              case session_archetype(db, key) do
+                archetype when is_binary(archetype) -> MapSet.member?(own_archetypes, archetype)
+                _ -> false
+              end
+
+            # A role the kungfu names reaches its holder whatever the agent type.
+            own? or
+              (roles != [] and SubtreeScope.role_admits?(roles, SubtreeScope.held_roles(db, key)))
           end)
       end)
   end
@@ -1919,17 +2114,38 @@ defmodule Tightbeam.Rules do
   # applied. A kungfu's refused rule is confined to that kungfu's own archetypes
   # (the way a refused tool-call rail is); substrate and org-written rules stay
   # unavailable for everyone.
-  defp unavailable_scope(base_dir, {:kungfu, _name} = owner) do
+  #
+  # With subtree rules on, a refused kungfu rule that names roles also closes
+  # its verb for the current holders of those roles, and for no one else.
+  defp unavailable_scope(base_dir, owner, roles \\ [])
+
+  defp unavailable_scope(base_dir, {:kungfu, _name} = owner, roles) do
     %{
       owner: owner,
       base_dir: base_dir,
       archetypes: base_dir |> owned_archetypes(owner) |> MapSet.to_list() |> Enum.sort()
     }
+    |> then(fn scope -> if roles == [], do: scope, else: Map.put(scope, :roles, roles) end)
   rescue
     _ -> :all
   end
 
-  defp unavailable_scope(_base_dir, _owner), do: :all
+  defp unavailable_scope(_base_dir, _owner, _roles), do: :all
+
+  # The roles a refused entry names, when it names a well-formed list of them.
+  defp refused_entry_roles(entry) when is_map(entry) do
+    if FeatureFlags.subtree_rules?() do
+      try do
+        SubtreeScope.parse!(Map.delete(entry, "scope"), &raise(ArgumentError, &1)).roles
+      rescue
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  defp refused_entry_roles(_entry), do: []
 
   # The owner of a broken file may itself be unreadable (an unreadable or
   # conflicting receipt); that leaves the verb unavailable for everyone.
@@ -1967,9 +2183,9 @@ defmodule Tightbeam.Rules do
   defp unavailable_scope_applies?(:all, _db, _call), do: true
 
   defp unavailable_scope_applies?(scope, db, call) do
-    case participant_archetypes(db, call) do
+    case participant_entries(db, call) do
       [_ | _] = participants ->
-        Tightbeam.RailScope.matches_agents?(scope.archetypes, participants)
+        participants_match?(scope, db, participants)
 
       [] ->
         zero_agent_belongs?(scope, db, call)
@@ -2033,7 +2249,12 @@ defmodule Tightbeam.Rules do
 
                 verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
                 affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
-                mark_unavailable(affected, path, unavailable_scope(base_dir, owner))
+
+                mark_unavailable(
+                  affected,
+                  path,
+                  unavailable_scope(base_dir, owner, refused_entry_roles(rule))
+                )
 
                 Enum.each(affected, fn affected_verb ->
                   record_unavailable_verb(%{
@@ -2129,7 +2350,8 @@ defmodule Tightbeam.Rules do
     rules ++ policies ++ reactions
   end
 
-  defp retired_policy?(policy),
+  @doc false
+  def retired_policy?(policy),
     do:
       is_map(policy) and
         Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
@@ -2191,7 +2413,7 @@ defmodule Tightbeam.Rules do
 
     fail = fn message -> raise ArgumentError, "#{path}: #{label}: #{message}" end
 
-    unknown = unknown_keys(policy, @policy_keys)
+    unknown = unknown_keys(policy, subtree_keys(@policy_keys))
     if unknown != [], do: fail.("unknown keys: #{Enum.join(unknown, ", ")}")
     unless valid_name?(raw_name), do: fail.("invalid or missing name: #{inspect(raw_name)}")
 
@@ -2200,6 +2422,8 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
     archetypes = validate_archetypes!(policy, owner, owned_archetypes, fail)
+    subtree = subtree_declarations!(policy, owner, fail)
+    archetypes = default_archetypes(policy, owner, archetypes)
     warn_omitted_archetypes(policy, owner, path, label)
     validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
@@ -2242,6 +2466,7 @@ defmodule Tightbeam.Rules do
       base_dir: base_dir,
       identity_manifest_sha: identity_manifest_sha
     }
+    |> Map.merge(subtree)
   end
 
   defp validate_policy!(
@@ -2307,7 +2532,7 @@ defmodule Tightbeam.Rules do
     label = if valid_name?(raw_name), do: "rule #{inspect(raw_name)}", else: "rule ##{ordinal}"
     fail = fn message -> raise ArgumentError, "#{path}: #{label}: #{message}" end
 
-    unknown = unknown_keys(rule, @rule_keys)
+    unknown = unknown_keys(rule, subtree_keys(@rule_keys))
     if unknown != [], do: fail.("unknown keys: #{Enum.join(unknown, ", ")}")
     unless valid_name?(raw_name), do: fail.("invalid or missing name: #{inspect(raw_name)}")
 
@@ -2321,6 +2546,8 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
     archetypes = validate_archetypes!(rule, owner, owned_archetypes, fail)
+    subtree = subtree_declarations!(rule, owner, fail)
+    archetypes = default_archetypes(rule, owner, archetypes)
     warn_omitted_archetypes(rule, owner, path, label)
     validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     check = validate_check!(Map.get(rule, "check"), base_dir, owner, fail)
@@ -2395,6 +2622,7 @@ defmodule Tightbeam.Rules do
       base_dir: base_dir,
       identity_manifest_sha: identity_manifest_sha
     }
+    |> Map.merge(subtree)
   end
 
   defp validate_rule!(
@@ -2829,7 +3057,7 @@ defmodule Tightbeam.Rules do
       Regex.scan(~r/\{([^{}]+)\}/, value, capture: :all_but_first)
       |> List.flatten()
 
-    case Enum.find(tokens, &(&1 not in @binding_tokens)) do
+    case Enum.find(tokens, &(&1 not in binding_tokens())) do
       nil -> :ok
       token -> fail.("remedy uses unknown binding token {#{token}}")
     end
@@ -2841,6 +3069,12 @@ defmodule Tightbeam.Rules do
   end
 
   defp valid_verdict_kind?(_kind), do: false
+
+  @doc false
+  def fact_type(fact), do: Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+
+  @doc false
+  def archetype_fact?(fact), do: MapSet.member?(@archetype_facts, fact)
 
   defp validate_condition!(condition, index, fail) do
     unknown = unknown_keys(condition, @condition_keys)
@@ -2864,12 +3098,25 @@ defmodule Tightbeam.Rules do
       end
     end
 
-    type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+    type = fact_type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
-    unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+
+    unless op in @operators or
+             (op in @subtree_operators and Tightbeam.FeatureFlags.subtree_rules?()),
+           do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+
     validate_value!(type, op, value, index, fail)
     %{fact: fact, op: op, value: value}
+  end
+
+  defp validate_value!(type, "contains", value, index, fail) do
+    unless type in [:string, {:list, :string}],
+      do: fail.("condition ##{index} operator contains is invalid for #{inspect(type)}")
+
+    unless (is_binary(value) or (is_list(value) and value != [])) and
+             Enum.all?(List.wrap(value), &(is_binary(&1) and &1 != "")),
+           do: fail.("condition ##{index} value must be nonempty text or a non-empty list of it")
   end
 
   defp validate_value!({:list, :string}, op, value, index, fail) do
@@ -4878,6 +5125,8 @@ defmodule Tightbeam.Rules do
   defp compare(left, "gte", right), do: left >= right
   defp compare(left, "lt", right), do: left < right
   defp compare(left, "lte", right), do: left <= right
+
+  defp compare(left, "contains", right), do: Tightbeam.SubtreeRules.contains?(left, right)
 
   defp compare(left, "in", right) when is_list(left),
     do: not MapSet.disjoint?(MapSet.new(left), MapSet.new(right))

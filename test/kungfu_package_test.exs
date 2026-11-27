@@ -77,6 +77,16 @@ defmodule Tightbeam.KungfuPackageTest do
     refute guidance =~ "### `agentic-engineering`"
   end
 
+  test "each shipped kungfu publishes with all its rule references resolved", %{base: base} do
+    ship!(@shipped)
+
+    for bundle <- Identity.available_bundle_names() do
+      bundle_base = Path.join(base, bundle)
+      assert {:ok, candidate} = Identity.learn!(bundle_base, bundle, "test")
+      publish!(bundle_base, candidate)
+    end
+  end
+
   test "no shipped file names the removed bundle" do
     offenders =
       Application.app_dir(:tightbeam, "priv")

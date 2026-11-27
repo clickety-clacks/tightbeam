@@ -207,6 +207,10 @@ defmodule Tightbeam.Roles do
     end
   end
 
+  @doc "Whether `name` is a valid role name."
+  @spec valid_name?(term()) :: boolean()
+  def valid_name?(name), do: validate_name(name) == :ok
+
   # The agent:/user: prefix reservations predate the typed seam and are
   # KEPT for a different reason now: nothing classifies strings anymore,
   # but a role named like another type's spelling is hostile to every

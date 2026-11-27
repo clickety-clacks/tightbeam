@@ -12,6 +12,16 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
   alias Tightbeam.DB.Txn
 
+  # Top-level fact names exposed to reaction expressions. Fields below a name
+  # belong to the event's runtime record projection.
+  @fact_roots ~w(assignment assignment_owner_user_id assignments attests child
+    configured_triage_deadline_ms coordination_parent current_opener delivery_owner
+    hold open_assignment_count opener_responsibility parent_activity_at personal_session_key
+    process_notification_recipient recovery_check request ruling_result_recipients
+    scope_participant_archetypes scope_record_session_groups sessions terminal_sources
+    wakes work_item)
+  def fact_reference?(path), do: hd(String.split(path, ".", parts: 2)) in @fact_roots
+
   @assignment ~w(id holderKey workItemId reviewsAssignmentId openedBySession currentOpenerSessionKey openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
   def assignment(txn, id), do: one(txn, "assignments", @assignment, "id=?1", [id])
 
@@ -502,6 +512,198 @@ defmodule Tightbeam.RowReactions.Snapshot do
         []
     end
   end
+
+  # Readable facts about the work for role-scoped rules, re-read at every
+  # evaluation (admission and the check just before a delayed notice). Lists
+  # are bounded so a long-lived assignment or work item cannot grow the
+  # recorded facts without limit; the most recent entries are kept.
+  @subtree_note_limit 32
+  @subtree_list_limit 64
+  @subtree_text_limit 2000
+
+  def subtree_facts(txn, event, facts) do
+    if Tightbeam.FeatureFlags.subtree_rules?() do
+      case subtree_subject(event) do
+        nil ->
+          facts
+
+        {assignment_id, work_item_id} ->
+          put_subtree_facts(txn, facts, assignment_id, work_item_id)
+      end
+    else
+      facts
+    end
+  end
+
+  defp subtree_subject(%{"kind" => "assignment", "terminal" => %{} = terminal}),
+    do: {terminal["assignment_id"], terminal["work_item_id"]}
+
+  defp subtree_subject(%{"kind" => kind, "after" => %{"assignment" => %{"id" => id}}})
+       when kind in ["assignment_attest", "assignment_start"],
+       do: {id, nil}
+
+  defp subtree_subject(%{"kind" => "work_item_observation", "workItemId" => id}), do: {nil, id}
+  defp subtree_subject(_event), do: nil
+
+  defp put_subtree_facts(txn, facts, assignment_id, work_item_id) do
+    assignment = subtree_assignment(txn, assignment_id)
+    work_item_id = (assignment && assignment.work_item_id) || work_item_id
+    work_item = subtree_work_item(txn, work_item_id)
+    delivery_owner = subtree_delivery_owner(txn, work_item_id)
+
+    people = %{
+      "holder" => subtree_person(txn, assignment && assignment.holder),
+      "opener" => subtree_person(txn, assignment && assignment.opener),
+      "delivery_owner" => subtree_person(txn, delivery_owner)
+    }
+
+    names = Map.new(people, fn {role, person} -> {role, person && person["name"]} end)
+    # The anchor depends on each rule's scope, so the scope check supplies it.
+    names = Map.put(names, "anchor", get_in(facts, ["names", "anchor"]))
+
+    facts =
+      if assignment,
+        do: Map.put(facts, "assignment", Map.merge(facts["assignment"] || %{}, assignment.facts)),
+        else: facts
+
+    facts =
+      if work_item,
+        do: Map.put(facts, "work_item", Map.merge(facts["work_item"] || %{}, work_item)),
+        else: facts
+
+    facts
+    |> Map.put("names", names)
+    |> Map.put("people", people)
+  end
+
+  defp subtree_person(_txn, nil), do: nil
+
+  defp subtree_person(txn, key), do: %{"session_key" => key, "name" => session_name(txn, key)}
+
+  defp subtree_assignment(_txn, nil), do: nil
+
+  defp subtree_assignment(txn, id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id,a.holderKey,COALESCE(a.currentOpenerSessionKey,a.openedBySession),a.workItemId,
+                  COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId=a.id),
+                           CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
+           FROM assignments a WHERE a.id=?1
+           """,
+           [id]
+         ) do
+      [[id, holder, opener, work_item_id, effect_kind]] ->
+        notes =
+          recent_attests(
+            txn,
+            "note",
+            "assignmentId=?1 AND note IS NOT NULL AND note<>''",
+            [id],
+            @subtree_note_limit
+          )
+
+        verdicts =
+          recent_attests(
+            txn,
+            "verdictKind",
+            "assignmentId=?1 AND kind='verdict' AND verdictKind IS NOT NULL",
+            [id],
+            @subtree_list_limit
+          )
+
+        %{
+          holder: holder,
+          opener: opener,
+          work_item_id: work_item_id,
+          facts: %{
+            "id" => id,
+            "effect_kind" => effect_kind,
+            "is_review" => effect_kind == "review",
+            "notes" => Enum.map(notes, &bounded_text/1),
+            "verdicts" => verdicts
+          }
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  defp subtree_work_item(_txn, nil), do: nil
+
+  defp subtree_work_item(txn, id) do
+    case Txn.q(txn, "SELECT id,title,state FROM work_items WHERE id=?1", [id]) do
+      [[id, title, state]] ->
+        artifacts =
+          Txn.q(
+            txn,
+            """
+            SELECT title,kind FROM (
+              SELECT title,kind,createdAt,artifactId FROM artifacts WHERE workItemId=?1
+              ORDER BY createdAt DESC,artifactId DESC LIMIT ?2
+            ) ORDER BY createdAt,artifactId
+            """,
+            [id, @subtree_list_limit]
+          )
+
+        %{
+          "id" => id,
+          "title" => title,
+          "state" => state,
+          "artifact_titles" => Enum.map(artifacts, fn [title, _] -> bounded_text(title) end),
+          "artifact_kinds" => artifacts |> Enum.map(fn [_, kind] -> kind end) |> Enum.uniq()
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  defp subtree_delivery_owner(_txn, nil), do: nil
+
+  defp subtree_delivery_owner(txn, work_item_id) do
+    case DeliveryResponsibilities.current_owner_in_txn(txn, work_item_id) do
+      %{"accountableSessionKey" => key} when is_binary(key) ->
+        key
+
+      _ ->
+        case Txn.q(txn, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id=?1", [
+               work_item_id
+             ]) do
+          [[key]] -> key
+          _ -> nil
+        end
+    end
+  end
+
+  @doc false
+  def session_name(_txn, nil), do: nil
+
+  def session_name(txn, key) do
+    case Txn.q(txn, "SELECT displayName FROM sessions WHERE sessionKey=?1", [key]) do
+      [[name]] -> name
+      _ -> nil
+    end
+  end
+
+  # One column of the latest `limit` matching attests, oldest first.
+  defp recent_attests(txn, column, where, params, limit) do
+    Txn.q(
+      txn,
+      """
+      SELECT value FROM (
+        SELECT #{column} AS value,ts,rowid AS position FROM attests WHERE #{where}
+        ORDER BY ts DESC,rowid DESC LIMIT #{limit}
+      ) ORDER BY ts,position
+      """,
+      params
+    )
+    |> Enum.map(fn [value] -> value end)
+  end
+
+  defp bounded_text(text) when is_binary(text), do: String.slice(text, 0, @subtree_text_limit)
+  defp bounded_text(text), do: text
 
   defp sessions(txn, keys),
     do:
