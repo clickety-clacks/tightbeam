@@ -1,6 +1,6 @@
 defmodule Tightbeam.OriginTest do
   # The warning flag is node-wide, so this module must not overlap async tests.
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   import ExUnit.CaptureLog
 
