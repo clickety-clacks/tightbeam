@@ -3951,6 +3951,157 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(empty.resp_body)["items"] == []
   end
 
+  test "scoped work item list and detail project an accepted extended commit reference", ctx do
+    creator = ctx.admin_session.session_key
+    item_id = ctx.work_item.id
+    neighbour = projection_fixture_item(ctx, creator, 10, "flynn")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET createdBySession=?, createdAt=? WHERE id=?",
+               [
+                 creator,
+                 20,
+                 item_id
+               ]
+             )
+
+    reference = %{
+      "repo" => "testhost:/tmp/projection-evidence",
+      "commit" => String.duplicate("a", 40),
+      "remote" => "https://example.invalid/projection/repo.git",
+      "ref" => "refs/heads/main"
+    }
+
+    holder = ctx.assignment.holderKey
+
+    assert %{attest: %{id: attest_id, commitRefs: [^reference]}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "session:" <> holder,
+               principal: {:session, holder},
+               session_key: holder,
+               params: %{
+                 assignment_id: ctx.assignment.id,
+                 kind: "progress",
+                 note: "Recorded commit evidence",
+                 commit_refs: [reference]
+               }
+             })
+
+    query = "/api/work-items?asUser=flynn&createdBySession=" <> URI.encode_www_form(creator)
+    list = get(ctx, query <> "&limit=2&tail=true", "tbc_core_detail")
+    detail = get(ctx, "/api/work-items/" <> item_id <> "?asUser=flynn", "tbc_core_detail")
+    assert list.status == 200
+    assert detail.status == 200
+
+    assert %{"items" => [first, item], "page" => page} = JSON.decode!(list.resp_body)
+    assert first["id"] == neighbour
+    assert item == JSON.decode!(detail.resp_body)["item"]
+    assert item["effectiveCommitRefs"] == [Map.take(reference, ["repo", "commit"])]
+    refute Map.has_key?(page, "partial")
+
+    assert {:ok, [[stored]]} =
+             DB.query(ctx.db, "SELECT commitRefs FROM attests WHERE id=?", [attest_id])
+
+    assert JSON.decode!(stored) == [reference]
+  end
+
+  test "scoped work item pages advance across mixed, trailing and all unprojectable rows", ctx do
+    reader = outsider_device(ctx)
+    creator = ctx.admin_session.session_key
+    oldest = projection_fixture_item(ctx, creator, 10, reader.user_id)
+    bad_older = projection_fixture_item(ctx, creator, 20, reader.user_id)
+    bad_newer = projection_fixture_item(ctx, creator, 30, reader.user_id)
+    newest = projection_fixture_item(ctx, creator, 40, reader.user_id)
+    _hidden = projection_fixture_item(ctx, creator, 25, "flynn")
+    _other_creator = projection_fixture_item(ctx, nil, 35, reader.user_id)
+
+    # REAL values satisfy the storage range constraint but cannot encode as an
+    # integer priority. This corruption is independent of commit metadata.
+    for id <- [bad_older, bad_newer] do
+      assert {:ok, _} = DB.query(ctx.db, "INSERT INTO work_item_priorities VALUES (?, 4.5)", [id])
+    end
+
+    query = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+
+    read_page = fn suffix ->
+      response = get(ctx, query <> suffix, reader.token)
+      assert response.status == 200
+      assert %{"items" => items, "page" => page} = JSON.decode!(response.resp_body)
+      {Enum.map(items, & &1["id"]), page}
+    end
+
+    assert {[first, last], %{"partial" => true}} = read_page.("&limit=4&tail=true")
+    assert [first, last] == [oldest, newest]
+
+    assert {[old], %{"oldestCursor" => oldest_cursor}} = read_page.("&limit=1")
+    assert old == newest
+
+    assert {[rendered],
+            %{
+              "partial" => true,
+              "oldestCursor" => mixed_cursor,
+              "newestCursor" => mixed_newest,
+              "hasMoreBefore" => true
+            }} =
+             read_page.("&limit=3&tail=true")
+
+    assert rendered == newest
+    assert mixed_cursor != oldest_cursor
+
+    assert {[],
+            %{
+              "partial" => true,
+              "oldestCursor" => bad_cursor,
+              "newestCursor" => bad_newest,
+              "hasMoreBefore" => true
+            }} =
+             read_page.("&limit=2&before=" <> URI.encode_www_form(oldest_cursor))
+
+    assert is_binary(bad_newest)
+    assert bad_newest != mixed_newest
+    assert mixed_cursor == bad_cursor
+    assert bad_cursor != oldest_cursor
+
+    assert {[prior], prior_page} =
+             read_page.("&limit=2&before=" <> URI.encode_www_form(bad_cursor))
+
+    assert prior == oldest
+    refute prior_page["hasMoreBefore"]
+    refute Map.has_key?(prior_page, "partial")
+
+    assert {[leading], %{"partial" => true, "newestCursor" => trailing_cursor}} =
+             read_page.("&limit=3&tail=false")
+
+    assert leading == oldest
+    assert trailing_cursor == bad_newest
+
+    assert {[following], following_page} =
+             read_page.("&limit=2&after=" <> URI.encode_www_form(trailing_cursor))
+
+    assert following == newest
+    refute Map.has_key?(following_page, "partial")
+
+    detail = get(ctx, "/api/work-items/" <> bad_older, reader.token)
+    assert detail.status == 500
+    assert JSON.decode!(detail.resp_body)["error"]["code"] == "projection_invalid"
+  end
+
+  defp projection_fixture_item(ctx, creator, created_at, owner) do
+    id = "wi_" <> Tightbeam.Id.uuid4()
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO work_items(id,title,ownerUserId,createdBySession,createdAt) VALUES (?,?,?,?,?)",
+               [id, "Projection fixture", owner, creator, created_at]
+             )
+
+    id
+  end
+
   test "work item reads with a recorded landing succeed on detail, list page and change notice",
        ctx do
     commit = String.duplicate("a", 40)

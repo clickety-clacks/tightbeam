@@ -2719,6 +2719,9 @@ defmodule Tightbeam.Wire.Router do
         resource when resource in [:assignments, :wakes, :turns] ->
           d1_core_state_collection(conn, request, boundary, principal, spec)
 
+        :work_items ->
+          d1_work_item_collection(conn, request, boundary, principal, spec)
+
         :decision_requests ->
           {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
           d1_send(conn, 200, d1_collection_envelope(spec, items, page))
@@ -2726,24 +2729,6 @@ defmodule Tightbeam.Wire.Router do
         resource ->
           result =
             cond do
-              spec.resource == "work items" ->
-                page =
-                  StateResources.query_work_item_page(
-                    db(conn),
-                    request.filters,
-                    %{rest_principal: principal},
-                    boundary,
-                    request.limit
-                  )
-
-                %{
-                  items: Enum.map(page.rows, &StateResources.work_item/1),
-                  flags: %{
-                    has_more_before: page.has_more_before,
-                    has_more_after: page.has_more_after
-                  }
-                }
-
               resource == :harness_processes ->
                 if D1Read.visible?(resource, principal.is_admin) do
                   page =
@@ -2789,6 +2774,45 @@ defmodule Tightbeam.Wire.Router do
     error in [ArgumentError, KeyError, MatchError] ->
       reraise_overload(error, __STACKTRACE__)
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_work_item_collection(conn, request, boundary, principal, spec) do
+    page =
+      StateResources.query_work_item_page(
+        db(conn),
+        request.filters,
+        %{rest_principal: principal},
+        boundary,
+        request.limit
+      )
+
+    result = %{
+      items: Enum.map(page.rows, &StateResources.work_item/1),
+      flags: %{has_more_before: page.has_more_before, has_more_after: page.has_more_after}
+    }
+
+    {selected, page} = d1_keyset_page(result, request, principal, spec, conn)
+
+    {encoded, partial?} =
+      Enum.reduce(selected, {[], false}, fn item, {items, partial?} ->
+        try do
+          {[d1_encode(:work_items, item) | items], partial?}
+        rescue
+          error in [ArgumentError, KeyError, MatchError] ->
+            reraise_overload(error, __STACKTRACE__)
+
+            Logger.warning("Scoped work item projection omitted a row",
+              work_item_id: item["id"],
+              projection_error: error.__struct__
+            )
+
+            {items, true}
+        end
+      end)
+
+    encoded_items = encoded |> Enum.reverse() |> Enum.join(",")
+    page = if partial?, do: Map.put(page, :partial, true), else: page
+    d1_send(conn, 200, d1_encoded_collection_envelope(spec, encoded_items, page))
   end
 
   defp d1_core_state_collection(conn, request, boundary, principal, spec) do
@@ -3593,6 +3617,12 @@ defmodule Tightbeam.Wire.Router do
   defp d1_collection_envelope(spec, items, page) do
     encoded_items = Enum.map_join(items, ",", &d1_encode(d1_resource(spec), &1))
 
+    d1_encoded_collection_envelope(spec, encoded_items, page)
+  end
+
+  defp d1_encoded_collection_envelope(spec, encoded_items, page) do
+    partial = if Map.get(page, :partial), do: ",\"partial\":true", else: ""
+
     "{\"schemaVersion\":1,\"resource\":" <>
       JSON.encode!(spec.resource) <>
       ",\"items\":[" <>
@@ -3602,7 +3632,8 @@ defmodule Tightbeam.Wire.Router do
       ",\"newestCursor\":" <>
       JSON.encode!(page.newest) <>
       ",\"hasMoreBefore\":" <>
-      JSON.encode!(page.before) <> ",\"hasMoreAfter\":" <> JSON.encode!(page.after) <> "}}"
+      JSON.encode!(page.before) <>
+      ",\"hasMoreAfter\":" <> JSON.encode!(page.after) <> partial <> "}}"
   end
 
   defp d1_detail_envelope(spec, item),
