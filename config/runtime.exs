@@ -63,6 +63,14 @@ if config_env() != :test do
     config :tightbeam, :live_base_guard, transition: value
   end
 
+  if System.get_env("TIGHTBEAM_LOOPBACK_ONLY") == "true" do
+    config :tightbeam, :loopback_only, true
+  end
+
+  if System.get_env("TIGHTBEAM_DISABLE_LOCAL_CODEX") == "true" do
+    config :tightbeam, :disable_local_codex, true
+  end
+
   if value = System.get_env("TIGHTBEAM_PORT") do
     config :tightbeam, :port, String.to_integer(value)
   end

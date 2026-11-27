@@ -302,7 +302,11 @@ defmodule Tightbeam.Gateway do
         cli_token: cli_token,
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
-        adapter_coordinator: Tightbeam.AdapterCoordinator
+        adapter_coordinator: Tightbeam.AdapterCoordinator,
+        setup_readiness: fn ->
+          readiness = Tightbeam.Readiness.summary(config, Tightbeam.ModelCatalog, Archetypes.all())
+          %{ready: readiness.runnable?, lines: Tightbeam.Readiness.render(readiness, config)}
+        end
       })
 
     # EDGE half of the heal trigger. Off the coordinator's process: the sweep
@@ -418,8 +422,11 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.SentinelSupervisor,
           db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
          Tightbeam.ListenerLifecycle.listener_spec(
-           plug: {Tightbeam.Wire.Router, router_deps},
-           port: config.port
+           [plug: {Tightbeam.Wire.Router, router_deps}, port: config.port] ++
+             if(Application.get_env(:tightbeam, :loopback_only, false),
+               do: [ip: {127, 0, 0, 1}],
+               else: []
+             )
          ),
          Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
        ])

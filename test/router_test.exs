@@ -505,6 +505,23 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["items"] == [Tightbeam.StateResources.session(visible)]
   end
 
+  test "setup readiness is available to the paired administrator", ctx do
+    report = %{ready: true, lines: ["READY: fixture can run turns."]}
+    opts = Keyword.put(ctx.opts, :setup_readiness, fn -> report end)
+
+    assert conn(:get, "/api/setup-readiness")
+           |> Router.call(Router.init(opts))
+           |> Map.fetch!(:status) == 401
+
+    response =
+      conn(:get, "/api/setup-readiness")
+      |> put_req_header("authorization", "Bearer " <> ctx.device.token)
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == %{"ready" => true, "lines" => report.lines}
+  end
+
   test "core device detail preserves authorization order and canonical envelope", ctx do
     opts = ctx.opts ++ [model_catalog: %{}]
 

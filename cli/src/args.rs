@@ -1520,6 +1520,9 @@ COMMANDS:
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
 
+  setup [--mode quick|full] [--yes] [--dry-run]
+      Set up this machine from a verified Tightbeam release.
+
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId> | --as-process <name>]
       Check the local Tightbeam installation and report its health, with each
       learned sentinel's state and what remains to set it up. Sentinel status
@@ -7716,6 +7719,7 @@ mod tests {
                 "decision-request",
                 "decision-requests",
                 "dispatch",
+                "setup",
                 "doctor",
                 "session-diagnose",
                 "harness-process",

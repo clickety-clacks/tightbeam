@@ -25,6 +25,7 @@ mod process_tree;
 mod rail_action;
 mod session_connect;
 mod session_rail_scope;
+mod setup;
 mod skills;
 mod transcript;
 mod transport_receipt;
@@ -235,6 +236,16 @@ fn main() {
     {
         println!("{}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
+    }
+
+    if args.first().is_some_and(|arg| arg == "setup") {
+        match setup::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     match args::parse(args) {
