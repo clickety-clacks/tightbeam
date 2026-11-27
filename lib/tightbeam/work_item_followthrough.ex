@@ -30,8 +30,15 @@ defmodule Tightbeam.WorkItemFollowthrough do
   # An explicit policy can supply exact current session relations. Spawn
   # ancestry and addressed-PO associations are deliberately not consulted.
   def route(txn, item) do
+    if enabled?(),
+      do: elected_route(txn, item),
+      else: %{"recipient" => nil, "status" => "unavailable"}
+  end
+
+  defp elected_route(txn, item) do
     policy = Tightbeam.Rules.reaction_policy("work-item-followthrough-supervision")
     relations = if policy, do: Map.get(policy.settings, "relations", []), else: []
+    relations = if is_list(relations), do: relations, else: []
     owner = item && item["deliveryOwnerSessionKey"]
 
     candidates =

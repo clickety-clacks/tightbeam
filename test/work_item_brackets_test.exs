@@ -452,6 +452,145 @@ defmodule Tightbeam.WorkItemBracketsTest do
              System.system_time(:millisecond) + 60_000
   end
 
+  test "disabling either flag restores one ordinary horizon across repeated recovery", ctx do
+    enable_followthrough()
+
+    for flag <- [:work_item_followthrough_enabled, :work_item_waits_enabled] do
+      Application.put_env(:tightbeam, :work_item_followthrough_enabled, true)
+      Application.put_env(:tightbeam, :work_item_waits_enabled, true)
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      pending = slate_wake_id(ctx.db, item.id)
+      assert Wakes.get(ctx.db, pending).prompt =~ "completed owner turn"
+      Application.put_env(:tightbeam, flag, false)
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      restored = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      assert restored.wake_id == pending
+      assert restored.session_key == "holder"
+      refute restored.prompt =~ "completed owner turn"
+      assert restored.due_at > System.system_time(:millisecond) + 60_000
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert Wakes.get(ctx.db, pending).due_at == restored.due_at
+      assert item_wake_count(ctx.db, item.id) == 1
+      assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+    end
+  end
+
+  test "terminally undeliverable follow-up retries the actual pointer with bounded pacing", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    failed = slate_wake_id(ctx.db, item.id)
+    at = System.system_time(:millisecond)
+
+    {:ok, {:canceled, _}} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.undeliverable_delivery_in_txn(txn, failed, "target unavailable", at)
+      end)
+
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != failed
+    assert Wakes.get(ctx.db, failed).state == "canceled"
+    wake = Wakes.get(ctx.db, retry)
+    assert wake.due_at >= at + 30_000
+    assert wake.due_at <= at + 1_800_000
+    assert wake.session_key == "holder"
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert slate_wake_id(ctx.db, item.id) == retry
+    assert Wakes.get(ctx.db, retry).due_at == wake.due_at
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    session(ctx.db, "retry-successor", "flynn")
+    update(ctx, item.id, %{delivery_owner_session_key: "retry-successor"})
+
+    for attempt <- 2..9 do
+      previous = slate_wake_id(ctx.db, item.id)
+      before = System.system_time(:millisecond)
+
+      {:ok, {:canceled, _}} =
+        DB.transaction(ctx.db, fn txn ->
+          Wakes.undeliverable_delivery_in_txn(txn, previous, "target unavailable", before)
+        end)
+
+      after_at = System.system_time(:millisecond)
+      next = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      delay = min(30_000 * Integer.pow(2, attempt - 1), 1_800_000)
+      assert next.wake_id != previous
+      assert next.session_key == "retry-successor"
+      assert next.due_at >= before + delay
+      assert next.due_at <= after_at + delay
+      assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert slate_wake_id(ctx.db, item.id) == next.wake_id
+      assert item_wake_count(ctx.db, item.id) == 1
+    end
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*), MAX(json_extract(event,'$.sourceAfter.followThrough.misses')) FROM row_reaction_events WHERE json_extract(event,'$.operation')='owner_turn_completed' AND json_extract(event,'$.workItemId')=?1",
+               [item.id]
+             )
+  end
+
+  test "a real wait withdraws the paced retry without reviving the failed notice", ctx do
+    enable_followthrough()
+    {item, first} = followthrough_item(ctx)
+    finish_notice(ctx, first)
+    failed = slate_wake_id(ctx.db, item.id)
+
+    {:ok, {:canceled, _}} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.undeliverable_delivery_in_txn(
+          txn,
+          failed,
+          "target unavailable",
+          System.system_time(:millisecond)
+        )
+      end)
+
+    retry = slate_wake_id(ctx.db, item.id)
+    assert retry != failed
+
+    assert %{wait: %{active: true}} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "retry-dependency",
+               condition_scope: item.id
+             })
+
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert slate_wake_id(ctx.db, item.id) == nil
+    assert Wakes.get(ctx.db, retry).state == "canceled"
+    assert Wakes.get(ctx.db, failed).state == "canceled"
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  test "scalar supervision settings leave ordinary operations and terminal commits available",
+       ctx do
+    enable_followthrough()
+
+    for scalar <- [~s("invalid"), "true", "7"], enabled <- [false, true] do
+      Application.put_env(:tightbeam, :work_item_followthrough_enabled, enabled)
+
+      File.write!(Path.join(ctx.law_base, "identity/rules/followthrough-supervision.toml"), """
+      [[reaction]]
+      name = "explicit-supervision"
+      family = "work-item-followthrough-supervision"
+      archetypes = ["*"]
+      english = "Malformed supervision must not block ordinary work."
+      settings = { relations = #{scalar} }
+      """)
+
+      Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+      {item, first} = followthrough_item(ctx)
+      finish_notice(ctx, first)
+      wake = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      assert wake.session_key == "holder"
+      if enabled, do: assert(wake.prompt =~ "route: unavailable")
+      assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+      assert item_wake_count(ctx.db, item.id) == 0
+    end
+  end
+
   @tag persistent_db: true
   test "database restart retains the episode and single pending follow-up", ctx do
     enable_followthrough()

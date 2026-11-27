@@ -147,7 +147,9 @@ defmodule Tightbeam.RowReactions.Notice do
             %{state: "canceled", delivered_turn_seq: nil} ->
               if (available or value["on_unavailable"] == "schedule") and
                    get_in(action, ["result", "delivery"]) == "undelivered" do
-                Wakes.retry_undelivered_notice_in_txn(txn, id, input, at)
+                Wakes.retry_undelivered_notice_in_txn(txn, id, input, at,
+                  paced: slate_reference?(value["reference"])
+                )
               else
                 raise ArgumentError, "reaction output identity is already terminal"
               end
@@ -156,9 +158,14 @@ defmodule Tightbeam.RowReactions.Notice do
               raise ArgumentError, "reaction output identity is already terminal"
           end
 
+        reference =
+          if wake.wake_id != id and slate_reference?(value["reference"]),
+            do: Map.put(value["reference"], "expected", id),
+            else: value["reference"]
+
         id = wake.wake_id
         replace_notice(txn, value["reference"], value["replace_wake_id"], id, at)
-        Reference.put(txn, value["reference"], id)
+        Reference.put(txn, reference, id)
         input = Map.put(input, :wake_id, id)
 
         result =
@@ -260,6 +267,9 @@ defmodule Tightbeam.RowReactions.Notice do
 
     Tightbeam.Reminders.render(txn, template, values)
   end
+
+  defp slate_reference?(%{"resource" => "work_item", "field" => "slateWakeId"}), do: true
+  defp slate_reference?(_), do: false
 
   defp revise(txn, old, input, result) do
     # A scheduler may defer an unchanged request while its recipient is busy.

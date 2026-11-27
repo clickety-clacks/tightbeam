@@ -442,6 +442,28 @@ defmodule Tightbeam.RowReactions do
     :ok
   end
 
+  # Terminal delivery failure leaves the scheduler queue. Reconcile its single
+  # slate intent now; the next transport attempt has a capped backoff deadline.
+  def retry_slate_in_txn(txn, wake_id) do
+    if ready?(txn) do
+      case Store.output_event(txn, wake_id) do
+        {%{"kind" => "work_item_observation"} = event, _} ->
+          case Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1 AND slateWakeId=?2", [
+                 event["workItemId"],
+                 wake_id
+               ]) do
+            [[1]] -> reconcile(txn, event)
+            _ -> :ok
+          end
+
+        _ ->
+          :ok
+      end
+    end
+
+    :ok
+  end
+
   def reconcile_work_item_in_txn(txn, item_id) do
     for [org, event_id] <-
           Txn.q(

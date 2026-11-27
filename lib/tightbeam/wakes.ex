@@ -3947,12 +3947,17 @@ defmodule Tightbeam.Wakes do
   # a timer. The caller owns the incomplete intent and elects this attempt's
   # recipient and deadline in the same transaction.
   @doc false
-  def retry_undelivered_notice_in_txn(txn, previous_id, input, at) do
+  def retry_undelivered_notice_in_txn(txn, previous_id, input, at, opts \\ []) do
     unless undelivered_notice_in_txn?(txn, previous_id),
       do: raise(ArgumentError, "notice has no undelivered attempt to resume")
 
     {root, attempt} = retry_identity_in_txn(txn, previous_id)
     id = retry_wake_id(root, attempt + 1)
+
+    input =
+      if Keyword.get(opts, :paced, false),
+        do: Map.update!(input, :due_at, &max(&1, at + retry_delay_ms(attempt + 1))),
+        else: input
 
     Txn.q(
       txn,
@@ -7668,6 +7673,7 @@ defmodule Tightbeam.Wakes do
         if cancel_in_txn(txn, command, fn -> at end) do
           EventLog.lifecycle_in_txn(txn, "wake_undeliverable", wake_id, reason)
           sender_notice = undeliverable_sender_notice_in_txn(txn, wake)
+          Tightbeam.RowReactions.retry_slate_in_txn(txn, wake_id)
           {:canceled, {wake.wake_id, sender_notice}}
         else
           :unresolved
