@@ -208,7 +208,6 @@ defmodule Tightbeam.IdentityTest do
            |> String.split("\n", trim: true) ==
              [
                "archetypes/default.toml",
-               "archetypes/tour-guide.toml",
                "guidance/operating-model.md",
                "rails/github-auth.toml",
                "rails/tightbeam-probe.toml",

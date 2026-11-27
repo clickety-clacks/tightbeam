@@ -31,6 +31,16 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
     run_cold_runtime(tmp, "live_base_boot_runtime.exs", "boot-admission-ordering: ok")
   end
 
+  @tag :boot_ordering
+  test "admitted Tour Guide seed survives ordinary boot and product relearn", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_boot_runtime.exs",
+      "tour-guide-seed-relearn: ok",
+      args: ["tour-guide"]
+    )
+  end
+
   @tag :boot_business_recovery
   test "guarded Boot loads row recognition before retired-decision recovery", %{tmp_dir: tmp} do
     run_cold_runtime(tmp, "live_base_recovery_runtime.exs", "guarded-business-recovery: ok")
