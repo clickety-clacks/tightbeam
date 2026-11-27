@@ -437,7 +437,7 @@ async function setup() {
     if (mode === 'quick') variables.TIGHTBEAM_LOOPBACK_ONLY = 'true';
     if (receipt?.defaultHarness) variables.TIGHTBEAM_DEFAULT_HARNESS = receipt.defaultHarness;
     for (const key of ['TIGHTBEAM_DEFAULT_HARNESS', 'TIGHTBEAM_DEFAULT_MODEL', 'TIGHTBEAM_DEFAULT_EFFORT',
-      'TIGHTBEAM_DEFAULT_CONTEXT', 'TIGHTBEAM_CREDENTIALS_DIRECTORY', 'CODEX_PATH']) {
+      'TIGHTBEAM_DEFAULT_CONTEXT', 'TIGHTBEAM_CREDENTIALS_DIRECTORY', 'CODEX_PATH', 'TIGHTBEAM_FIRST_RUN_ONBOARDING']) {
       if (env[key]) variables[key] = env[key];
     }
 
@@ -538,7 +538,7 @@ async function setup() {
     add(writeChatMap, 'Connect local Chat over loopback and recognize the advertised gateway address as an alias.');
     add(writeChat || startChat, `Start local Tightbeam Chat as a user service.${logoutNote}`);
     add(readiness || pending.length, 'Check whether this installation can run a turn.');
-    add(needsFirstRun, 'Open Tightbeam Chat and ask your main agent to introduce itself.');
+    add(needsFirstRun, 'Open Tightbeam Chat and start the welcome with your Tour Guide.');
     for (const line of [...install, ...notes]) console.log(`- ${line}`);
     if (flags.dryRun || !install.length) return;
     if (!flags.yes && await ask(answers, 'Install yes or no') !== 'yes') return;
@@ -720,7 +720,7 @@ async function setup() {
       } else {
         console.log('NOT READY: Tightbeam could not read the gateway readiness check.');
       }
-      if (needsFirstRun && state.ready) {
+      if (state.ready && command(targetCli, ['onboard', '--first-run', '--check'], { cwd: home, env: onboardingEnv }).status === 0) {
         run(targetCli, ['onboard', '--first-run'], {
           cwd: home, env: onboardingEnv,
         });

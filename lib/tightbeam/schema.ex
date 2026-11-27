@@ -9477,6 +9477,7 @@ defmodule Tightbeam.Schema do
                    end
 
                    if fresh_bootstrap? do
+                     :ok = Tightbeam.FirstRunTour.mark_fresh_in_txn(txn)
                      Txn.exec(txn, "DROP TABLE #{@fresh_owner_link_origin_table}")
                    end
 

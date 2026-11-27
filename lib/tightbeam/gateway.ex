@@ -247,6 +247,7 @@ defmodule Tightbeam.Gateway do
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config, db)
+    :ok = Tightbeam.FirstRunTour.ensure(db, defaults)
     # Bubble recognition stays outside the lane transaction; it can enqueue
     # turns and therefore must not run synchronously inside LaneManager.
     on_terminal = fn _session_key, seq ->
