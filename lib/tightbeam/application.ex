@@ -305,8 +305,6 @@ defmodule Tightbeam.Application do
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
       onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000),
-      provider_accounts_enabled:
-        Application.get_env(:tightbeam, :provider_accounts_enabled, false),
       harness_switch_context_enabled:
         Application.get_env(:tightbeam, :harness_switch_context_enabled, true),
       harness_switch_context: Application.get_env(:tightbeam, :harness_switch_context, %{}),

@@ -35,10 +35,6 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// gateway's existing splitter is unchanged -- the credential reader moved, the protocol
 /// between the hosts did not.
 pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
-    let (read_only, args) = match args {
-        [flag, rest @ ..] if flag == "--read-only" => (true, rest),
-        _ => (false, args),
-    };
     let [provider, kind, credential_path, url] = args else {
         return Err(
             "usage: tightbeam catalog-probe <provider> <kind> <credential-path> <url>".to_owned(),
@@ -57,12 +53,7 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
     // Best-effort by construction. A renewal that fails must not fail the probe: the stored
     // token may still be good (a clock skew, a provider hiccup), and the honest outcome of
     // asking with it is the provider's own answer rather than ours.
-    let renewal = if read_only {
-        Ok(None)
-    } else {
-        renewed(provider, kind, &raw, credential_path)
-    };
-    let raw = match renewal {
+    let raw = match renewed(provider, kind, &raw, credential_path) {
         Ok(Some(fresh)) => fresh,
         Ok(None) => raw,
         Err(Renewal { fresh, reason }) => {

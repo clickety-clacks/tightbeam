@@ -355,39 +355,6 @@ defmodule Tightbeam.ModelCatalogTest do
     refute Enum.any?(claude ++ codex, &(&1.context != nil))
   end
 
-  test "Claude catalog reads without renewal while the account writer is busy", ctx do
-    db =
-      start_supervised!(
-        Supervisor.child_spec({Tightbeam.DB, path: ":memory:", name: :catalog_writer_fixture},
-          id: :catalog_writer_fixture
-        )
-      )
-
-    :ok = Tightbeam.Schema.ensure_all(db)
-    register_hosts(db, %{"remote" => %{ssh: "fixture-host", base_dir: ctx.base_dir}})
-    assert {:ok, {:ok, _}} = Tightbeam.AccountWriter.reserve(db, "claude:shared@remote")
-
-    sh = fn command ->
-      if Enum.any?(command, &String.contains?(&1, "catalog-probe")) do
-        assert Enum.any?(command, &String.contains?(&1, "catalog-probe --read-only anthropic"))
-        {"fixture refusal\n401", 0}
-      else
-        {"no writer receipt", 1}
-      end
-    end
-
-    config = %{db: db, base_dir: ctx.base_dir, sh: sh}
-
-    assert {:error, :credential_writer_busy} =
-             Tightbeam.Harness.Claude.fetch_catalog(%{
-               base_dir: ctx.base_dir,
-               host_name: "remote",
-               host_config: %{ssh: "fixture-host"},
-               credential_kind: :subscription,
-               options: %{sh: sh, account_writer_config: config}
-             })
-  end
-
   test "an expired local subscription uses catalog-probe on the initial catalog derivation",
        ctx do
     credential_path =
