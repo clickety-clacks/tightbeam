@@ -159,7 +159,9 @@ exec "$E2E_REAL_TIGHTBEAM" "$@"
             assert readiness == {"records": []}, readiness
             print("PASS bounded authenticated packaged people-wait")
             with watcher(relay, root, relay_env, watch_log) as process:
-                wait_for(wait_marker.exists, 10, "watcher entering authenticated wait")
+                # The wrapper observes invocation before broker registration. The
+                # ordinary people_messages tests deterministically cover parking.
+                wait_for(wait_marker.exists, 10, "watcher invoking authenticated wait")
                 process.send_signal(signal.SIGSTOP)
                 try:
                     record = tb("sender", "people-send", {
@@ -176,7 +178,7 @@ exec "$E2E_REAL_TIGHTBEAM" "$@"
                             if item["shared"]["shared_id"] == shared)
                 assert updated["report"]["remote_revision"] == item["request_revision"] == 2
                 assert first["report"]["outcomes"] == [{"address": "user:" + SENDER, "status": "reached"}]
-                print("PASS stock named delivery and ordered revision across idle-boundary wake")
+                print("PASS stock named delivery and ordered revision after observed wait invocation")
             fault_marker = root / "lost-accept"
             relay_db = root / "relay-state/relay.db"
             gateway_db = root / "base/state.db"
