@@ -2784,6 +2784,19 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(observer_with_admin_cursor.resp_body)["items"] ==
              JSON.decode!(anonymous_sessions.resp_body)["items"]
 
+    additive = rewrite_cursor(org_session_cursor, &Map.put(&1, "futureMetadata", true))
+
+    from_additive =
+      get_without_authorization(ctx, "/api/sessions?limit=1&after=#{additive}")
+
+    assert from_additive.status == 200
+    assert from_additive.resp_body == observer_with_admin_cursor.resp_body
+
+    unbound = rewrite_cursor(additive, &Map.delete(&1, "principalId"))
+    refused = get_without_authorization(ctx, "/api/sessions?limit=1&after=#{unbound}")
+    assert refused.status == 400
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_cursor"
+
     anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
     org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
     assert anonymous_session.status == 200
