@@ -30,6 +30,8 @@ unless File.exists?(Path.join(base, "build-owner.json")) do
   Application.put_env(:tightbeam, :live_base_guard, transition: transition)
 end
 
+Application.put_env(:tightbeam, :provider_accounts_enabled, System.get_env("TB_UPGRADE_ACCOUNTS") == "1")
+
 if System.get_env("TB_UPGRADE_INTERRUPT") == "1" do
   Application.put_env(:tightbeam, :provider_schema_checkpoint, fn ->
     IO.puts("UPGRADE_TRANSACTION_OPEN #{System.pid()}")

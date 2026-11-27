@@ -702,6 +702,38 @@ defmodule Tightbeam.StateResources do
     end)
   end
 
+  @doc false
+  def query_work_item_version_page(%Txn{} = txn, principal, boundary, limit) do
+    trace_core_detail(principal, {:au4_visibility, "work items"})
+    {where, params} = work_item_page_visibility(%{rest_principal: principal})
+
+    from = """
+    work_items AS wi
+    LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+    """
+
+    page =
+      Keyset.page(
+        fn sql, args -> observed_query(txn, principal, sql, args) end,
+        "SELECT wi.id, wi.createdAt, COALESCE(v.rowVersion, wi.createdAt) FROM " <> from,
+        from,
+        where,
+        params,
+        ["wi.createdAt", "wi.id"],
+        boundary,
+        limit,
+        fn [id, created_at, _version] -> [created_at, id] end
+      )
+
+    %{
+      items:
+        Enum.map(page.rows, fn [id, created_at, row_version] ->
+          %{id: id, created_at: created_at, row_version: row_version}
+        end),
+      has_more_after: page.has_more_after
+    }
+  end
+
   defp work_item_page_visibility(call) do
     case detail_principal(call) do
       {_kind, _id, true} -> {"1 = 1", []}
@@ -1964,12 +1996,6 @@ defmodule Tightbeam.StateResources do
         "user" -> where <> " AND wi.createdByUser IS NOT NULL"
         "session" -> where <> " AND wi.createdByUser IS NULL"
         _ -> where
-      end
-
-    {where, params} =
-      case filters["createdBefore"] do
-        nil -> {where, params}
-        timestamp -> {where <> " AND wi.createdAt < ?", params ++ [timestamp]}
       end
 
     holder_keys = Map.get(filters, "holderKey", [])
