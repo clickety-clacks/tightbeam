@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 LIMIT = 1_000_000
 REQUIRED_TABLES = (
     "sessions", "assignments", "attests", "artifacts", "wakes",
-    "decision_requests", "work_items", "users", "schema_stamp",
+    "decision_requests", "work_items", "users", "schema_stamp", "admin_projection_versions",
 )
 GENERATED_VALUE = re.compile(
     r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
-    r"|(?P<short>(?:wi|art|dr|asg|att)_[0-9a-f]{8,32})\b"
+    r"|(?P<short>(?:wi|art|dr|asg|att)_[0-9a-f]{8,32})(?![-0-9a-f])\b"
     r"|(?P<token>tb[a-z]*_[A-Za-z0-9_-]{24,})"
 )
 
@@ -25,6 +25,26 @@ GENERATED_VALUE = re.compile(
 def canonical_dump(db, scratch):
     dump = subprocess.check_output(["sqlite3", "-batch", "-bail", db, ".dump"], text=True)
     values = {}
+    derived_hash = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+    # These rows store opaque correlation keys derived from the random IDs.
+    # Preserve every occurrence of each key, including embedded references.
+    hashes = dict.fromkeys(
+        match[0]
+        for line in dump.splitlines()
+        if line.startswith(("INSERT INTO row_reaction_actions ", "INSERT INTO decision_requests "))
+        for match in derived_hash.finditer(line)
+    )
+    hashes = {digest: f"{index:064x}" for index, digest in enumerate(hashes, 1)}
+
+    timestamps = re.compile(r"(?<![0-9a-f])[0-9]{13}(?![0-9a-f])")
+
+    def canonical_time(match):
+        value = int(match[0])
+        # The clock is started at a fixed instant, but BEAM advances it using
+        # monotonic time. Remove sub-run drift while keeping configured delays.
+        if 1_735_689_600_000 <= value < 3_400_000_000_000:
+            return str(value - value % 600_000)
+        return match[0]
 
     def canonical_value(match):
         value = match[0]
@@ -46,7 +66,8 @@ def canonical_dump(db, scratch):
     for line in dump.splitlines(keepends=True):
         if not line.startswith((".restrict ", ".unrestrict ")):
             line = GENERATED_VALUE.sub(canonical_value, line.replace(str(scratch), "/fixture"))
-            lines.append(line)
+            line = derived_hash.sub(lambda match: hashes.get(match[0], match[0]), line)
+            lines.append(timestamps.sub(canonical_time, line))
     return "".join(lines)
 
 

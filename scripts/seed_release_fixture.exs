@@ -68,7 +68,8 @@ end
   Escalation.operator_ask(Tightbeam.DB, call.("operator-ask", holder, %{
     question: "Continue fixture work?",
     project: "Fixture",
-    assignment_id: assignment
+    assignment_id: assignment,
+    deadline: 86_400_000 * 365 * 50
   }))
 
 %{wake_id: _} =
