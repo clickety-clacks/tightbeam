@@ -48,6 +48,8 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     on_exit(fn -> File.rm_rf!(tmp) end)
     runtime = Tightbeam.GuardRuntimeFixture.prepare!(tmp, @boot)
     File.mkdir_p!(runtime.base)
+    File.write!(Path.join(runtime.base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
+    Tightbeam.RecoveryFixture.place_adapter!(runtime.base, seed_credential: false)
     db = Path.join(runtime.base, "state.db")
     dump = Path.join(@fixtures, filename)
     assert {"", 0} = System.cmd("sqlite3", ["-batch", "-bail", db, ".read \"#{dump}\""])
