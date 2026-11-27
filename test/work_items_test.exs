@@ -107,8 +107,8 @@ defmodule Tightbeam.WorkItemsTest do
     item = create(ctx, owner, %{title: "Previously closed"})
     assert :ok = DB.execute(ctx.db, "ALTER TABLE work_items DROP COLUMN closeReason")
     assert :ok = DB.execute(ctx.db, "UPDATE work_items SET state='closed'")
-    assert :ok = WorkItems.ensure_schema(ctx.db)
-    assert :ok = WorkItems.ensure_schema(ctx.db)
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
     assert %{workItem: %{closeReason: nil, state: "closed"}} =
              WorkItems.__handle__(
@@ -578,7 +578,6 @@ defmodule Tightbeam.WorkItemsTest do
              "ownerUserId",
              "state",
              "failReason",
-             "closeReason",
              "routingWakeId",
              "slateWakeId",
              "createdByUser",
@@ -586,7 +585,8 @@ defmodule Tightbeam.WorkItemsTest do
              "createdInTurnSeq",
              "createdContextKnown",
              "createdAt",
-             "deliveryOwnerSessionKey"
+             "deliveryOwnerSessionKey",
+             "closeReason"
            ]
 
     assert {:ok, assignment_columns} = DB.query(db, "PRAGMA table_info(assignments)")

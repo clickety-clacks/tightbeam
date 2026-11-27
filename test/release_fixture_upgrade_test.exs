@@ -20,6 +20,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
 
     {runtime, db} = restore(filename)
     original = preserved_rows(db)
+    original_columns = work_item_columns(db)
     schema_existed? = provider_schema?(db)
     if filename == @predecessor, do: refute(schema_existed?)
 
@@ -29,6 +30,7 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     assert {137, false, _output} = await_exit(port)
 
     assert provider_schema?(db) == schema_existed?
+    assert work_item_columns(db) == original_columns
     assert intact?(db)
     assert preserved_rows(db) == original
 
@@ -120,8 +122,12 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     assert {status, ready?} == {0, true}, "restart did not complete:\n#{output}"
     assert provider_schema?(db)
     assert intact?(db)
-    assert preserved_rows(db) == original
-    assert sqlite(db, "SELECT COUNT(*) FROM work_items WHERE closeReason IS NOT NULL") == "0\n"
+    assert Map.delete(preserved_rows(db), :close_reasons) == Map.delete(original, :close_reasons)
+
+    expected_reasons =
+      original[:close_reasons] || sqlite(db, "SELECT NULL FROM work_items ORDER BY id")
+
+    assert sqlite(db, "SELECT closeReason FROM work_items ORDER BY id") == expected_reasons
   end
 
   defp intact?(db), do: sqlite(db, "PRAGMA integrity_check; PRAGMA foreign_key_check;") == "ok\n"
@@ -140,11 +146,21 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
       )
       |> String.trim()
 
-    Map.new(@preserved_tables, fn
-      "work_items" -> {"work_items", sqlite(db, "SELECT #{fields} FROM work_items")}
-      table -> {table, sqlite(db, "SELECT * FROM #{table}")}
-    end)
+    rows =
+      Map.new(@preserved_tables, fn
+        "work_items" -> {"work_items", sqlite(db, "SELECT #{fields} FROM work_items")}
+        table -> {table, sqlite(db, "SELECT * FROM #{table}")}
+      end)
+
+    if sqlite(db, "SELECT name FROM pragma_table_info('work_items') WHERE name='closeReason'") !=
+         "" do
+      Map.put(rows, :close_reasons, sqlite(db, "SELECT closeReason FROM work_items ORDER BY id"))
+    else
+      rows
+    end
   end
+
+  defp work_item_columns(db), do: sqlite(db, "PRAGMA table_info(work_items)")
 
   defp sqlite(db, statement) do
     assert {result, 0} = System.cmd("sqlite3", ["-batch", "-bail", db, statement])

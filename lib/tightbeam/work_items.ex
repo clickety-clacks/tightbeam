@@ -54,7 +54,6 @@ defmodule Tightbeam.WorkItems do
     ownerUserId TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','iceboxed','closed','failed')),
     failReason TEXT NULL,
-    #{@close_reason_column},
     routingWakeId TEXT NULL,
     slateWakeId TEXT NULL,
     createdByUser TEXT NULL,
@@ -83,9 +82,16 @@ defmodule Tightbeam.WorkItems do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
     with :ok <- DB.execute(db, @ddl),
-         :ok <- DB.execute(db, @priority_ddl),
-         {:ok, :ok} <- DB.transaction(db, &ensure_close_reason_in_txn/1) do
+         :ok <- DB.execute(db, @priority_ddl) do
       :ok
+    end
+  end
+
+  @doc false
+  def ensure_close_reason_schema(db) do
+    case DB.transaction(db, &ensure_close_reason_in_txn/1) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
     end
   end
 

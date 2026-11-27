@@ -74,11 +74,22 @@ defmodule Tightbeam.R1SchemaMigrationTest do
         "CREATE TRIGGER refuse_r1 BEFORE UPDATE ON schema_stamp WHEN NEW.shape='row-driven-r1-v1-019' BEGIN SELECT RAISE(ABORT, 'R1 fixture refusal'); END"
       )
 
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_r1','Historical close','fixture','closed','fixture',1)"
+      )
+
     assignments = rows(db, "SELECT * FROM assignments")
     facts = rows(db, "SELECT * FROM condition_facts")
+    old_columns = rows(db, "PRAGMA table_info(work_items)")
+    old_fields = columns(db, "work_items") |> Enum.join(",")
+    old_items = rows(db, "SELECT #{old_fields} FROM work_items")
     before = snapshot(db)
     assert_raise DB.Error, fn -> Schema.ensure_all(db) end
     assert snapshot(db) == before
+    assert rows(db, "PRAGMA table_info(work_items)") == old_columns
+    assert rows(db, "SELECT * FROM work_items") == old_items
 
     assert rows(
              db,
@@ -98,6 +109,14 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     :ok = DB.execute(db, "DROP TRIGGER refuse_r1")
     assert :ok = Schema.ensure_all(db)
     assert_columns(db)
+    assert ["closeReason"] -- columns(db, "work_items") == []
+
+    assert rows(db, "SELECT #{old_fields},closeReason FROM work_items") ==
+             Enum.map(old_items, &(&1 ++ [nil]))
+
+    :ok = DB.execute(db, "UPDATE work_items SET closeReason='completed' WHERE id='wi_r1'")
+    assert :ok = Schema.ensure_all(db)
+    assert rows(db, "SELECT closeReason FROM work_items") == [["completed"]]
 
     assert rows(
              db,

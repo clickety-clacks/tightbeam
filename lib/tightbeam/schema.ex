@@ -2166,6 +2166,9 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.ProviderAccounts.ensure_schema(db)
     :ok = Tightbeam.AccountWriter.ensure_schema(db)
 
+    # Keep the historical work-item shape until predecessor migrations succeed.
+    :ok = Tightbeam.WorkItems.ensure_close_reason_schema(db)
+
     case DB.finish_schema(db) do
       :ok -> :ok
       {:error, error} -> raise error
