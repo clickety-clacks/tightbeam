@@ -207,7 +207,12 @@ defmodule Tightbeam.ReleaseProvenancePackagingTest do
       "GITHUB_REF_NAME",
       "CI_SOURCE_SHA",
       "GITHUB_SHA",
-      "GITHUB_REPOSITORY"
+      "GITHUB_REPOSITORY",
+      "GITHUB_WORKFLOW_REF",
+      "GITHUB_WORKFLOW_SHA",
+      "CANDIDATE_BRANCH",
+      "CANDIDATE_REF",
+      "CANDIDATE_SHA"
     ]
 
     env = Enum.map(keys, fn key -> {key, Map.get(overrides, key)} end)
