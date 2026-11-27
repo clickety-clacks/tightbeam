@@ -64,14 +64,20 @@ defmodule Tightbeam.Mementos do
 
   @doc false
   def read_declarations!(law_base, revision) do
+    law_base
+    |> Path.join("identity/kungfu/*/manifest.toml")
+    |> Path.wildcard()
+    |> Enum.sort()
+    |> Enum.map(&{&1, File.read!(&1)})
+    |> declarations_from_manifests(revision)
+  end
+
+  @doc false
+  def declarations_from_manifests(manifests, revision) do
     declarations =
-      law_base
-      |> Path.join("identity/kungfu/*/manifest.toml")
-      |> Path.wildcard()
-      |> Enum.sort()
-      |> Enum.flat_map(fn path ->
+      Enum.flat_map(manifests, fn {path, bytes} ->
         bundle = path |> Path.dirname() |> Path.basename()
-        manifest = path |> File.read!() |> Toml.decode!()
+        manifest = Toml.decode!(bytes)
 
         for declaration <- declarations!(Map.get(manifest, "mementos", []), path) do
           qualified = bundle <> "/" <> declaration.name

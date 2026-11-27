@@ -257,46 +257,18 @@ defmodule Tightbeam.RowReactions.Plan do
       |> Enum.map(&Tightbeam.Identity.Provenance.qualify(owner, &1))
       |> MapSet.new()
 
-    walk_scope_expression(expression, fn fact, op, value ->
-      if archetype_reference?(fact) do
-        values = if op in ["in", "not_in"], do: value, else: [value]
-        foreign = Enum.reject(List.wrap(values), &MapSet.member?(allowed, &1))
+    Enum.each(Expression.archetype_comparisons(expression), fn {fact, op, value} ->
+      values = if op in ["in", "not_in"], do: value, else: [value]
+      foreign = Enum.reject(List.wrap(values), &MapSet.member?(allowed, &1))
 
-        if foreign != [] do
-          raise ArgumentError,
-                "reaction #{rail} in kungfu #{name} compares #{fact} against foreign " <>
-                  "archetype(s) #{inspect(foreign)}; allowed names: " <>
-                  Enum.join(MapSet.to_list(allowed) |> Enum.sort(), ", ")
-        end
+      if foreign != [] do
+        raise ArgumentError,
+              "reaction #{rail} in kungfu #{name} compares #{fact} against foreign " <>
+                "archetype(s) #{inspect(foreign)}; allowed names: " <>
+                Enum.join(MapSet.to_list(allowed) |> Enum.sort(), ", ")
       end
     end)
   end
-
-  defp walk_scope_expression(%{"op" => op, "args" => [left, right | _]} = expression, visit)
-       when op in ["eq", "ne", "in", "not_in"] do
-    right_reference = expression_reference(right)
-
-    cond do
-      reference = expression_reference(left) -> visit.(reference, op, right)
-      op in ["eq", "ne"] and is_binary(right_reference) -> visit.(right_reference, op, left)
-      true -> :ok
-    end
-
-    Enum.each(Map.values(expression), &walk_scope_expression(&1, visit))
-  end
-
-  defp walk_scope_expression(value, visit) when is_map(value),
-    do: Enum.each(Map.values(value), &walk_scope_expression(&1, visit))
-
-  defp walk_scope_expression(value, visit) when is_list(value),
-    do: Enum.each(value, &walk_scope_expression(&1, visit))
-
-  defp walk_scope_expression(_value, _visit), do: :ok
-
-  defp expression_reference(%{"ref" => name}) when is_binary(name), do: name
-  defp expression_reference(_), do: nil
-
-  defp archetype_reference?(name), do: String.ends_with?(name, ".archetype")
 
   # Organization-level declarations elect policy independently of their audience.
   # Session-scoped declarations retain the existing participant restrictions.
