@@ -65,7 +65,7 @@ end
   }) | session_key: holder})
 
 %{id: _} =
-  Escalation.operator_ask(call.("operator-ask", holder, %{
+  Escalation.operator_ask(Tightbeam.DB, call.("operator-ask", holder, %{
     question: "Continue fixture work?",
     project: "Fixture",
     assignment_id: assignment
