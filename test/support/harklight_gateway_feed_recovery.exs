@@ -78,6 +78,8 @@ if phase == "prepare" do
 
   File.write!(agent, """
   #!/bin/sh
+  if [ "$1" = --version ]; then echo 'harklight-agent 0.2.3'; exit 0; fi
+  case "$*" in *--pending*) echo "error: unexpected argument '--pending' found" >&2; exit 2;; esac
   printf '%s\n' "$*" >> '#{calls_path}'
   if [ -f '#{root}/resume' ]; then
     printf '%s\n' '{"kind":"caught_up","rev":9}'
@@ -85,8 +87,8 @@ if phase == "prepare" do
   fi
   printf '%s\n' '{"kind":"caught_up","rev":8}'
   while [ ! -f '#{root}/fail' ]; do sleep 0.05; done
-  if [ '#{scenario}' = 'drain-baseline' ]; then
-    printf '%s\n' '{"kind":"baseline","rev":9}'
+  if [ '#{scenario}' = 'drain-ambiguous' ]; then
+    printf '%s\n' 'unclassified final diagnostic' >&2
     exec sleep 300
   fi
   printf '%s\n' 'listen: live updates paused: internal_error (Request-Id Some("fixture-original-id"))' >&2
@@ -212,7 +214,7 @@ if phase == "prepare" do
       :ok = Task.await(shutdown)
       File.touch!(Path.join(root, "prepare-ready"))
 
-    "drain-baseline" ->
+    "drain-ambiguous" ->
       state = :sys.get_state(HarklightWakes)
       worker = state.workers[handle]
       port = state.ports[handle]
@@ -221,9 +223,9 @@ if phase == "prepare" do
 
       receive do
         {:trace, ^worker, :receive, {^port, {:data, bytes}}} ->
-          assert bytes =~ ~s("kind":"baseline")
+          assert bytes =~ "unclassified"
       after
-        3_000 -> flunk("worker did not receive the open baseline")
+        3_000 -> flunk("worker did not receive the final diagnostic")
       end
 
       1 = :erlang.trace(worker, false, [:receive])

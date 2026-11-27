@@ -150,7 +150,10 @@ defmodule Tightbeam.Homes do
 
   defp reconcile_remote(target, remote_home, desired, mechanics) do
     stage_base = Path.join([target.base_dir, "staging", target.host_name])
-    staged_home = home_path(stage_base, desired.machine, desired.harness)
+
+    staged_home =
+      home_path(stage_base, desired.machine, desired.harness, Map.get(desired, :slot, "shared"))
+
     File.rm_rf!(staged_home)
 
     staged =
@@ -215,6 +218,70 @@ defmodule Tightbeam.Homes do
   @spec home_path(String.t(), String.t(), harness()) :: String.t()
   def home_path(base_dir, machine, harness),
     do: Path.join([base_dir, "homes", machine, Atom.to_string(harness)])
+
+  @doc "Find the home for a provider account slot."
+  def home_path(base_dir, machine, harness, "shared"), do: home_path(base_dir, machine, harness)
+
+  def home_path(base_dir, machine, harness, "acct_" <> _ = slot) do
+    Path.join([base_dir, "homes", machine, Atom.to_string(harness) <> "-accounts", slot])
+  end
+
+  @doc "Project an account home and link its conversation directory to the shared home."
+  def project_account(target, desired, slot) do
+    harness = Harness.module!(desired.harness)
+    base_dir = target.host_config.base_dir
+    home = home_path(base_dir, desired.machine, desired.harness, slot)
+    shared_home = home_path(base_dir, desired.machine, desired.harness)
+
+    if home != shared_home do
+      directory = harness.conversation_directory()
+      link_conversations(target, home, directory, Path.join(shared_home, directory))
+    end
+
+    harness.reconcile_home(target, home, Map.put(desired, :slot, slot))
+  end
+
+  defp link_conversations(target, home, directory, shared) do
+    link = Path.join(home, directory)
+
+    if Support.local?(target) do
+      File.mkdir_p!(shared)
+      File.mkdir_p!(home)
+
+      case File.ln_s(shared, link) do
+        :ok ->
+          :ok
+
+        {:error, :eexist} ->
+          unless File.read_link(link) == {:ok, shared} do
+            raise "account conversation link conflicts with an existing entry at #{link}"
+          end
+
+        {:error, reason} ->
+          raise File.Error, reason: reason, action: "link account conversations", path: link
+      end
+    else
+      shared_arg = Support.shell_quote(shared)
+      home_arg = Support.shell_quote(home)
+      link_arg = Support.shell_quote(link)
+
+      script = """
+      set -eu
+      mkdir -p #{shared_arg} #{home_arg}
+      if [ -L #{link_arg} ]; then
+        [ "$(readlink #{link_arg})" = #{shared_arg} ]
+      else
+        [ ! -e #{link_arg} ] && ln -s #{shared_arg} #{link_arg}
+      fi
+      """
+
+      Support.run!(
+        target,
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+      )
+    end
+  end
 
   @doc false
   def materialize_legacy_auth_link(target, home, source) do

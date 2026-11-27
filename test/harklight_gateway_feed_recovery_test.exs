@@ -9,7 +9,7 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
         "neither-store",
         "clean",
         "drain-pause",
-        "drain-baseline"
+        "drain-ambiguous"
       ] do
     @scenario scenario
     @tag timeout: 120_000
@@ -21,7 +21,7 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
         {:os_pid, old_pid} = Port.info(first, :os_pid)
         first_state = await_file(first, Path.join(tmp, "prepare-ready"))
 
-        if @scenario in ["clean", "drain-pause", "drain-baseline"] do
+        if @scenario in ["clean", "drain-pause", "drain-ambiguous"] do
           assert_exit(first, 0, first_state)
         else
           assert first_state == :ready
