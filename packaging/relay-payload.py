@@ -83,7 +83,11 @@ def import_tree(checkout, commit, tree, destination):
 
     files = {name: git(checkout, "cat-file", "blob", blob)
              for name, (_, blob) in entries.items()}
-    files["LICENSE"] = git(checkout, "show", f"{commit}:LICENSE")
+    license_entry = git(checkout, "ls-tree", "-z", commit, "--", "LICENSE").decode()
+    match = re.fullmatch(r"100644 blob ([0-9a-f]{40})\tLICENSE\x00", license_entry)
+    if match is None:
+        raise ValueError("reviewed pack LICENSE must be a regular Git 100644 blob")
+    files["LICENSE"] = git(checkout, "cat-file", "blob", match[1])
     manifest = {
         "repository": REPOSITORY,
         "commit": commit,
