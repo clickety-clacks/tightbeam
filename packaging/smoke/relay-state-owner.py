@@ -26,18 +26,21 @@ def check(relay):
         database.write_bytes(untouched)
         with (state / "run.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            for mode in ([], ["--watch"]):
+            for label, mode in (("finite", []), ("watch", ["--watch"])):
                 command = [sys.executable, str(relay), "--config", str(config),
                            "--state-dir", str(state), *mode]
                 result = subprocess.run(command, capture_output=True, text=True, timeout=10,
                                         env={"HOME": str(home), "PATH": "", "LC_ALL": "C",
                                              "PYTHONDONTWRITEBYTECODE": "1"})
                 refusal = "another relay already owns this state directory"
-                if result.returncode != 1 or refusal not in result.stderr.lower():
-                    raise SystemExit(f"relay {mode or 'finite'} did not refuse the held state lock")
+                if mode:
+                    if result.returncode != 1 or refusal not in result.stderr.lower():
+                        raise SystemExit("competing relay watcher did not report the held state lock")
+                elif result.returncode != 0 or result.stdout or result.stderr:
+                    raise SystemExit("competing finite relay did not exit quietly")
                 if database.read_bytes() != untouched or set(os.listdir(state)) != {"run.lock", "relay.db"}:
                     raise SystemExit("a competing relay changed existing state")
-                print(f"relay {mode or 'finite'}: held state lock refused before runtime operations")
+                print(f"relay {label}: held state lock prevented runtime operations")
 
 
 if __name__ == "__main__":
