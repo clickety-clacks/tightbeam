@@ -15,6 +15,13 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
   end
 
+  case System.get_env("TIGHTBEAM_HARKLIGHT_PENDING_OPEN_ENABLED") do
+    nil -> :ok
+    "true" -> config :tightbeam, :harklight_pending_open_enabled, true
+    "false" -> config :tightbeam, :harklight_pending_open_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_HARKLIGHT_PENDING_OPEN_ENABLED must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end
