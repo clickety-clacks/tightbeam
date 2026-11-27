@@ -944,10 +944,8 @@ defmodule Tightbeam.ConditionFacts do
 
   defp landing_record!([id, ts, scope, encoded_payload]) do
     payload = JSON.decode!(encoded_payload)
-    fields = ~w(branch commit headCommit)
 
     unless is_integer(id) and is_integer(ts) and is_map(payload) and
-             Enum.sort(Map.keys(payload)) == Enum.sort(fields) and
              is_binary(payload["branch"]) and payload["branch"] != "" and
              valid_commit_oid?(payload["commit"]) and valid_commit_oid?(payload["headCommit"]) do
       raise ArgumentError, "invalid stored observed merge record"
