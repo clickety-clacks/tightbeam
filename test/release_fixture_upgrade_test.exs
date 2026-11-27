@@ -1,5 +1,5 @@
 defmodule Tightbeam.ReleaseFixtureUpgradeTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   @fixtures Path.join(__DIR__, "fixtures/releases")
   @boot "release_upgrade_boot.exs"
