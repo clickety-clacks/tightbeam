@@ -347,10 +347,7 @@ defmodule Tightbeam.Gateway do
 
     (credential_children(config, db) ++
        [
-         {ModelCatalog,
-          base_dir: config.base_dir,
-          db: db,
-          account_writer_config: if(Map.get(config, :provider_accounts_enabled), do: config)},
+         {ModelCatalog, base_dir: config.base_dir, db: db},
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ArtifactBlobStore, blob_options},
@@ -431,8 +428,7 @@ defmodule Tightbeam.Gateway do
                do: [ip: {127, 0, 0, 1}],
                else: []
              )
-         ),
-         Tightbeam.ExecutionMapTurnVersions.enabled_child(db)
+         )
        ])
     |> Enum.reject(&is_nil/1)
   end
@@ -473,7 +469,7 @@ defmodule Tightbeam.Gateway do
     opts =
       [
         name: Tightbeam.Credentials.server(machine),
-        provider_accounts_db: db,
+        provider_accounts_db: if(Tightbeam.ProviderAccounts.enabled?(), do: db),
         provider_accounts_registration:
           if(machine != Placement.local_host_name(), do: {host.base_dir, host.ssh}),
         base_dir: host.base_dir,

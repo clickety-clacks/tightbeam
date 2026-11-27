@@ -15,7 +15,7 @@ Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 
 # A SQL export has no build-owner marker. Supply the usual exact transition
 # for this disposable base from the independently observed checkout identity.
-unless File.exists?(Path.join(base, "build-owner.json")) do
+if expected_stamp != "" and not File.exists?(Path.join(base, "build-owner.json")) do
   %{identity: target} =
     LiveBaseAdmission.prepare!(base <> "-unpopulated", payload_root: payload)
 
@@ -29,6 +29,8 @@ unless File.exists?(Path.join(base, "build-owner.json")) do
 
   Application.put_env(:tightbeam, :live_base_guard, transition: transition)
 end
+
+Application.put_env(:tightbeam, :provider_accounts_enabled, System.get_env("TB_UPGRADE_ACCOUNTS") == "1")
 
 if System.get_env("TB_UPGRADE_INTERRUPT") == "1" do
   Application.put_env(:tightbeam, :provider_schema_checkpoint, fn ->

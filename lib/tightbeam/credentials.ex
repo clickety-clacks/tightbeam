@@ -58,23 +58,6 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  @doc "Run one owning-host command that completes and persists an idle account write."
-  def with_idle_account_writer(config, account, command, opts \\ [])
-      when is_function(command, 1) do
-    with {:ok, %{target: target, home: home} = context} <- account_target(config, account) do
-      key = "#{account["harness"]}:#{account["slot"]}@#{account["host"]}"
-
-      Tightbeam.AccountWriter.run(
-        Map.get(config, :db, Tightbeam.DB),
-        key,
-        target,
-        home,
-        command.(context),
-        opts
-      )
-    end
-  end
-
   @doc "Resolve the lifecycle owner registered for a machine."
   @spec server(String.t()) :: GenServer.server()
   def server(machine) do

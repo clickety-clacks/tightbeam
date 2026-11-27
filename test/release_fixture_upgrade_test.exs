@@ -9,6 +9,46 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
   @preserved_tables ~w(sessions assignments attests artifacts wakes decision_requests work_items)
 
   @tag timeout: 120_000
+  test "default boot preserves the predecessor without creating optional storage" do
+    {runtime, db} = restore(@predecessor)
+    original = preserved_rows(db)
+
+    {status, ready?, output} = await_exit(boot(runtime, db, false, false))
+    assert {status, ready?} == {0, true}, "default boot did not complete:\n#{output}"
+    assert intact?(db)
+    assert preserved_rows(db) == original
+    assert_default_schema(db)
+  end
+
+  @tag timeout: 120_000
+  test "fresh default boot leaves optional storage absent" do
+    runtime = fixture_runtime()
+    db = Path.join(runtime.base, "state.db")
+    refute File.exists?(db)
+
+    {status, ready?, output} = await_exit(boot(runtime, db, false, false))
+    assert {status, ready?} == {0, true}, "fresh boot did not complete:\n#{output}"
+    assert intact?(db)
+    assert_default_schema(db)
+  end
+
+  defp assert_default_schema(db) do
+    assert sqlite(db, """
+           SELECT name FROM sqlite_schema
+           WHERE name IN (
+             'account_writer_leases', 'provider_accounts', 'provider_account_schema_stamp',
+             'account_serving', 'account_limits', 'capacity_windows',
+             'execution_map_turn_versions', 'execution_map_turn_version_activation',
+             'execution_map_revisions', 'harklight_pending_opens', 'harklight_item_ids',
+             'harklight_outage_recoveries', 'people_conversations'
+           )
+              OR name GLOB 'execution_map_revision_*'
+              OR name GLOB 'execution_map_turn_versions_*';
+           SELECT name FROM pragma_table_info('turns') WHERE name = 'accountId';
+           """) == ""
+  end
+
+  @tag timeout: 120_000
   test "killing first startup during the provider-account migration rolls back and can restart" do
     filename =
       if File.exists?(Path.join(@fixtures, @predecessor)) do
@@ -43,13 +83,18 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     end
   end
 
-  defp restore(filename) do
+  defp fixture_runtime do
     tmp = Path.join(System.tmp_dir!(), "release-upgrade-#{Tightbeam.Id.uuid4()}")
     on_exit(fn -> File.rm_rf!(tmp) end)
     runtime = Tightbeam.GuardRuntimeFixture.prepare!(tmp, @boot)
     File.mkdir_p!(runtime.base)
     File.write!(Path.join(runtime.base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
     Tightbeam.RecoveryFixture.place_adapter!(runtime.base, seed_credential: false)
+    runtime
+  end
+
+  defp restore(filename) do
+    runtime = fixture_runtime()
     db = Path.join(runtime.base, "state.db")
     dump = Path.join(@fixtures, filename)
     assert {"", 0} = System.cmd("sqlite3", ["-batch", "-bail", db, ".read \"#{dump}\""])
@@ -57,12 +102,16 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     {runtime, db}
   end
 
-  defp boot(runtime, db, interrupt?) do
-    stamp = db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim()
+  defp boot(runtime, db, interrupt?, accounts? \\ true) do
+    stamp = if File.exists?(db), do: db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim(), else: ""
 
     env =
       runtime.env ++
-        [{"npm_config_offline", "true"}, {"TB_UPGRADE_INTERRUPT", if(interrupt?, do: "1", else: "0")}]
+        [
+          {"npm_config_offline", "true"},
+          {"TB_UPGRADE_INTERRUPT", if(interrupt?, do: "1", else: "0")},
+          {"TB_UPGRADE_ACCOUNTS", if(accounts?, do: "1", else: "0")}
+        ]
 
     Port.open({:spawn_executable, runtime.executable}, [
       :binary,

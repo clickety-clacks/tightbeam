@@ -310,7 +310,7 @@ defmodule Tightbeam.HarnessProcess.Recovery do
       {:ok, bytes} ->
         case String.split(bytes, "\t") do
           ["tightbeam-launch-failed-v1", launch, step, status] when launch == row.launch_id ->
-            with true <- step in ~w(fork session leader boot start_time write writer_lock),
+            with true <- step in ~w(fork session leader boot start_time write),
                  true <- String.ends_with?(status, "\n"),
                  {code, "\n"} when code > 0 <- Integer.parse(status) do
               {:ok, %{step: step, status: code}}

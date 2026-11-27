@@ -648,9 +648,21 @@ defmodule Tightbeam.StateResources do
 
   @doc "Return one bounded, principal-visible work-item page in creation order."
   def query_work_item_page(db, filters, call, boundary, limit) do
+    {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
-    {visibility, visibility_params} = work_item_page_visibility(call)
+
+    {visibility, visibility_params} =
+      cond do
+        is_admin ->
+          {"1 = 1", []}
+
+        principal_kind == "user" ->
+          {"wi.ownerUserId = ?", [principal_id]}
+
+        principal_kind == "session" ->
+          {"1 = 1", []}
+      end
 
     {where, params} =
       append_work_item_filters(
@@ -677,36 +689,38 @@ defmodule Tightbeam.StateResources do
       "work_items AS wi LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
         "LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id"
 
-    with_read_transaction(db, fn txn ->
-      query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
+    case DB.read_transaction(db, fn txn ->
+           query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
 
-      page =
-        Keyset.page(
-          query,
-          select_from,
-          probe_from,
-          where,
-          params,
-          ["wi.createdAt", "wi.id"],
-          boundary,
-          limit,
-          fn row -> [Enum.at(row, 14), hd(row)] end
-        )
+           page =
+             Keyset.page(
+               query,
+               select_from,
+               probe_from,
+               where,
+               params,
+               ["wi.createdAt", "wi.id"],
+               boundary,
+               limit,
+               fn row -> [Enum.at(row, 14), hd(row)] end
+             )
 
-      rows =
-        page.rows
-        |> Enum.map(&work_item_query_row/1)
-        |> then(&attach_work_item_summaries(txn, &1, :page, call))
+           rows =
+             page.rows
+             |> Enum.map(&work_item_query_row/1)
+             |> then(&WorkItemSummary.attach_many(txn, &1))
 
-      %{rows: rows, has_more_before: page.has_more_before, has_more_after: page.has_more_after}
-    end)
-  end
+           %{page | rows: rows}
+         end) do
+      {:ok, page} ->
+        %{
+          rows: page.rows,
+          has_more_before: page.has_more_before,
+          has_more_after: page.has_more_after
+        }
 
-  defp work_item_page_visibility(call) do
-    case detail_principal(call) do
-      {_kind, _id, true} -> {"1 = 1", []}
-      {"user", id, false} -> {"wi.ownerUserId = ?", [id]}
-      {"session", _id, false} -> {"1 = 1", []}
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -1942,8 +1956,7 @@ defmodule Tightbeam.StateResources do
           {"ownerUserId", "wi.ownerUserId"},
           {"createdBySession", "wi.createdBySession"},
           {"createdByUser", "wi.createdByUser"},
-          {"specRefName", "wi.specRefName"},
-          {"specRefSha256", "wi.specRefSha256"}
+          {"specRefName", "wi.specRefName"}
         ],
         {where, params},
         fn {field, column}, {where, params} ->
@@ -1958,19 +1971,6 @@ defmodule Tightbeam.StateResources do
         "false" -> 0
       end)
       |> then(&append_in_filter(where, params, "wi.isBug", &1))
-
-    where =
-      case filters["executionMapOrigin"] do
-        "user" -> where <> " AND wi.createdByUser IS NOT NULL"
-        "session" -> where <> " AND wi.createdByUser IS NULL"
-        _ -> where
-      end
-
-    {where, params} =
-      case filters["createdBefore"] do
-        nil -> {where, params}
-        timestamp -> {where <> " AND wi.createdAt < ?", params ++ [timestamp]}
-      end
 
     holder_keys = Map.get(filters, "holderKey", [])
 
