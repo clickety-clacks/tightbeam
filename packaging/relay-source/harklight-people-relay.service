@@ -1,0 +1,8 @@
+[Unit]
+Description=Harklight relay for Tightbeam people messages
+
+[Service]
+Type=oneshot
+UMask=0077
+StateDirectory=harklight-people-relay
+ExecStart=/usr/bin/python3 %h/.local/share/harklight-tightbeam-pack/pack/relay/relay.py --config %h/.config/harklight-people-relay/config.json --state-dir %S/harklight-people-relay

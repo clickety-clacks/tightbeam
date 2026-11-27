@@ -1,0 +1,92 @@
+name: optional relay package evidence
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/relay-package-evidence.yml"
+      - "packaging/assemble.sh"
+      - "packaging/relay-*/**"
+      - "packaging/relay-payload.py"
+      - "packaging/stage-optional-relay.sh"
+      - "packaging/smoke/relay-*"
+      - "packaging/smoke/named-relay/**"
+      - "priv/guidance/operating-manual.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-package-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Assemble and verify the standard package
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git config user.name "Relay package smoke"
+          git config user.email relay-smoke@example.invalid
+          mix deps.get
+          sh packaging/assemble.sh
+          platform=$(uname -s | tr 'A-Z' 'a-z')
+          for archive in _build/npm/tightbeam-*.tgz; do
+            shasum -a 256 "$archive"
+            sh packaging/verify-payload.sh "$archive"
+            python3 packaging/relay-payload.py verify-archive "$archive" "$platform" \
+              --manual priv/guidance/operating-manual.md
+            python3 packaging/smoke/relay-state-owner.py \
+              _build/npm/tightbeam/optional/harklight-people-relay/source/relay.py
+          done | tee "$RUNNER_TEMP/relay-archive.log"
+
+      - name: Verify the explicit lifecycle and ordinary setup boundary
+        run: |
+          set -euo pipefail
+          for archive in _build/npm/tightbeam-*.tgz; do
+            bash packaging/smoke/relay-install-boundary.sh "$archive"
+          done | tee "$RUNNER_TEMP/relay-boundary.log"
+
+      - name: Pair the packaged relay with released Agent and Server
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for archive in _build/npm/tightbeam-*.tgz; do
+            bash packaging/smoke/named-relay/run-named-archive-evidence.sh "$archive" packaging/gateway-smoke.py
+          done | tee "$RUNNER_TEMP/relay-pair.log"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relay-package-evidence-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/relay-archive.log
+            ${{ runner.temp }}/relay-boundary.log
+            ${{ runner.temp }}/relay-pair.log

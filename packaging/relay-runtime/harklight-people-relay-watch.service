@@ -1,0 +1,15 @@
+[Unit]
+Description=Harklight relay for Tightbeam people messages
+
+[Service]
+Type=simple
+UMask=0077
+StateDirectory=harklight-people-relay
+StateDirectoryMode=0700
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=python3 %h/.local/share/tightbeam/people-relay/relay.py --config %h/.config/harklight-people-relay/config.json --state-dir %S/harklight-people-relay --watch
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
