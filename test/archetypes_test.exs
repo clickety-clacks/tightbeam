@@ -52,7 +52,8 @@ defmodule Tightbeam.ArchetypesTest do
     main_snapshot = Identity.snapshot!(ctx.base_dir, "default", :codex)
     assert main_snapshot.guidance =~ "Be Main, the user's root contact"
     assert main_snapshot.guidance =~ "Harklight over email"
-    assert main_snapshot.guidance =~ "channel availability, recipient consent and send authority"
+    assert main_snapshot.guidance =~ "channel availability, recipient consent"
+    assert main_snapshot.guidance =~ "send authority separately from the preference"
     assert main_snapshot.guidance =~ "already authorized fallback"
     assert main_snapshot.guidance =~ "keep custody"
     refute main_snapshot.guidance =~ "tightbeam doctor"
