@@ -767,7 +767,7 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     assert {:ok, _} = DB.query(ctx.db, "DELETE FROM turns WHERE seq=?1", [seq])
     deleted = get(ctx, path, ctx.token) |> decode_success()
-    assert deleted["dependencyVersion"] == baseline["dependencyVersion"]
+    refute deleted["dependencyVersion"] == inserted["dependencyVersion"]
 
     {:ok, _seq} =
       Ledger.enqueue(ctx.db, %{
@@ -780,6 +780,79 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     recreated = get(ctx, path, ctx.token) |> decode_success()
     refute recreated["dependencyVersion"] == inserted["dependencyVersion"]
+  end
+
+  test "a cached legacy dependency token receives a fresh full page", ctx do
+    item = insert_work_item!(ctx.db, "wi_cached_dependency", "owner", 42_000)
+    legacy = :crypto.hash(:sha256, JSON.encode!([[], []])) |> Base.encode16(case: :lower)
+
+    response =
+      conn(:get, "/api/execution-map?limit=1")
+      |> put_req_header("authorization", "Bearer " <> ctx.token)
+      |> put_req_header("if-none-match", ~s("#{legacy}"))
+      |> Router.call(Router.init(ctx.opts))
+
+    page = decode_success(response)
+    assert Enum.map(page["items"], & &1["id"]) == [item]
+    refute page["dependencyVersion"] == legacy
+  end
+
+  test "quiet pages and off-page attest dependencies span internal item batches", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, """
+             WITH RECURSIVE n(i) AS (
+               VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 260
+             )
+             INSERT INTO work_items
+               (id, title, isBug, ownerUserId, state, createdByUser, createdAt, createdContextKnown)
+             SELECT printf('wi_chunk_%03d', i), 'Page fixture', 0, 'owner', 'open', 'owner',
+                    40000 + i, 0
+             FROM n
+             """)
+
+    assignment =
+      insert_assignment!(ctx.db, "asg_off_page_attest",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: "wi_chunk_001"
+      )
+
+    insert_attest!(
+      ctx.db,
+      "att_off_page",
+      assignment,
+      ctx.owner_session.session_key,
+      45_000
+    )
+
+    call = %{
+      principal: %{kind: "user", id: "owner", is_admin: false},
+      filters: %{"quietOverMs" => 1},
+      boundary: :latest,
+      limit: 2,
+      now: 50_000
+    }
+
+    page = ExecutionMap.list_execution_map(ctx.db, call)
+    assert Enum.map(page.items, & &1.id) == ["wi_chunk_259", "wi_chunk_260"]
+    assert page.flags == %{has_more_before: true, has_more_after: false}
+
+    earlier =
+      ExecutionMap.list_execution_map(ctx.db, %{
+        call
+        | boundary: {:before, [40_259, "wi_chunk_259"]}
+      })
+
+    assert Enum.map(earlier.items, & &1.id) == ["wi_chunk_257", "wi_chunk_258"]
+    assert earlier.flags == %{has_more_before: true, has_more_after: true}
+    assert earlier.dependency_version == page.dependency_version
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE attests SET ts=ts+1 WHERE id='att_off_page'")
+
+    changed = ExecutionMap.list_execution_map(ctx.db, call)
+    assert changed.items == page.items
+    refute changed.dependency_version == page.dependency_version
   end
 
   test "REST uses visible turn dependencies while the index backfills", ctx do

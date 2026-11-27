@@ -1401,18 +1401,7 @@ defmodule Tightbeam.Placement do
     host_config = Map.fetch!(hosts_for(config), host)
     sh = Map.get(config, :sh, &system_cmd/1)
 
-    target =
-      Map.merge(
-        %{
-          base_dir: config.base_dir,
-          host_config: host_config,
-          host_name: host,
-          sh: sh,
-          cli_bin: config.cli_bin,
-          default_model: Map.get(config, :default_model)
-        },
-        Map.get(config, :harness_target_overrides, %{})
-      )
+    target = harness_target(config, host, host_config, sh)
 
     projected_home = Homes.home_path(host_config.base_dir, host, module.id())
 
@@ -1564,6 +1553,29 @@ defmodule Tightbeam.Placement do
     with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
       {:ok, Keyword.merge(base, plan)}
     end
+  end
+
+  @doc false
+  def account_target(config, host) do
+    with {:ok, host_config} <- Map.fetch(hosts_for(config), host) do
+      {:ok, harness_target(config, host, host_config, Map.get(config, :sh, &system_cmd/1))}
+    else
+      :error -> {:error, :unknown_host}
+    end
+  end
+
+  defp harness_target(config, host, host_config, sh) do
+    Map.merge(
+      %{
+        base_dir: config.base_dir,
+        host_config: host_config,
+        host_name: host,
+        sh: sh,
+        cli_bin: Map.get(config, :cli_bin, Path.join(config.base_dir, "bin")),
+        default_model: Map.get(config, :default_model)
+      },
+      Map.get(config, :harness_target_overrides, %{})
+    )
   end
 
   @doc false

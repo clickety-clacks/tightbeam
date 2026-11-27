@@ -170,6 +170,15 @@ fn build_identity_apply_step_request(identity: &Identity, cursor: Option<&str>) 
     request(identity, "identity-apply", vec![], params)
 }
 
+pub(crate) fn facts_read_request(identity: &Identity, kind: &str) -> RequestSpec {
+    request(
+        identity,
+        "facts-read",
+        vec![],
+        vec![string_field("kind", kind)],
+    )
+}
+
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     let context = CommandContext::for_command(command);

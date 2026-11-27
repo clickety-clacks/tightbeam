@@ -33,10 +33,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      install_channels: ${{ steps.channels.outputs.enabled }}
     permissions:
       actions: read
       contents: read
@@ -78,6 +84,15 @@ jobs:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Detect install channels in the selected candidate
+        id: channels
+        run: |
+          if [ -f packaging/prepare-install-channels.mjs ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify main commit and unused release tag
         shell: bash
@@ -217,7 +232,7 @@ jobs:
         with:
           name: release-payload-${{ inputs.candidate_sha }}
           path: ${{ runner.temp }}/release/
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   publish:
@@ -262,9 +277,92 @@ jobs:
           target_commitish: ${{ inputs.candidate_sha }}
           name: Tightbeam ${{ inputs.release_tag }}
           generate_release_notes: true
+          prerelease: false
+          make_latest: "true"
           fail_on_unmatched_files: true
           files: |
             release/tightbeam-*.tgz
             release/release-candidate-manifest.json
             release/SHA256SUMS
             release/release-provenance.json
+
+      - name: Report legacy candidate publication
+        if: needs.prepare.outputs.install_channels != 'true'
+        run: echo "Published GitHub release. The selected candidate predates npm and Homebrew distribution." >> "$GITHUB_STEP_SUMMARY"
+
+  distribute:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.install_channels == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Check publication credentials
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "Set HOMEBREW_TAP_TOKEN with Contents write access to clickety-clacks/homebrew-tap" >&2
+            exit 1
+          fi
+          status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' https://registry.npmjs.org/tightbeam)
+          case "$status" in
+            200)
+              if [ -z "$NODE_AUTH_TOKEN" ] &&
+                 { [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; }; then
+                echo "Set NPM_TOKEN or enable npm Trusted Publishing with GitHub Actions OIDC" >&2
+                exit 1
+              fi
+              ;;
+            404) test -n "$NODE_AUTH_TOKEN" || {
+                   echo "Set NPM_TOKEN to bootstrap the unclaimed tightbeam package" >&2
+                   exit 1
+                 } ;;
+            *) echo "npm registry lookup failed (HTTP $status)" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-payload-${{ inputs.candidate_sha }}
+          path: verified-release
+
+      - name: Confirm this is the latest stable GitHub release with the verified archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" |
+            jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and (.draft or .prerelease | not)'
+          gh release download "$RELEASE_TAG" --dir published-release \
+            --pattern SHA256SUMS --pattern 'tightbeam-*.tgz' --pattern release-candidate-manifest.json
+          cmp verified-release/SHA256SUMS published-release/SHA256SUMS
+          (cd published-release && sha256sum --check SHA256SUMS)
+          node packaging/prepare-install-channels.mjs "$RELEASE_TAG" published-release/SHA256SUMS channels
+
+      - uses: actions/checkout@v4
+        with:
+          repository: clickety-clacks/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Publish npm and Homebrew and verify both public channels
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash packaging/publish-install-channels.sh "$PWD/channels" "$PWD/homebrew-tap"

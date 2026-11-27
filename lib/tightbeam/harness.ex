@@ -96,6 +96,7 @@ defmodule Tightbeam.Harness do
   @doc "The harness-owned leaf entries of a projected home."
   @callback owned_home_entries() :: [String.t()]
   @callback reconcile_home(target(), String.t(), desired_home()) :: map()
+  @callback conversation_directory() :: String.t()
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
   @callback credential_live?(target(), String.t(), keyword()) :: credential_liveness()
@@ -133,7 +134,8 @@ defmodule Tightbeam.Harness do
   @doc "Whether a running turn accepts model tuning without replacing its conversation."
   @callback running_model_tuning_supported?() :: boolean()
 
-  @optional_callbacks preflight_launch: 3,
+  @optional_callbacks conversation_directory: 0,
+                      preflight_launch: 3,
                       check_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
