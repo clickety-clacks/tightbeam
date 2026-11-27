@@ -21,6 +21,7 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Harness.Claude
 
   alias Tightbeam.HarnessHealth.{
     ModelRateLimit,
@@ -640,7 +641,7 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
     File.write!(path, """
     #!/bin/sh
     case "$1" in
-      --version) printf 'fixture claude version\\n' ;;
+      --version) printf '2.1.322 (Claude Code)\\n' ;;
       --help) printf '%s\\n' '-p --tools --model --safe-mode --strict-mcp-config --no-session-persistence --output-format' ;;
       -p)
         test "$4" = "--model" || exit 2
@@ -651,6 +652,22 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
     """)
 
     File.chmod!(path, 0o700)
+
+    root = Path.join(base_dir, "adapters")
+    installed = Claude.installed_adapter(root)
+    package = Path.join(root, "node_modules/@agentclientprotocol/claude-agent-acp")
+    entry = Path.join(package, "fixture-acp")
+    File.mkdir_p!(package)
+    File.mkdir_p!(Path.dirname(installed))
+    File.write!(entry, "#!/bin/sh\nexit 1\n")
+    File.chmod!(entry, 0o700)
+    File.ln_s!(entry, installed)
+
+    File.write!(
+      Path.join(package, "package.json"),
+      JSON.encode!(%{name: Claude.install_package(), version: Claude.adapter_version()})
+    )
+
     Path.join(bin, "fixture-probe.log")
   end
 

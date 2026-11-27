@@ -1093,13 +1093,14 @@ defmodule Tightbeam.HarnessHealth do
     diagnostic = ErrorDiagnostic.of(reason)
     reason = ErrorDiagnostic.classified(reason)
     pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason, diagnostic)
+    pi_typed_failure? = pi_typed_turn_failure?(session, reason)
 
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        unless pre_request_refusal? do
+        unless pre_request_refusal? or pi_typed_failure? do
           Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
         end
 
@@ -1148,7 +1149,7 @@ defmodule Tightbeam.HarnessHealth do
             :model -> {:model_scoped, nil}
           end
 
-        unless pre_request_refusal? do
+        unless pre_request_refusal? or pi_typed_failure? do
           redelivery_failure_class =
             case typed_redelivery_failure_class(reason) do
               ^failure_class -> failure_class
@@ -1167,6 +1168,24 @@ defmodule Tightbeam.HarnessHealth do
         after_harness_health_commit(result)
     end
   end
+
+  @doc """
+  Whether a turn failure on this session is a typed Pi failure from the
+  Tightbeam pi-acp patch. Only a Pi session's failure qualifies; the same error
+  kind from any other harness keeps the normal replay paths.
+
+  Pi retries a failed provider request itself before reporting these kinds, and
+  the turn may have run tools before failing. Replaying the prompt would add
+  attempts Pi already spent, so these failures keep their incident and fact
+  evidence but are never redelivered or retried as a wake.
+  """
+  @spec pi_typed_turn_failure?(map(), term()) :: boolean()
+  def pi_typed_turn_failure?(%{harness: harness}, %{"data" => %{"errorKind" => kind}}),
+    do:
+      to_string(harness) == "pi" and kind in ~w(pi_retry_exhausted pi_turn_failed) and
+        Tightbeam.Harness.Pi.typed_turn_failures_enabled?()
+
+  def pi_typed_turn_failure?(_session, _reason), do: false
 
   # Model observations never feed harness-wide evidence, even when several
   # separate models are limited. Account and authoritative signals still do.

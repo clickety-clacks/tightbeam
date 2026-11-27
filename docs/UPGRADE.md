@@ -25,8 +25,7 @@ new yes before acting; read-only inventory can proceed while waiting.
    selecting a new build.
 2. Verify the target release package, `SHA256SUMS`, and
    `release-provenance.json`. For the package commands, follow the
-   [stage/select instructions](../README.md#from-a-release-package) below the
-   README's release-package heading; `stage` leaves the running build selected.
+   [stage/select instructions](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#from-a-release-package) for the manual installer. The `stage` command leaves the running build selected.
    If the service still starts an npm-installed executable, follow
    [the selector move](#moving-an-npm-installed-gateway-to-the-selector)
    for inventory and staging only at this step; its stop/configuration and
@@ -209,7 +208,7 @@ particular, do not use `npm install -g` for a service-managed gateway: it can
 replace restart-loadable bytes before a running process is restarted.
 
 For a package upgrade, first take the backup described below, then follow the
-release-package stage/select steps in [README.md](../README.md). `stage` checks
+release-package stage/select steps in [the versioned package instructions](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#from-a-release-package). `stage` checks
 the package SHA-256 against `SHA256SUMS`, binds the package version and source
 commit to `release-provenance.json`, checks the CLI and gateway versions, and
 records hashes for the staged files. It does not change `current`. After the
@@ -245,9 +244,9 @@ Use the service-manager branch that applies, within this same upgrade order:
   loaded job with `sudo launchctl print system/com.tightbeam.gateway`. Read
   `ProgramArguments` and `EnvironmentVariables`, including `PATH`; resolve the
   executable's symlink chain with `readlink`. Use the system LaunchDaemon from
-  the [README plist](../README.md#macos--launchd), not a per-login LaunchAgent.
+  the [versioned LaunchDaemon example](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#macos--launchd), not a per-login LaunchAgent.
 
-Stage the verified 0.1.9 target using the README's release-package commands.
+Stage the verified 0.1.9 target using the [versioned release-package commands](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#from-a-release-package).
 For the 0.1.8 upgrade, this is the end of step 2: staging does not authorize
 starting the selected build. The following phases keep service configuration
 separate from the first 0.1.9 start.
@@ -274,7 +273,7 @@ credentials, remaining environment and logging settings.
   `ProgramArguments` to the selector path and put the selected bin directory
   first in `EnvironmentVariables.PATH`. Preserve `UserName`, `WorkingDirectory`,
   other arguments, `RunAtLoad`, `KeepAlive` and other settings; retain the
-  README's `root:wheel` ownership and mode `644`. Validate the edited plist
+  versioned example's `root:wheel` ownership and mode `644`. Validate the edited plist
   with `plutil -lint`. Leave the job unloaded; do not bootstrap it yet.
 
 Complete every pre-start item in step 4 of
@@ -652,7 +651,7 @@ starts the currently selected complete build.
 `:drain_timeout_ms`, **default 90s**.
 
 Keep the service manager's stop limit longer than the effective drain budget.
-The README examples use 120 seconds (`TimeoutStopSec=120s` for systemd and
+The [versioned service examples](https://github.com/clickety-clacks/tightbeam/blob/v0.1.16%2B4304/README.md#installing-as-a-service--required-and-the-install-is-not-complete-without-it) use 120 seconds (`TimeoutStopSec=120s` for systemd and
 `ExitTimeOut=120` for launchd). If `TIGHTBEAM_DRAIN_TIMEOUT_MS` overrides the
 default, convert its millisecond value to seconds and set the service manager's
 limit higher; a shorter limit can force-kill the gateway before its drain

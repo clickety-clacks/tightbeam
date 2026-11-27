@@ -7,6 +7,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   identity repository so it survives a refused boot without becoming served law.
   """
 
+  alias Exqlite.Sqlite3
   alias Tightbeam.{AdminProjection, DB, Identity}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity.{Provenance, TomlEdit}
@@ -224,6 +225,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
       {:ok, {:migrated, final_report}} ->
         write_report!(report_path, final_report)
+        Tightbeam.RuleReferences.warn_legacy!(plan.entries)
         final_report
 
       {:error, error} ->
@@ -317,6 +319,65 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     end)
   end
 
+  @doc false
+  def with_preview!(base_dir, load) do
+    plan = plan!(base_dir)
+
+    if plan.stops != [] do
+      raise ArgumentError, "rail scoping migration stopped: #{stop_summary(plan.stops)}"
+    end
+
+    Identity.with_law_revision!(base_dir, plan.source_revision, fn scratch, revision ->
+      write_identity_plan!(Path.join(scratch, "identity"), plan)
+      result = load.(scratch, revision)
+      {result, Tightbeam.RuleReferences.legacy_archetype_diagnostics(plan.entries)}
+    end)
+  end
+
+  @doc false
+  def pending_for_database!(path) do
+    {:ok, conn} = Sqlite3.open(path, mode: :readonly)
+
+    try do
+      :ok = Sqlite3.execute(conn, "BEGIN")
+
+      case marker_rows!(conn, """
+           SELECT name FROM sqlite_schema
+           WHERE type = 'table' AND name = 'rail_scope_migrations'
+           """) do
+        [] ->
+          true
+
+        [["rail_scope_migrations"]] ->
+          conn
+          |> marker_rows!(
+            "SELECT reportJson FROM rail_scope_migrations WHERE migrationId = '#{@migration_id}'"
+          )
+          |> decode_completed_report!()
+          |> case do
+            :not_complete -> true
+            {:complete, _} -> false
+          end
+      end
+    after
+      Sqlite3.close(conn)
+    end
+  rescue
+    error ->
+      raise ArgumentError, "cannot read the rail migration marker: #{Exception.message(error)}"
+  end
+
+  defp marker_rows!(conn, sql) do
+    {:ok, statement} = Sqlite3.prepare(conn, sql)
+
+    try do
+      {:ok, rows} = Sqlite3.fetch_all(conn, statement)
+      rows
+    after
+      Sqlite3.release(conn, statement)
+    end
+  end
+
   # 0.1.16 shipped this org-wide rule in an optional bundle. Preserve its
   # configured bytes as substrate law before applying kungfu scope isolation.
   defp plan_decision_briefing(plan) do
@@ -397,7 +458,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     branch = git_output!(dir, ["branch", "--show-current"])
     main = git_output!(dir, ["rev-parse", "main"])
     live = git_output!(dir, ["rev-parse", "tightbeam/live"])
-    dirty = git_output!(dir, ["status", "--porcelain"])
+    dirty = git_output!(dir, ["--no-optional-locks", "status", "--porcelain"])
 
     cond do
       branch != "main" ->
@@ -1269,7 +1330,10 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   defp publish_identity!(_base_dir, prior, candidate) when prior == candidate, do: :ok
 
   defp publish_identity!(base_dir, prior, candidate) do
-    case Identity.publish_live!(base_dir, %{candidate_revision: candidate, expected_prior: prior}) do
+    case Identity.publish_rail_scope_migration!(base_dir, %{
+           candidate_revision: candidate,
+           expected_prior: prior
+         }) do
       {:ok, _revision} -> :ok
       {:error, error} -> raise ArgumentError, "identity publication failed: #{inspect(error)}"
     end

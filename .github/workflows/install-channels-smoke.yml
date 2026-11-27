@@ -1,0 +1,51 @@
+name: installer smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/install-channels-smoke.yml"
+      - "packaging/npm/**"
+      - "packaging/*install-channels*"
+      - "packaging/smoke/install-channels.sh"
+      - "packaging/smoke/verify-setup-entrypoints.sh"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Published target release tag (defaults to the latest stable release)"
+        type: string
+      previous_tag:
+        description: "Published predecessor release tag"
+        type: string
+        default: "v0.1.15+4082"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-smoke-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_TAG: ${{ inputs.release_tag }}
+      PREVIOUS_TAG: ${{ inputs.previous_tag || 'v0.1.15+4082' }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: Homebrew/actions/setup-homebrew@main
+      - name: Install, upgrade and refuse a mismatched SHA-256
+        run: bash packaging/smoke/install-channels.sh

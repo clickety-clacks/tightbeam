@@ -197,6 +197,10 @@ pub enum Command {
         work_item_id: Option<String>,
         session_key: Option<String>,
     },
+    PeopleMessage {
+        verb: String,
+        params: serde_json::Value,
+    },
     HarklightSend {
         identity: Identity,
         session: String,
@@ -558,6 +562,10 @@ pub enum Command {
         target_id: String,
     },
     Transcript {
+        roles: Vec<String>,
+        no_notices: bool,
+        since: Option<String>,
+        text: bool,
         identity: Identity,
         session: Option<String>,
         name: Option<String>,
@@ -1066,6 +1074,26 @@ COMMANDS:
       --status received|applied|refused [--op-id <uuid>]
       Report what happened to a delivered Harklight answer. If uncertain, retry with
       unchanged inputs and the operation ID returned in the response.
+  people-send --json '<object>'
+      Queue a message. Omitted or empty addresses use the work-item owner.
+  people-update --json '<object>'
+      Update a conversation at its current revision.
+  people-reply --json '<object>'
+      Reply to everyone, optionally mentioning one address.
+  people-withdraw --json '<object>'
+      Withdraw a conversation as its sender.
+  people-status --json '<object>'
+      Read delivery status, waiting records and per-address outcomes.
+  people-collect --json '<object>'
+      Collect waiting operations using the configured relay session.
+  people-report --json '<object>'
+      Report the outcome of a collected operation.
+  people-event --json '<object>'
+      Submit a stable inbound event.
+  people-wait --json '<object>'
+      Wait for eligible operations as the relay, up to timeout_ms (default 15000, max 20000).
+  people-lookup --json '<object>'
+      Read the neutral conversation and its delivered revision mappings as the relay.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
@@ -1214,11 +1242,20 @@ COMMANDS:
       Compute physical breathing from one durable snapshot. Both answers exit 0.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
+             [--role <role,...>] [--no-notices] [--since <time>] [--format json|text]
       Read a session's conversation from the substrate's own rows. --name is a
       LOOKUP: it returns candidate sessions to choose from, never content.
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
+      Recover with --no-notices --format text; --role assistant reads just replies. --role repeats or
+      accepts commas (user, assistant, system, tool). --no-notices hides process
+      user notices and batches with only process-authored included members;
+      mixed agent batches stay. Filters apply before limit and paging.
+      --since accepts ISO 8601 with timezone or durations (30m, 2h, 1d).
+      JSON is the default. Text includes UTC headers and paging cursors.
+      Filters require gateway capability transcript-filters-v1; older gateways
+      fail clearly. Text alone also works with older gateways.
   execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
            [--session <key>] [--tree]
@@ -1431,6 +1468,11 @@ COMMANDS:
       what a step applied is kept if the run is interrupted. A busy session is
       reported and passed over. Run it again to continue or to pick those up;
       sessions that are already current are passed quickly.
+  onboard --first-run [--check]
+      Open Chat to Main and start the welcome conversation once per installation.
+      When TIGHTBEAM_FIRST_RUN_ONBOARDING=true, wait up to 30 minutes to open the
+      new project's Chat tab. Ctrl-C leaves the welcome marked complete.
+      --check exits 0 when enabled and pending, without changing anything.
   onboard openai|anthropic [--api-key] [--owner <user>]
       Run this machine's model-provider credential onboarding flow. Without
       --api-key this is the interactive subscription ceremony. With it the flow is
@@ -1494,6 +1536,9 @@ COMMANDS:
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
+
+  setup [--mode quick|full] [--yes] [--dry-run]
+      Set up this machine from a verified Tightbeam release.
 
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId> | --as-process <name>]
       Check the local Tightbeam installation and report its health, with each
@@ -1589,6 +1634,7 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
+    "no-notices",
     "abort",
     "admin",
     "all",
@@ -1660,6 +1706,7 @@ fn split_args(args: Vec<String>) -> Flags {
                 if matches!(
                     name,
                     "memento"
+                        | "role"
                         | "value"
                         | "kind-prefix"
                         | "kind"
@@ -2860,6 +2907,28 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 work_item_id: nonempty(flags, "work-item"),
                 session_key: nonempty(flags, "session"),
+            })
+        }
+        verb @ ("people-send" | "people-update" | "people-reply" | "people-withdraw"
+        | "people-status" | "people-collect" | "people-report" | "people-event"
+        | "people-lookup" | "people-wait") => {
+            let params = match parsed.positional.as_slice() {
+                [_, encoded]
+                    if flags.len() == 1
+                        && flags.contains_key("json")
+                        && parsed.duplicates.is_empty() =>
+                {
+                    serde_json::from_str::<serde_json::Value>(encoded)
+                        .map_err(|error| format!("invalid JSON: {error}"))?
+                }
+                _ => return Err(format!("{verb} requires --json '<object>'")),
+            };
+            if !params.is_object() {
+                return Err(format!("{verb} requires a JSON object"));
+            }
+            Ok(Command::PeopleMessage {
+                verb: verb.to_owned(),
+                params,
             })
         }
         "harklight-send" => {
@@ -4117,7 +4186,40 @@ fn parse_with_optional_catalog(
             if before.is_some() && after.is_some() {
                 return Err("transcript takes at most one of --before or --after".to_owned());
             }
+            for flag in ["role", "since", "format"] {
+                if flags.contains_key(flag) && nonempty(flags, flag).is_none() {
+                    return Err(format!("--{flag} requires a value"));
+                }
+            }
+            let roles: Vec<String> = parsed
+                .repeated
+                .get("role")
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.split(','))
+                .map(|role| role.trim().to_owned())
+                .collect();
+            if roles
+                .iter()
+                .any(|role| !["user", "assistant", "system", "tool"].contains(&role.as_str()))
+            {
+                return Err("--role requires user, assistant, system, or tool".to_owned());
+            }
+            let format = nonempty(flags, "format").unwrap_or_else(|| "json".to_owned());
+            if !["json", "text"].contains(&format.as_str()) {
+                return Err("--format requires json or text".to_owned());
+            }
+            if name.is_some() && format == "text" {
+                return Err(
+                    "--format text requires --session; use JSON name lookup to choose a session"
+                        .to_owned(),
+                );
+            }
             Ok(Command::Transcript {
+                roles,
+                no_notices: flags.contains_key("no-notices"),
+                since: nonempty(flags, "since"),
+                text: format == "text",
                 identity: identity(flags)?,
                 session,
                 name,
@@ -4626,7 +4728,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, people-send, people-update, people-reply, people-withdraw, people-status, people-collect, people-report, people-event, people-lookup, people-wait, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -7637,10 +7739,21 @@ mod tests {
                 "decision-request",
                 "decision-requests",
                 "dispatch",
+                "setup",
                 "doctor",
                 "session-diagnose",
                 "harness-process",
                 "harklight-briefings-catchup",
+                "people-send",
+                "people-update",
+                "people-reply",
+                "people-withdraw",
+                "people-status",
+                "people-collect",
+                "people-report",
+                "people-event",
+                "people-lookup",
+                "people-wait",
                 "harklight-send",
                 "harklight-progress",
                 "harklight-revise",
@@ -8920,7 +9033,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "sample-user"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, people-send, people-update, people-reply, people-withdraw, people-status, people-collect, people-report, people-event, people-lookup, people-wait, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -10142,5 +10255,48 @@ mod tests {
         assert_eq!(update.flags.get("title"), Some(&"--prefixed".to_owned()));
         assert!(!update.flags.contains_key("prefixed"));
         assert!(!update.missing_values.contains("title"));
+    }
+    #[test]
+    fn transcript_filters_accept_single_repeat_and_comma_roles() {
+        for (roles, expected) in [
+            (vec!["--role", "assistant"], vec!["assistant"]),
+            (
+                vec!["--role", "user", "--role", "assistant"],
+                vec!["user", "assistant"],
+            ),
+            (vec!["--role", "user,assistant"], vec!["user", "assistant"]),
+        ] {
+            let mut argv = vec![
+                "transcript",
+                "--session",
+                "session-key",
+                "--format",
+                "text",
+                "--no-notices",
+                "--since",
+                "30m",
+            ];
+            argv.extend(roles);
+            let command = parse(argv.into_iter().map(str::to_owned).collect()).unwrap();
+            match command {
+                Command::Transcript {
+                    roles,
+                    no_notices,
+                    since,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(roles, expected);
+                    assert!(no_notices && text);
+                    assert_eq!(since.as_deref(), Some("30m"));
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+        for flag in [vec!["--role", "bogus"], vec!["--format", "yaml"]] {
+            let mut argv = vec!["transcript", "--session", "session-key"];
+            argv.extend(flag);
+            assert!(parse(argv.into_iter().map(str::to_owned).collect()).is_err());
+        }
     }
 }

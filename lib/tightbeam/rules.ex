@@ -13,7 +13,10 @@ defmodule Tightbeam.Rules do
   A nil fact never satisfies any operator, including `ne` and `not_in`.
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
   for a caller holding no roles, and `assignment.verdicts not_in
-  ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
+  ["reviewed-clean"]` fires for an assignment with no verdicts. With the
+  `subtree_rules` switch on, `contains` is also accepted on text and list
+  facts: it holds when any item contains any of the given texts, ignoring
+  case, as plain text (no patterns). List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
   `assignment.qualifying_review_verdict_kinds`,
@@ -241,6 +244,8 @@ defmodule Tightbeam.Rules do
     "verifier.holder_is_other" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
+  # Admitted only while role-scoped rules are switched on.
+  @subtree_operators ~w(contains)
   @predicate_binding_keys ~w(
     workItemId assignmentId decisionRequestId artifact
     conditionKind conditionScope conditionAfterId conditionFactId
@@ -2272,7 +2277,12 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy", "reaction"]))
+    root_keys =
+      if Tightbeam.FeatureFlags.subtree_rules?(),
+        do: ["rule", "policy", "reaction", "reminder"],
+        else: ["rule", "policy", "reaction"]
+
+    unknown = unknown_keys(manifest, MapSet.new(root_keys))
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
@@ -2406,7 +2416,8 @@ defmodule Tightbeam.Rules do
     rules ++ policies ++ reactions
   end
 
-  defp retired_policy?(policy),
+  @doc false
+  def retired_policy?(policy),
     do:
       is_map(policy) and
         Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
@@ -3131,6 +3142,12 @@ defmodule Tightbeam.Rules do
 
   defp valid_verdict_kind?(_kind), do: false
 
+  @doc false
+  def fact_type(fact), do: Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+
+  @doc false
+  def archetype_fact?(fact), do: MapSet.member?(@archetype_facts, fact)
+
   defp validate_condition!(condition, index, fail) do
     unknown = unknown_keys(condition, @condition_keys)
 
@@ -3153,12 +3170,25 @@ defmodule Tightbeam.Rules do
       end
     end
 
-    type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+    type = fact_type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
-    unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+
+    unless op in @operators or
+             (op in @subtree_operators and Tightbeam.FeatureFlags.subtree_rules?()),
+           do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
+
     validate_value!(type, op, value, index, fail)
     %{fact: fact, op: op, value: value}
+  end
+
+  defp validate_value!(type, "contains", value, index, fail) do
+    unless type in [:string, {:list, :string}],
+      do: fail.("condition ##{index} operator contains is invalid for #{inspect(type)}")
+
+    unless (is_binary(value) or (is_list(value) and value != [])) and
+             Enum.all?(List.wrap(value), &(is_binary(&1) and &1 != "")),
+           do: fail.("condition ##{index} value must be nonempty text or a non-empty list of it")
   end
 
   defp validate_value!({:list, :string}, op, value, index, fail) do
@@ -5175,6 +5205,8 @@ defmodule Tightbeam.Rules do
   defp compare(left, "gte", right), do: left >= right
   defp compare(left, "lt", right), do: left < right
   defp compare(left, "lte", right), do: left <= right
+
+  defp compare(left, "contains", right), do: Tightbeam.SubtreeRules.contains?(left, right)
 
   defp compare(left, "in", right) when is_list(left),
     do: not MapSet.disjoint?(MapSet.new(left), MapSet.new(right))

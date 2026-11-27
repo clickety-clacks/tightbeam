@@ -140,11 +140,18 @@ defmodule GuardDispatchIdentityRefresh do
 
         fourth = publish_skill!(base, "fourth served revision")
 
-        {first_assignment, first_wake} =
-          assign_and_wake!(handlers, session.session_key, "mixed batch assignment brief")
+        # Both immediate wakes must be registered before the scheduler can batch them.
+        :ok = :sys.suspend(scheduler)
 
-        {second_assignment, second_wake} =
-          assign_and_wake!(handlers, session.session_key, "another assignment notice")
+        {{first_assignment, first_wake}, {second_assignment, second_wake}} =
+          try do
+            {
+              assign_and_wake!(handlers, session.session_key, "mixed batch assignment brief"),
+              assign_and_wake!(handlers, session.session_key, "another assignment notice")
+            }
+          after
+            :ok = :sys.resume(scheduler)
+          end
 
         assert first_assignment != second_assignment
         :ok = Wakes.fire_due(scheduler)
