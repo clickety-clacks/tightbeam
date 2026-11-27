@@ -52,8 +52,12 @@ defmodule Tightbeam.RulePreflight do
 
     {references, diagnostics} =
       case mode do
-        :installed -> Identity.with_recovery_law!(base_dir, load)
-        :pending_upgrade -> RailScopeMigration.with_preview!(base_dir, load)
+        :installed ->
+          Identity.with_recovery_law!(base_dir, load)
+
+        :pending_upgrade ->
+          {{converted, status}, legacy} = RailScopeMigration.with_preview!(base_dir, load)
+          {Enum.uniq(converted ++ legacy), status}
       end
 
     %{

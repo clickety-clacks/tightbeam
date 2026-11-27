@@ -372,8 +372,11 @@ defmodule Tightbeam.Identity do
 
   @doc false
   def with_law_revision!(base_dir, revision, load) do
-    dir = identity_dir(base_dir)
-    snapshot = Path.join(base_dir, ".identity-law-#{Tightbeam.Id.uuid4()}")
+    with_exported_identity!(identity_dir(base_dir), base_dir, revision, load)
+  end
+
+  defp with_exported_identity!(dir, scratch_parent, revision, load) do
+    snapshot = Path.join(scratch_parent, ".identity-law-#{Tightbeam.Id.uuid4()}")
     tree = Path.join(snapshot, "identity")
 
     try do
@@ -2800,12 +2803,10 @@ defmodule Tightbeam.Identity do
       end
     end)
 
-    dir
-    |> Tightbeam.RuleReferences.tree_entries!()
-    |> Tightbeam.RuleReferences.validate!()
+    :ok
   end
 
-  defp validate_revision_dir!(dir, revision) do
+  defp validate_revision_dir!(dir, revision, references \\ :skip) do
     catalog = revision_catalog!(dir, revision)
 
     Enum.each(@universal_roots, fn name ->
@@ -2838,21 +2839,24 @@ defmodule Tightbeam.Identity do
       end
     end)
 
-    dir
-    |> git_output!([
-      "ls-tree",
-      "-r",
-      "--name-only",
-      revision,
-      "--",
-      "rules",
-      "archetypes",
-      "kungfu"
-    ])
-    |> String.split("\n", trim: true)
-    |> Enum.filter(&Tightbeam.RuleReferences.source_path?/1)
-    |> Map.new(&{&1, git_show!(dir, revision, &1)})
-    |> Tightbeam.RuleReferences.validate!()
+    case references do
+      :skip ->
+        :ok
+
+      :warn ->
+        dir |> revision_reference_entries!(revision) |> Tightbeam.RuleReferences.warn_entries!()
+
+      {:compare, live} ->
+        candidate = revision_reference_entries!(dir, revision)
+        prior = revision_reference_entries!(dir, live)
+        Tightbeam.RuleReferences.validate_publication!(candidate, prior)
+    end
+  end
+
+  defp revision_reference_entries!(dir, revision) do
+    with_exported_identity!(dir, System.tmp_dir!(), revision, fn snapshot, _revision ->
+      Tightbeam.RuleReferences.tree_entries!(Path.join(snapshot, "identity"))
+    end)
   end
 
   defp refuse_reserved_substrate_skills!(dir) do
@@ -3003,11 +3007,16 @@ defmodule Tightbeam.Identity do
 
   @doc "Revalidate an exact candidate commit and advance live from its expected prior OID."
   @spec publish_live!(String.t(), map()) :: {:ok, String.t()} | {:error, map()}
-  def publish_live!(base_dir, candidate) do
+  def publish_live!(base_dir, candidate), do: publish_live!(base_dir, candidate, :enforce)
+
+  @doc false
+  def publish_rail_scope_migration!(base_dir, candidate),
+    do: publish_live!(base_dir, candidate, :warn)
+
+  defp publish_live!(base_dir, candidate, references) do
     dir = identity_dir(base_dir)
     revision = Map.fetch!(candidate, :candidate_revision)
     expected = Map.fetch!(candidate, :expected_prior)
-    validate_revision_dir!(dir, revision)
 
     with_live_revision_lock_in_dir(dir, fn actual ->
       cond do
@@ -3024,6 +3033,9 @@ defmodule Tightbeam.Identity do
            }}
 
         true ->
+          mode = if references == :warn, do: :warn, else: {:compare, actual}
+          validate_revision_dir!(dir, revision, mode)
+
           case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
             {_output, 0} ->
               case product_snapshot_for_candidate(dir, revision) do
@@ -3059,7 +3071,7 @@ defmodule Tightbeam.Identity do
   defp publish_live_unmarked!(dir) do
     with_live_revision_lock_in_dir(dir, fn live ->
       main = git_output!(dir, ["rev-parse", "main"])
-      validate_revision_dir!(dir, main)
+      validate_revision_dir!(dir, main, {:compare, live})
 
       case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
         {_output, 0} ->

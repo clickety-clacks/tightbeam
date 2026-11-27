@@ -128,11 +128,14 @@ defmodule Tightbeam.RulePreflightTest do
     write!(
       dir,
       "archetypes/exec.toml",
-      String.replace(default, ~s(name = "default"), ~s(name = "exec"))
+      String.replace(default, ~s(name = "default"), "")
     )
 
-    write!(dir, "kungfu/agentic-engineering/manifest.toml", ~s(name = "agentic-engineering"
-))
+    write!(dir, "kungfu/agentic-engineering/manifest.toml", """
+    name = "agentic-engineering"
+    root_archetype = "coder"
+    purpose = "Exercise the legacy rule conversion."
+    """)
 
     write!(dir, "kungfu/agentic-engineering/installed.toml", """
     name = "agentic-engineering"
@@ -160,11 +163,59 @@ defmodule Tightbeam.RulePreflightTest do
     assert Identity.live_revision!(base) == revision
 
     File.write!(path, String.replace(rule, ~s("exec"), ~s("missing-exec")))
+    write!(dir, "rules/orphan.toml", orphan_rule())
     commit_live!(dir)
 
-    assert_raise ArgumentError, ~r/legacy-staffing.*unknown archetype.*missing-exec/, fn ->
-      RulePreflight.run(base, :pending_upgrade)
-    end
+    report = RulePreflight.run(base, :pending_upgrade)
+    assert report.complete
+    refute report.recording_available
+
+    assert ~s(rules/legacy.toml: rule "legacy-staffing": unknown archetype "missing-exec") in report.warnings
+
+    assert ~s(rules/orphan.toml: rule "orphaned-topology": unknown kungfu "removed") in report.warnings
+
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{"status" => "complete", "result_revision" => published} =
+                 Tightbeam.Identity.RailScopeMigration.run!(base, db)
+
+        assert Identity.live_revision!(base) == published
+      end)
+
+    assert log =~ ~s(rule "legacy-staffing": unknown archetype "missing-exec")
+    assert log =~ ~s(rule "orphaned-topology": unknown kungfu "removed")
+  end
+
+  test "publishing resolves nameless archetypes by their filenames", %{base: base} do
+    dir = Path.join(base, "identity")
+    live = Identity.live_revision!(base)
+    write!(dir, "archetypes/reviewer.toml", ~s(skills = []\nwhere = ["*"]\n))
+
+    write!(
+      dir,
+      "rules/staffing.toml",
+      String.replace(orphan_rule(), "removed.worker", "reviewer")
+    )
+
+    git!(dir, ["add", "-A"])
+
+    git!(dir, [
+      "-c",
+      "user.name=test",
+      "-c",
+      "user.email=test@localhost",
+      "commit",
+      "-m",
+      "staffing"
+    ])
+
+    revision = git!(dir, ["rev-parse", "HEAD"])
+
+    assert {:ok, ^revision} =
+             Identity.publish_live!(base, %{candidate_revision: revision, expected_prior: live})
   end
 
   test "the selector uses the database marker to choose the preview", %{base: base} do
@@ -217,6 +268,64 @@ defmodule Tightbeam.RulePreflightTest do
     end
 
     assert Identity.live_revision!(base) == live
+  end
+
+  test "publication warns about carried references and refuses newly introduced ones", %{
+    base: base
+  } do
+    dir = Path.join(base, "identity")
+    write!(dir, "rules/orphan.toml", orphan_rule())
+    prior = commit_live!(dir)
+    write!(dir, "archetypes/reviewer.toml", ~s(skills = []\nwhere = ["*"]\n))
+    revision = commit!(dir)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, ^revision} =
+                 Identity.publish_live!(base, %{
+                   candidate_revision: revision,
+                   expected_prior: prior
+                 })
+      end)
+
+    assert log =~ ~s(Existing invalid rule reference: rules/orphan.toml: rule "orphaned-topology")
+
+    write!(
+      dir,
+      "rules/second.toml",
+      String.replace(orphan_rule(), "removed.worker", "other.worker")
+    )
+
+    candidate = commit!(dir)
+
+    assert_raise ArgumentError, ~r/rules\/second.toml.*unknown kungfu.*other/, fn ->
+      Identity.publish_live!(base, %{candidate_revision: candidate, expected_prior: revision})
+    end
+
+    assert Identity.live_revision!(base) == revision
+  end
+
+  test "checks literal archetypes and fact roots in reaction conditions and bindings" do
+    diagnostics =
+      RuleReferences.diagnostics(%{
+        "archetypes/broken.toml" => "name = [",
+        "rules/reaction.toml" => """
+        [[reaction]]
+        name = "reaction-references"
+        when = { op = "eq", args = [{ ref = "event.after.archetype" }, "absent-role"] }
+        bind = [
+          { name = "present", value = { ref = "facts.sessions" } },
+          { name = "threshold", value = { ref = "facts.missing_limit" } },
+          { name = "match", value = { op = "eq", args = ["absent-binding-role", { ref = "event.before.archetype" }] } }
+        ]
+        """
+      })
+
+    assert Enum.any?(diagnostics, &(&1 =~ "archetypes/broken.toml: invalid archetype TOML"))
+    assert Enum.any?(diagnostics, &(&1 =~ ~s(unknown archetype "absent-role")))
+    assert Enum.any?(diagnostics, &(&1 =~ ~s(unknown archetype "absent-binding-role")))
+    assert Enum.any?(diagnostics, &(&1 =~ ~s(unknown fact "missing_limit")))
+    refute Enum.any?(diagnostics, &(&1 =~ ~s(unknown fact "sessions")))
   end
 
   test "startup law loading warns when an orphan is already installed", %{base: base} do
@@ -274,6 +383,12 @@ defmodule Tightbeam.RulePreflightTest do
   end
 
   defp commit_live!(dir) do
+    revision = commit!(dir)
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", revision])
+    revision
+  end
+
+  defp commit!(dir) do
     git!(dir, ["add", "-A"])
 
     git!(dir, [
@@ -283,12 +398,10 @@ defmodule Tightbeam.RulePreflightTest do
       "user.email=test@localhost",
       "commit",
       "-m",
-      "legacy"
+      "fixture"
     ])
 
-    revision = git!(dir, ["rev-parse", "HEAD"])
-    git!(dir, ["update-ref", "refs/heads/tightbeam/live", revision])
-    revision
+    git!(dir, ["rev-parse", "HEAD"])
   end
 
   defp git!(dir, args) do

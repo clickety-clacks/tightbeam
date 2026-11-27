@@ -225,6 +225,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
       {:ok, {:migrated, final_report}} ->
         write_report!(report_path, final_report)
+        Tightbeam.RuleReferences.warn_legacy!(plan.entries)
         final_report
 
       {:error, error} ->
@@ -328,7 +329,8 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
     Identity.with_law_revision!(base_dir, plan.source_revision, fn scratch, revision ->
       write_identity_plan!(Path.join(scratch, "identity"), plan)
-      load.(scratch, revision)
+      result = load.(scratch, revision)
+      {result, Tightbeam.RuleReferences.legacy_archetype_diagnostics(plan.entries)}
     end)
   end
 
@@ -543,31 +545,22 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   end
 
   defp build_name_map(archetypes) do
-    bare =
-      Map.new(archetypes, fn {short, items} ->
-        flat =
-          Enum.find(items, fn item ->
-            Path.split(item.path) == ["archetypes", short <> ".toml"]
-          end)
+    Map.new(archetypes, fn {short, items} ->
+      flat =
+        Enum.find(items, fn item -> Path.split(item.path) == ["archetypes", short <> ".toml"] end)
 
-        owners = items |> Enum.map(& &1.owner) |> Enum.uniq()
+      owners = items |> Enum.map(& &1.owner) |> Enum.uniq()
 
-        qualified =
-          cond do
-            flat != nil -> Provenance.qualify(flat.owner, short)
-            length(owners) == 1 -> Provenance.qualify(hd(owners), short)
-            length(owners) > 1 -> :ambiguous
-            true -> short
-          end
+      qualified =
+        cond do
+          flat != nil -> Provenance.qualify(flat.owner, short)
+          length(owners) == 1 -> Provenance.qualify(hd(owners), short)
+          length(owners) > 1 -> :ambiguous
+          true -> short
+        end
 
-        {short, qualified}
-      end)
-
-    for {short, items} <- archetypes,
-        item <- items,
-        name = Provenance.qualify(item.owner, short),
-        into: Map.put_new(bare, "default", "default"),
-        do: {name, name}
+      {short, qualified}
+    end)
   end
 
   defp plan_archetypes(plan) do
@@ -884,8 +877,6 @@ defmodule Tightbeam.Identity.RailScopeMigration do
       values = if op in ["in", "not_in"] and is_list(value), do: value, else: [value]
       mapped = Enum.map(values, &Map.get(name_map, &1, &1))
 
-      unknown = Enum.reject(values, &Map.has_key?(name_map, &1))
-
       if :ambiguous in mapped do
         {:stop,
          "comparison #{fact} #{op} #{inspect(value)} refers to an ambiguous bare archetype name"}
@@ -923,9 +914,6 @@ defmodule Tightbeam.Identity.RailScopeMigration do
           {:kungfu, _} when not participant? ->
             {:stop,
              "comparison #{fact} #{op} #{inspect(value)} is a foreign archetype comparison on a record fact"}
-
-          {:kungfu, _} when unknown != [] ->
-            {:stop, "comparison #{fact} #{op} names unknown archetype(s) #{inspect(unknown)}"}
 
           {:kungfu, _} ->
             preserve_participant_comparison(fact, op, value, mapped, foreign, allowed, rewrites)
@@ -1342,7 +1330,10 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   defp publish_identity!(_base_dir, prior, candidate) when prior == candidate, do: :ok
 
   defp publish_identity!(base_dir, prior, candidate) do
-    case Identity.publish_live!(base_dir, %{candidate_revision: candidate, expected_prior: prior}) do
+    case Identity.publish_rail_scope_migration!(base_dir, %{
+           candidate_revision: candidate,
+           expected_prior: prior
+         }) do
       {:ok, _revision} -> :ok
       {:error, error} -> raise ArgumentError, "identity publication failed: #{inspect(error)}"
     end
