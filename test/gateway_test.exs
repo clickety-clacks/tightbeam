@@ -9785,6 +9785,72 @@ defmodule Tightbeam.GatewayTest do
     refute encoded =~ "family"
   end
 
+  test "both model pickers expose a partial catalog without changing its rows", ctx do
+    start_supervised!({DB, path: ":memory:", name: DB}, id: :org_picker_db)
+    :ok = Placement.ensure_schema(DB)
+    Archetypes.load!(role_test_base("picker-completeness"))
+    host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", host)
+    put_host_catalog(host, "claude", ["first-model", "second-model"])
+
+    opts =
+      Tightbeam.Wire.Router.init(
+        db: ctx.db,
+        session_status: fn key -> Gateway.session_status(key, ctx.db) end
+      )
+
+    get = fn path ->
+      conn =
+        Plug.Test.conn(:get, path)
+        |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.device.token}")
+        |> Tightbeam.Wire.Router.call(opts)
+
+      assert conn.status == 200
+      JSON.decode!(conn.resp_body)
+    end
+
+    complete_org = get.("/api/org-options")
+    complete_session = get.("/api/session-status?sessionKey=k1")["modelCatalog"]
+    refute Map.has_key?(complete_org, "modelCatalogPartial")
+    refute Map.has_key?(complete_session, "partial")
+    assert complete_session["available"] == true
+
+    assert Enum.map(complete_org["models"][host]["claude"], & &1["model"]) ==
+             ["first-model", "second-model"]
+
+    assert Enum.map(complete_session["models"], & &1["model"]) ==
+             ["first-model", "second-model"]
+
+    replace_catalog_state(fn state ->
+      put_in(state.entries[{host, "claude"}][:omitted], 2)
+    end)
+
+    catalog_pid = Process.whereis(ModelCatalog)
+    :erlang.trace(catalog_pid, true, [:receive])
+
+    partial_org =
+      try do
+        get.("/api/org-options")
+      after
+        :erlang.trace(catalog_pid, false, [:receive])
+      end
+
+    assert_receive {:trace, ^catalog_pid, :receive, {:"$gen_call", _, :snapshot}}
+    refute_received {:trace, ^catalog_pid, :receive, {:"$gen_call", _, _}}
+
+    assert partial_org ==
+             Map.put(complete_org, "modelCatalogPartial", %{host => %{"claude" => true}})
+
+    assert get.("/api/session-status?sessionKey=k1")["modelCatalog"] ==
+             Map.put(complete_session, "partial", true)
+
+    stale_host_catalog(host, "claude")
+    assert get.("/api/org-options") == partial_org
+
+    assert get.("/api/session-status?sessionKey=k1")["modelCatalog"] ==
+             Map.put(complete_session, "partial", true)
+  end
+
   # THE WIRE SEAM, both directions. The ruling names the wire as a seam that
   # carries NAMED FIELDS: a 1M selection that crossed as the bare string
   # `claude-fable-5[1m]`, with nothing saying which part was the context, left

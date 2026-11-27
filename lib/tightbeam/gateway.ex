@@ -3470,9 +3470,24 @@ defmodule Tightbeam.Gateway do
     base_dir =
       Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
 
+    snapshot = ModelCatalog.snapshot()
+    catalog = Map.new(snapshot, fn {key, {entries, _health}} -> {key, entries} end)
+    models = picker_models(base_dir, Tightbeam.DB, catalog)
+
+    partial =
+      Enum.reduce(snapshot, %{}, fn
+        {{host, harness}, {_entries, {:incomplete, _freshness, _omitted}}}, acc ->
+          if is_list(get_in(models, [host, harness])),
+            do: Map.update(acc, host, %{harness => true}, &Map.put(&1, harness, true)),
+            else: acc
+
+        _, acc ->
+          acc
+      end)
+
     %{
       harnesses: Enum.map(Harness.all(), & &1.wire_name()),
-      models: picker_models(base_dir, Tightbeam.DB),
+      models: models,
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
       archetypes:
         Enum.map(Archetypes.names(), fn name ->
@@ -3480,14 +3495,13 @@ defmodule Tightbeam.Gateway do
           %{name: a.name, where: a.where, defaults: wire_defaults(a.defaults)}
         end)
     }
+    |> maybe_put(:modelCatalogPartial, if(partial != %{}, do: partial))
   end
 
   # %{host => %{harness => [model]}} — the shape both pickers (org-options) and
   # inspect publish. Hosts come from the registry, so a host whose catalog is
   # still degraded appears with an empty list rather than vanishing.
-  defp picker_models(base_dir, db) do
-    catalog = ModelCatalog.get()
-
+  defp picker_models(base_dir, db, catalog \\ ModelCatalog.get()) do
     base_dir
     |> Placement.hosts(db)
     |> Map.keys()
@@ -3565,7 +3579,7 @@ defmodule Tightbeam.Gateway do
             preferences -> Enum.map(preferences, &wire_preference/1)
           end
 
-        {catalog, _health} = ModelCatalog.get(session.host, session.harness, ModelCatalog)
+        {catalog, catalog_health} = ModelCatalog.get(session.host, session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
         runtime_projection = live_runtime_projection(db, session)
         runtime_model = runtime_projection.model
@@ -3666,19 +3680,21 @@ defmodule Tightbeam.Gateway do
             canChangeVerbosity: false,
             readOnlyStatus: false
           },
-          modelCatalog: %{
-            available: true,
-            # Client Model decoder REQUIRES id + provider + ref (id is the
-            # stable identity; ref doubles as it here). One row per vendor
-            # model — including each context variant, which is part of the
-            # identity — with the effort tier owned by the reasoning picker.
-            # `model`/`context`/`efforts` are the row's named fields.
-            models:
-              Enum.map(
-                catalog,
-                &Map.merge(%{name: &1.name, provider: session.provider}, wire_model(&1))
-              )
-          },
+          modelCatalog:
+            %{
+              available: true,
+              # Client Model decoder REQUIRES id + provider + ref (id is the
+              # stable identity; ref doubles as it here). One row per vendor
+              # model — including each context variant, which is part of the
+              # identity — with the effort tier owned by the reasoning picker.
+              # `model`/`context`/`efforts` are the row's named fields.
+              models:
+                Enum.map(
+                  catalog,
+                  &Map.merge(%{name: &1.name, provider: session.provider}, wire_model(&1))
+                )
+            }
+            |> maybe_put(:partial, if(match?({:incomplete, _, _}, catalog_health), do: true)),
           runtimeStatus: runtime_projection.status,
           runtimeChanges: Tightbeam.RuntimeChanges.status(db, session_key),
           lastTurnError: last_turn_error,

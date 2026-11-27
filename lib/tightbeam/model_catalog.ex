@@ -73,6 +73,15 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
+  @doc "Return the cached entries and health for every inventory from one snapshot."
+  @spec snapshot(GenServer.server()) :: %{key() => {[entry()], health()}}
+  def snapshot(server \\ __MODULE__) do
+    case safe_call(server, :snapshot) do
+      {:ok, inventories} -> inventories
+      :unavailable -> %{}
+    end
+  end
+
   @doc "Return one host's cached harness inventory and its freshness and completeness health."
   @spec get(String.t(), String.t(), GenServer.server()) :: {[entry()], health()}
   def get(host, harness, server) when is_binary(host) and is_binary(harness) do
@@ -351,6 +360,17 @@ defmodule Tightbeam.ModelCatalog do
   def handle_call(:get, _from, state) do
     {:reply, Map.new(state.entries, fn {key, cache} -> {key, cache.entries} end),
      enqueue_background({:info, :refresh_due}, state)}
+  end
+
+  def handle_call(:snapshot, _from, state) do
+    now = now_ms(state)
+
+    inventories =
+      Map.new(state.entries, fn {key, cache} ->
+        {key, {cache.entries, health(cache, now, state.ttl_ms)}}
+      end)
+
+    {:reply, inventories, enqueue_background({:info, :refresh_due}, state)}
   end
 
   def handle_call({:get, key}, _from, state) do
