@@ -132,6 +132,8 @@ data shows whether the event path ever drops anything.
 
 ## Verification
 
+Release database fixtures in `test/fixtures/releases` come from the corresponding release packages.
+
 - The Evidence section of
   `test/support/fixtures/kungfu/agentic-engineering/guidance/engineering-core.md` decides which
   tests to add or require. Established tests and gates, including CI
