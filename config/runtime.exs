@@ -1,6 +1,20 @@
 import Config
 
 if config_env() != :test do
+  case System.get_env("TIGHTBEAM_HARKLIGHT_ITEM_ID_CAPTURE") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :harklight_item_id_capture, true
+    _ -> raise ArgumentError, "TIGHTBEAM_HARKLIGHT_ITEM_ID_CAPTURE must be true or false"
+  end
+
+  case System.get_env("TIGHTBEAM_HARKLIGHT_ITEM_ID_MATCHING") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :harklight_item_id_matching, true
+    _ -> raise ArgumentError, "TIGHTBEAM_HARKLIGHT_ITEM_ID_MATCHING must be true or false"
+  end
+
   case System.get_env("TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL") do
     nil -> :ok
     "true" -> config :tightbeam, :execution_map_turn_backfill_enabled, true

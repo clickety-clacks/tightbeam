@@ -11,6 +11,7 @@ defmodule Tightbeam.HarklightWakes do
     DB,
     ErrorDiagnostic,
     HarklightFailures,
+    HarklightItemIds,
     HarklightLifecycle,
     Org,
     Placement,
@@ -233,6 +234,7 @@ defmodule Tightbeam.HarklightWakes do
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
          :ok <- ensure_pending_open_schema(db),
+         :ok <- HarklightItemIds.ensure_schema(db),
          :ok <- Outage.ensure_schema(db),
          :ok <- HarklightFailures.ensure_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
@@ -2629,9 +2631,11 @@ defmodule Tightbeam.HarklightWakes do
   def handle_call({:feed_start, handle}, from, state) do
     result =
       if valid_worker?(state, handle, from) do
-        case feed_start(state.db, handle) do
-          {:ok, start} -> {:ok, state.db, start}
-          _ -> {:error, "capture_unavailable"}
+        with :ok <- ensure_feed_item_ids(state.db, handle) do
+          case feed_start(state.db, handle) do
+            {:ok, start} -> {:ok, state.db, start}
+            _ -> {:error, "capture_unavailable"}
+          end
         end
       else
         {:error, "listener_fenced"}
@@ -3433,6 +3437,10 @@ defmodule Tightbeam.HarklightWakes do
     end
   rescue
     _ -> finish(manager, handle, "listener_failed")
+  end
+
+  defp ensure_feed_item_ids(db, handle) do
+    if HarklightItemIds.enabled?(), do: HarklightItemIds.ensure_handle(db, handle), else: :ok
   end
 
   defp record_feed_ready(manager, handle, delays) do
@@ -4557,8 +4565,18 @@ defmodule Tightbeam.HarklightWakes do
            "SELECT senderId FROM harklight_wake_requests WHERE handle=?1 AND messageId=?2",
            [handle, item_id]
          ) do
-      [[sender]] -> {:ok, sender, item_id}
-      [] -> registered_migrated_item(txn, handle, item_id, item)
+      [[sender]] ->
+        {:ok, sender, item_id}
+
+      [] ->
+        if HarklightItemIds.enabled?() do
+          case HarklightItemIds.migrated_in_txn(txn, item_id) do
+            {:ok, ^handle, sender, local_id} -> {:ok, sender, local_id}
+            _ -> :unregistered
+          end
+        else
+          registered_migrated_item(txn, handle, item_id, item)
+        end
     end
   end
 

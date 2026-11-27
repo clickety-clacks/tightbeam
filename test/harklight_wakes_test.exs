@@ -5,7 +5,9 @@ defmodule Tightbeam.HarklightWakesTest do
     DB,
     Ephemeral,
     HarklightAgentActions,
+    HarklightBounces,
     HarklightFollows,
+    HarklightItemIds,
     HarklightLifecycle,
     HarklightReceipts,
     HarklightSend,
@@ -1266,6 +1268,188 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightSend.settle(db, %{call | params: %{message_id: "request"}}, runner: runner)
 
     assert_received {:retried_op, ^key}
+  end
+
+  test "opaque matching persists bindings from markless pages and captures replies and answers without aliases",
+       %{db: db} do
+    enable_item_id_capture!(db)
+    migrated_from_01!(db)
+    refute HarklightItemIds.enabled?()
+    assert {:ok, 1} = HarklightItemIds.capture_status(db)
+
+    item = %{
+      "item_id" => "opaque-item",
+      "sender" => "sender",
+      "session" => @handle,
+      "revision" => 1
+    }
+
+    migration_row = Map.put(item, "legacy_message_id", "request")
+
+    runner = fn
+      ["messages"] ->
+        {JSON.encode!(%{
+           "messages" => [
+             %{migration_row | "sender" => "another-sender", "item_id" => "wrong-sender"},
+             %{migration_row | "session" => "another-session", "item_id" => "wrong-session"}
+           ],
+           "next_page" => "next"
+         }), 0}
+
+      ["messages", "--page", "next"] ->
+        {JSON.encode!(%{"messages" => [migration_row]}), 0}
+    end
+
+    assert {:ok, _} = HarklightBounces.read_pass(db, runner: runner)
+    assert {:ok, 0} = HarklightItemIds.capture_status(db)
+    Application.delete_env(:tightbeam, :harklight_item_id_capture)
+    enable_item_id_matching!(db)
+    assert :ok = HarklightItemIds.ensure_handle(db, @handle)
+
+    assert {:ok, [[@handle, "sender", "request", "opaque-item"]]} =
+             DB.query(db, "SELECT handle,senderId,messageId,itemId FROM harklight_item_ids")
+
+    assert :ok =
+             HarklightWakes.capture_feed(
+               db,
+               @handle,
+               3,
+               [
+                 %{"kind" => "message", "rev" => 1, "data" => item},
+                 feed_chat(2, "opaque-item", "opaque-reply"),
+                 %{
+                   "kind" => "message",
+                   "rev" => 3,
+                   "data" =>
+                     Map.put(item, "terminal", %{
+                       "state" => "answered",
+                       "at_ms" => 50,
+                       "answer" => nil
+                     })
+                 }
+               ],
+               :live
+             )
+
+    assert {:ok, [["request", "discussion"], ["request", "terminal"]]} =
+             DB.query(
+               db,
+               "SELECT messageId,entryKind FROM harklight_wake_entries ORDER BY feedCursor"
+             )
+  end
+
+  test "opaque account view uses the saved binding and preserves write refusals", %{
+    db: db,
+    call: call
+  } do
+    enable_item_id_capture!(db)
+    migrated_from_01!(db)
+    import_item_id!(db)
+    Application.delete_env(:tightbeam, :harklight_item_id_capture)
+    enable_item_id_matching!(db)
+    call = %{call | params: %{message_id: "request", title: "Revised", base_revision: 1}}
+
+    runner = fn
+      ["message-get", "--item-id", "opaque-item"] ->
+        account_item("sender")
+
+      ["journal-id"] ->
+        {JSON.encode!(%{"kind" => "journal", "journal_id" => "journal"}), 0}
+
+      ["revise", "--item-id", "opaque-item" | args] ->
+        key = List.last(args)
+
+        {JSON.encode!(%{
+           "kind" => "refused",
+           "operation" => "revise",
+           "op_id" => key,
+           "status" => 404,
+           "error" => "not_found"
+         }), 2}
+    end
+
+    assert %{outcome: "refused", code: "not_found"} =
+             HarklightSend.change_request(db, call, "revise", runner: runner)
+
+    assert %{outcome: "refused", code: "harklight_result_mismatch"} =
+             HarklightSend.change_request(db, call, "revise",
+               runner: fn ["message-get", "--item-id", "opaque-item"] ->
+                 account_item("another-sender")
+               end
+             )
+
+    for {status, token} <- [{2, "ambiguous_message_id"}, {5, "unsupported"}] do
+      assert %{outcome: "refused", code: ^token} =
+               HarklightSend.change_request(db, call, "revise",
+                 runner: fn ["message-get", "--item-id", "opaque-item"] ->
+                   {JSON.encode!(%{
+                      "kind" => "refused",
+                      "operation" => "message-get",
+                      "error" => token
+                    }), status}
+                 end
+               )
+    end
+
+    wrong_session = put_in(call.params[:handle], "5365335c-b23c-4f66-8248-2c6f3bd7c03f")
+
+    assert %{outcome: "refused", code: "harklight_session_mismatch"} =
+             HarklightSend.change_request(db, wrong_session, "revise",
+               runner: fn _ -> flunk("query after wrong session") end
+             )
+  end
+
+  test "an uncaptured old message refuses before querying an Agent", %{db: db, call: call} do
+    enable_item_id_matching!(db)
+    migrated_from_01!(db)
+    call = %{call | params: %{message_id: "request"}}
+
+    assert %{
+             code: "harklight_item_id_unmapped",
+             outcome: "refused",
+             message_id: "request",
+             reason: reason
+           } =
+             HarklightSend.change_request(db, call, "retract",
+               runner: fn _ -> flunk("uncaptured ID must not reach the Agent") end
+             )
+
+    assert reason =~ "message request"
+    assert HarklightLifecycle.lookup_change(db, "request") == nil
+  end
+
+  defp enable_item_id_capture!(db) do
+    Application.put_env(:tightbeam, :harklight_item_id_capture, true)
+    on_exit(fn -> Application.delete_env(:tightbeam, :harklight_item_id_capture) end)
+    assert :ok = HarklightItemIds.ensure_schema(db)
+  end
+
+  defp enable_item_id_matching!(db) do
+    Application.put_env(:tightbeam, :harklight_item_id_matching, true)
+    on_exit(fn -> Application.delete_env(:tightbeam, :harklight_item_id_matching) end)
+    assert :ok = HarklightItemIds.ensure_schema(db)
+  end
+
+  defp import_item_id!(db) do
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               HarklightItemIds.import_in_txn(txn, [
+                 %{
+                   "item_id" => "opaque-item",
+                   "legacy_message_id" => "request",
+                   "sender" => "sender",
+                   "session" => @handle
+                 }
+               ])
+             end)
+  end
+
+  defp account_item(sender) do
+    {JSON.encode!(%{
+       "rev" => 1,
+       "view" => "account",
+       "item" => %{"item_id" => "opaque-item", "sender" => sender, "as" => "knock"}
+     }), 0}
   end
 
   test "a missing migrated Progress item preserves the definite Agent refusal", %{
@@ -5537,6 +5721,38 @@ defmodule Tightbeam.HarklightWakesTest do
       # The refused prepare is not logged by the stand-in, as a real one prints usage only.
       assert pending_calls(agent) == ["listen --follow --session #{@handle} --snapshot"]
       assert {:ok, []} = pending_row(db)
+    end
+
+    test "an unmapped item leaves a stopped pending read and checkpoint intact", %{db: db} do
+      migrated_from_01!(db)
+      enable_item_id_matching!(db)
+      opened_under_02!(db)
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO harklight_pending_opens(handle,rev,token,stopped) VALUES(?1,30,'T1',1)",
+                 [@handle]
+               )
+
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+
+      assert eventually(fn ->
+               case DB.query(db, "SELECT lastError FROM harklight_wake_handles") do
+                 {:ok, [[reason]]} when is_binary(reason) ->
+                   reason =~ "harklight_item_id_unmapped"
+
+                 _ ->
+                   false
+               end
+             end)
+
+      assert {:ok, [[30, "T1", 0, 1]]} = pending_row(db)
+      assert {:ok, [[0]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      assert {:ok, []} = DB.query(db, "SELECT eventId FROM harklight_wake_entries")
+      assert pending_calls(agent) == []
     end
 
     test "a finished conversation is not opened", %{db: db} do

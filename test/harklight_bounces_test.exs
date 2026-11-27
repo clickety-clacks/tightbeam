@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarklightBouncesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, HarklightBounces, HarklightWakes, Model, Org, Placement}
+  alias Tightbeam.{DB, HarklightBounces, HarklightItemIds, HarklightWakes, Model, Org, Placement}
 
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
   @other_handle "0a2a4b2e-6a52-4c2b-9d52-2f5cc1a0f4aa"
@@ -314,6 +314,52 @@ defmodule Tightbeam.HarklightBouncesTest do
 
     assert {:ok, %{woken: ["adv-1"]}} = read(db, [migrated])
     assert [["server-item"]] = wake_rows(db, "SELECT itemId FROM harklight_bounces")
+  end
+
+  test "a captured item routes bounces without legacy fields on either path", %{
+    db: db,
+    main: main
+  } do
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "legacy-9")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_send_operations SET payload=json_remove(payload,'$.request.protocol')"
+             )
+
+    Application.put_env(:tightbeam, :harklight_item_id_capture, true)
+
+    on_exit(fn ->
+      Application.delete_env(:tightbeam, :harklight_item_id_capture)
+      Application.delete_env(:tightbeam, :harklight_item_id_matching)
+    end)
+
+    assert :ok = HarklightItemIds.ensure_schema(db)
+
+    migrated = item("server-item", @handle, extra: %{"legacy_message_id" => "legacy-9"})
+    %{runner: runner} = ack_runner(pages: %{nil => {[migrated], nil}})
+    assert {:ok, %{woken: []}} = HarklightBounces.read_pass(db, runner: runner)
+    assert {:ok, 0} = HarklightItemIds.capture_status(db)
+    Application.delete_env(:tightbeam, :harklight_item_id_capture)
+    Application.put_env(:tightbeam, :harklight_item_id_matching, true)
+
+    assert :ok =
+             HarklightWakes.capture_feed(
+               db,
+               @handle,
+               5,
+               [advisory_frame(5, "server-item", "adv-opaque-feed")],
+               :live
+             )
+
+    assert {:ok, %{woken: ["adv-opaque-read"]}} =
+             read(db, [item("server-item", @handle, advisories: [advisory("adv-opaque-read")])])
+
+    assert [["adv-opaque-feed", "server-item"], ["adv-opaque-read", "server-item"]] =
+             wake_rows(db, "SELECT advisoryId,itemId FROM harklight_bounces ORDER BY advisoryId")
   end
 
   test "possible_contradictions notices are ignored and never acknowledged", ctx do
