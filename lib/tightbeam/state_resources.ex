@@ -2632,6 +2632,7 @@ defmodule Tightbeam.StateResources do
   def encode_item(resource, item, catalog)
       when is_binary(resource) and is_map(item) and is_map(catalog) do
     resource = Map.get(@item_resource_aliases, resource, resource)
+    item = normalize_item_projection(resource, item)
     fields = Map.fetch!(@item_field_order, resource)
     fields = conditional_fields!(resource, fields, item)
     exact_item_keys!(resource, item, fields)
@@ -2645,6 +2646,20 @@ defmodule Tightbeam.StateResources do
 
     "{" <> encoded <> "}"
   end
+
+  defp normalize_item_projection("work items", %{"effectiveCommitRefs" => refs} = item)
+       when is_list(refs) do
+    # Remote/ref are stored for provenance. The REST reference has only repo/commit.
+    refs =
+      Enum.map(refs, fn
+        ref when is_map(ref) -> Map.drop(ref, ["remote", "ref"])
+        ref -> ref
+      end)
+
+    Map.put(item, "effectiveCommitRefs", refs)
+  end
+
+  defp normalize_item_projection(_resource, item), do: item
 
   @doc false
   def item_shape_complete?(resource, item) when is_binary(resource) and is_map(item) do
