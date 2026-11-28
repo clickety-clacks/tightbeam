@@ -1822,13 +1822,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert first.status == 200
     cursor = JSON.decode!(first.resp_body)["page"]["newestCursor"]
 
-    one_field =
-      cursor
-      |> Base.url_decode64!(padding: false)
-      |> JSON.decode!()
-      |> Map.put("tuple", [1])
-      |> JSON.encode!()
-      |> Base.url_encode64(padding: false)
+    additive = rewrite_cursor(cursor, &Map.put(&1, "futureMetadata", %{"producer" => 2}))
+    prior_format = get(ctx, path <> "?after=" <> cursor, outsider_device.token)
+    new_format = get(ctx, path <> "?after=" <> additive, outsider_device.token)
+    assert prior_format.status == 200
+    assert new_format.status == 200
+    assert JSON.decode!(prior_format.resp_body) == JSON.decode!(new_format.resp_body)
+
+    one_field = rewrite_cursor(additive, &Map.put(&1, "tuple", [1]))
 
     response = get(ctx, path <> "?after=" <> one_field, outsider_device.token)
     assert response.status == 400
@@ -2782,6 +2783,19 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert JSON.decode!(observer_with_admin_cursor.resp_body)["items"] ==
              JSON.decode!(anonymous_sessions.resp_body)["items"]
+
+    additive = rewrite_cursor(org_session_cursor, &Map.put(&1, "futureMetadata", true))
+
+    from_additive =
+      get_without_authorization(ctx, "/api/sessions?limit=1&after=#{additive}")
+
+    assert from_additive.status == 200
+    assert from_additive.resp_body == observer_with_admin_cursor.resp_body
+
+    unbound = rewrite_cursor(additive, &Map.delete(&1, "principalId"))
+    refused = get_without_authorization(ctx, "/api/sessions?limit=1&after=#{unbound}")
+    assert refused.status == 400
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_cursor"
 
     anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
     org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
@@ -3934,6 +3948,16 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     prior = get(ctx, "/api/work-items?state=open&limit=2&before=" <> URI.encode_www_form(cursor))
     assert prior.status == 200
     assert JSON.decode!(prior.resp_body)["items"] ++ page["items"] == items
+    additive = rewrite_cursor(cursor, &Map.put(&1, "futureMetadata", %{"producer" => 2}))
+    newer_prior = get(ctx, "/api/work-items?state=open&limit=2&before=" <> additive)
+    assert newer_prior.status == 200
+    assert JSON.decode!(newer_prior.resp_body) == JSON.decode!(prior.resp_body)
+
+    bad_version = rewrite_cursor(additive, &Map.put(&1, "version", "1"))
+    invalid = get(ctx, "/api/work-items?state=open&before=" <> bad_version)
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_cursor"
+
     mismatch = get(ctx, "/api/work-items?state=closed&before=" <> URI.encode_www_form(cursor))
     assert mismatch.status == 400
     assert JSON.decode!(mismatch.resp_body)["error"]["code"] == "invalid_cursor"
@@ -3949,6 +3973,157 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     empty = get(ctx, "/api/work-items?ownerUserId=absent-owner")
     assert empty.status == 200
     assert JSON.decode!(empty.resp_body)["items"] == []
+  end
+
+  test "scoped work item list and detail project an accepted extended commit reference", ctx do
+    creator = ctx.admin_session.session_key
+    item_id = ctx.work_item.id
+    neighbour = projection_fixture_item(ctx, creator, 10, "flynn")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET createdBySession=?, createdAt=? WHERE id=?",
+               [
+                 creator,
+                 20,
+                 item_id
+               ]
+             )
+
+    reference = %{
+      "repo" => "testhost:/tmp/projection-evidence",
+      "commit" => String.duplicate("a", 40),
+      "remote" => "https://example.invalid/projection/repo.git",
+      "ref" => "refs/heads/main"
+    }
+
+    holder = ctx.assignment.holderKey
+
+    assert %{attest: %{id: attest_id, commitRefs: [^reference]}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "session:" <> holder,
+               principal: {:session, holder},
+               session_key: holder,
+               params: %{
+                 assignment_id: ctx.assignment.id,
+                 kind: "progress",
+                 note: "Recorded commit evidence",
+                 commit_refs: [reference]
+               }
+             })
+
+    query = "/api/work-items?asUser=flynn&createdBySession=" <> URI.encode_www_form(creator)
+    list = get(ctx, query <> "&limit=2&tail=true", "tbc_core_detail")
+    detail = get(ctx, "/api/work-items/" <> item_id <> "?asUser=flynn", "tbc_core_detail")
+    assert list.status == 200
+    assert detail.status == 200
+
+    assert %{"items" => [first, item], "page" => page} = JSON.decode!(list.resp_body)
+    assert first["id"] == neighbour
+    assert item == JSON.decode!(detail.resp_body)["item"]
+    assert item["effectiveCommitRefs"] == [Map.take(reference, ["repo", "commit"])]
+    refute Map.has_key?(page, "partial")
+
+    assert {:ok, [[stored]]} =
+             DB.query(ctx.db, "SELECT commitRefs FROM attests WHERE id=?", [attest_id])
+
+    assert JSON.decode!(stored) == [reference]
+  end
+
+  test "scoped work item pages advance across mixed, trailing and all unprojectable rows", ctx do
+    reader = outsider_device(ctx)
+    creator = ctx.admin_session.session_key
+    oldest = projection_fixture_item(ctx, creator, 10, reader.user_id)
+    bad_older = projection_fixture_item(ctx, creator, 20, reader.user_id)
+    bad_newer = projection_fixture_item(ctx, creator, 30, reader.user_id)
+    newest = projection_fixture_item(ctx, creator, 40, reader.user_id)
+    _hidden = projection_fixture_item(ctx, creator, 25, "flynn")
+    _other_creator = projection_fixture_item(ctx, nil, 35, reader.user_id)
+
+    # REAL values satisfy the storage range constraint but cannot encode as an
+    # integer priority. This corruption is independent of commit metadata.
+    for id <- [bad_older, bad_newer] do
+      assert {:ok, _} = DB.query(ctx.db, "INSERT INTO work_item_priorities VALUES (?, 4.5)", [id])
+    end
+
+    query = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+
+    read_page = fn suffix ->
+      response = get(ctx, query <> suffix, reader.token)
+      assert response.status == 200
+      assert %{"items" => items, "page" => page} = JSON.decode!(response.resp_body)
+      {Enum.map(items, & &1["id"]), page}
+    end
+
+    assert {[first, last], %{"partial" => true}} = read_page.("&limit=4&tail=true")
+    assert [first, last] == [oldest, newest]
+
+    assert {[old], %{"oldestCursor" => oldest_cursor}} = read_page.("&limit=1")
+    assert old == newest
+
+    assert {[rendered],
+            %{
+              "partial" => true,
+              "oldestCursor" => mixed_cursor,
+              "newestCursor" => mixed_newest,
+              "hasMoreBefore" => true
+            }} =
+             read_page.("&limit=3&tail=true")
+
+    assert rendered == newest
+    assert mixed_cursor != oldest_cursor
+
+    assert {[],
+            %{
+              "partial" => true,
+              "oldestCursor" => bad_cursor,
+              "newestCursor" => bad_newest,
+              "hasMoreBefore" => true
+            }} =
+             read_page.("&limit=2&before=" <> URI.encode_www_form(oldest_cursor))
+
+    assert is_binary(bad_newest)
+    assert bad_newest != mixed_newest
+    assert mixed_cursor == bad_cursor
+    assert bad_cursor != oldest_cursor
+
+    assert {[prior], prior_page} =
+             read_page.("&limit=2&before=" <> URI.encode_www_form(bad_cursor))
+
+    assert prior == oldest
+    refute prior_page["hasMoreBefore"]
+    refute Map.has_key?(prior_page, "partial")
+
+    assert {[leading], %{"partial" => true, "newestCursor" => trailing_cursor}} =
+             read_page.("&limit=3&tail=false")
+
+    assert leading == oldest
+    assert trailing_cursor == bad_newest
+
+    assert {[following], following_page} =
+             read_page.("&limit=2&after=" <> URI.encode_www_form(trailing_cursor))
+
+    assert following == newest
+    refute Map.has_key?(following_page, "partial")
+
+    detail = get(ctx, "/api/work-items/" <> bad_older, reader.token)
+    assert detail.status == 500
+    assert JSON.decode!(detail.resp_body)["error"]["code"] == "projection_invalid"
+  end
+
+  defp projection_fixture_item(ctx, creator, created_at, owner) do
+    id = "wi_" <> Tightbeam.Id.uuid4()
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO work_items(id,title,ownerUserId,createdBySession,createdAt) VALUES (?,?,?,?,?)",
+               [id, "Projection fixture", owner, creator, created_at]
+             )
+
+    id
   end
 
   test "work item reads with a recorded landing succeed on detail, list page and change notice",
@@ -4045,6 +4220,92 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.any?(notices, fn notice ->
              inspect(notice) =~ "work_item.updated" and inspect(notice) =~ "Example/Repo"
            end)
+
+    # Simulate the same record written by a newer producer. Its added metadata
+    # remains stored, while the existing list and detail emit the same fields.
+    additive = Map.put(input.payload, "futureMetadata", %{"producer" => 2})
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE condition_facts SET payload=? WHERE kind=? AND scope=?", [
+               JSON.encode!(additive),
+               input.kind,
+               input.scope
+             ])
+
+    newer_list = get(ctx, "/api/work-items?state=open")
+    newer_detail = get(ctx, "/api/work-items/" <> ctx.work_item.id)
+    assert newer_list.status == 200
+    assert newer_detail.status == 200
+    assert JSON.decode!(newer_list.resp_body) == JSON.decode!(list.resp_body)
+    assert JSON.decode!(newer_detail.resp_body) == JSON.decode!(detail.resp_body)
+
+    # Match via the merge commit but reject an invalid consumed head commit.
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE condition_facts SET payload=? WHERE kind=? AND scope=?", [
+               JSON.encode!(Map.put(additive, "headCommit", "invalid")),
+               input.kind,
+               input.scope
+             ])
+
+    invalid = get(ctx, "/api/work-items/" <> ctx.work_item.id)
+    assert invalid.status == 500
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "projection_invalid"
+  end
+
+  test "REST attest pages and notices keep their wire shape with additive stored commit refs",
+       ctx do
+    attest_id = "att_additive_refs"
+    core = %{"repo" => "Example/Repo", "commit" => String.duplicate("a", 40)}
+
+    enriched =
+      Map.merge(core, %{
+        "remote" => "https://example.invalid/repo.git",
+        "ref" => "refs/heads/main",
+        "futureMetadata" => %{"producer" => 2}
+      })
+
+    query!(
+      ctx.db,
+      "INSERT INTO attests(id,assignmentId,kind,bySession,commitRefs,ts) VALUES (?,?,'progress',?,?,?)",
+      [attest_id, ctx.assignment.id, ctx.assignment.holderKey, JSON.encode!([core]), 1]
+    )
+
+    path = "/api/attests/" <> attest_id
+    list_path = "/api/attests?assignmentId=" <> ctx.assignment.id
+    old_detail = get(ctx, path)
+    old_list = get(ctx, list_path)
+    assert old_detail.status == 200
+    assert old_list.status == 200
+    item = JSON.decode!(old_detail.resp_body)["item"]
+    assert item["commitRefs"] == [core]
+
+    query!(ctx.db, "UPDATE attests SET commitRefs=? WHERE id=?", [
+      JSON.encode!([enriched]),
+      attest_id
+    ])
+
+    new_detail = get(ctx, path)
+    new_list = get(ctx, list_path)
+    assert new_detail.status == 200
+    assert new_list.status == 200
+    assert new_detail.resp_body == old_detail.resp_body
+    assert new_list.resp_body == old_list.resp_body
+
+    row = StateResources.query_attest(ctx.db, attest_id)
+    assert row.commit_refs == [enriched]
+    notice = Publisher.committed_notice("attest.filed", row, %{})
+    assert JSON.decode!(Publisher.encode_wire_notice(notice, %{}))["payload"] == item
+
+    invalid = Map.put(enriched, "commit", 42)
+
+    query!(ctx.db, "UPDATE attests SET commitRefs=? WHERE id=?", [
+      JSON.encode!([invalid]),
+      attest_id
+    ])
+
+    refused = get(ctx, path)
+    assert refused.status == 500
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "projection_invalid"
   end
 
   test "B2 missing priority sidecar preserves configured and fallback defaults across reads and notices",
@@ -4599,6 +4860,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(#{table})")
       assert Enum.any?(columns, fn [_cid, name | _rest] -> name == "recordEventIds" end)
     end
+  end
+
+  defp rewrite_cursor(cursor, edit) do
+    cursor
+    |> Base.url_decode64!(padding: false)
+    |> JSON.decode!()
+    |> edit.()
+    |> JSON.encode!()
+    |> Base.url_encode64(padding: false)
   end
 
   defp get(ctx, path, bearer \\ nil, headers \\ []) do

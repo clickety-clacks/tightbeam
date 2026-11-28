@@ -171,13 +171,28 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                ]
            })["options"] == [%{"label" => "allow"}, %{"label" => "deny"}]
 
+    assert {:ok, _} =
+             DB.query(db, "UPDATE decision_requests SET options=? WHERE id=?", [
+               JSON.encode!([
+                 "legacy",
+                 %{"label" => "approve", "display" => %{"color" => "green"}},
+                 %{"label" => "deny", "effect" => "deny", "description" => "new producer"}
+               ]),
+               statute.id
+             ])
+
+    reloaded = Escalation.raw_by_id(db, statute.id)
+
+    assert StateResources.decision_request(reloaded)["options"] ==
+             [%{"label" => "legacy"}, %{"label" => "approve"}, %{"label" => "deny"}]
+
     for malformed <- [
           :invalid_json,
           "allow",
           [1],
           [%{"label" => 1}],
-          [%{"label" => "allow", "effect" => "defer"}],
-          [%{"label" => "allow", "unexpected" => "field"}]
+          [%{"label" => "allow", "effect" => "defer", "unexpected" => "field"}],
+          [%{"unexpected" => "field"}]
         ] do
       assert_raise ArgumentError, ~r/projection_invalid/, fn ->
         StateResources.decision_request(%{statute | options: malformed})

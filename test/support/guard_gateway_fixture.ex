@@ -43,7 +43,9 @@ defmodule Tightbeam.GuardGatewayFixture do
       ORDER BY name
       """)
 
-    drop_revisions = Enum.map_join(revision_triggers, "\n", fn [name, _] -> "DROP TRIGGER #{name};" end)
+    drop_revisions =
+      Enum.map_join(revision_triggers, "\n", fn [name, _] -> "DROP TRIGGER #{name};" end)
+
     restore_revisions = Enum.map_join(revision_triggers, ";\n", fn [_, sql] -> sql end)
 
     :ok = Tightbeam.DB.execute(db, "PRAGMA foreign_keys=OFF")

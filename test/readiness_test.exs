@@ -157,6 +157,25 @@ defmodule Tightbeam.ReadinessTest do
     assert statement in Readiness.render(summary, config)
   end
 
+  test "readiness reports incomplete model coverage while usable rows remain ready", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+    {entries, :fresh} = live("m")
+
+    incomplete = catalog!(%{module.wire_name() => {entries, {:incomplete, :fresh, 2}}})
+    complete = catalog!(%{module.wire_name() => {entries, :fresh}})
+
+    summary = Readiness.summary(ctx.config, incomplete)
+    assert summary.runnable?
+
+    assert Enum.any?(Readiness.render(summary, ctx.config), fn line ->
+             line =~ "model catalog is incomplete (2 unreadable lines)"
+           end)
+
+    complete_lines = ctx.config |> Readiness.summary(complete) |> Readiness.render(ctx.config)
+    refute Enum.any?(complete_lines, &(&1 =~ "model catalog is incomplete"))
+  end
+
   test "a ready install with NO service manager says so — the install is not finished", ctx do
     # The gap that cost a production host its uptime and its crash log (testhost-a,
     # 2026-08-05): a gateway running foreground in tmux does not survive a

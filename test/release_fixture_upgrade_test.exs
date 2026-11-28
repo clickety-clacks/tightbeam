@@ -88,7 +88,12 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
     on_exit(fn -> File.rm_rf!(tmp) end)
     runtime = Tightbeam.GuardRuntimeFixture.prepare!(tmp, @boot)
     File.mkdir_p!(runtime.base)
-    File.write!(Path.join(runtime.base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
+
+    File.write!(
+      Path.join(runtime.base, ".soak-arena"),
+      "tightbeam recovery acceptance arena v1\n"
+    )
+
     Tightbeam.RecoveryFixture.place_adapter!(runtime.base, seed_credential: false)
     runtime
   end
@@ -103,7 +108,10 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
   end
 
   defp boot(runtime, db, interrupt?, accounts? \\ true) do
-    stamp = if File.exists?(db), do: db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim(), else: ""
+    stamp =
+      if File.exists?(db),
+        do: db |> sqlite("SELECT shape FROM schema_stamp") |> String.trim(),
+        else: ""
 
     env =
       runtime.env ++
@@ -119,21 +127,26 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
       :stderr_to_stdout,
       {:line, 8192},
       {:args, runtime.args ++ [stamp]},
-      {:env, Enum.map(env, fn
-        {key, nil} -> {String.to_charlist(key), false}
-        {key, value} -> {String.to_charlist(key), String.to_charlist(value)}
-      end)}
+      {:env,
+       Enum.map(env, fn
+         {key, nil} -> {String.to_charlist(key), false}
+         {key, value} -> {String.to_charlist(key), String.to_charlist(value)}
+       end)}
     ])
   end
 
   defp await_checkpoint(port, output \\ []) do
     receive do
-      {^port, {:data, {:eol, "UPGRADE_TRANSACTION_OPEN " <> pid}}} -> pid
+      {^port, {:data, {:eol, "UPGRADE_TRANSACTION_OPEN " <> pid}}} ->
+        pid
+
       {^port, {:data, {_, line}}} ->
         await_checkpoint(port, [line | output])
 
       {^port, {:exit_status, status}} ->
-        flunk("first boot exited with #{status} before migration checkpoint:\n#{boot_log(output)}")
+        flunk(
+          "first boot exited with #{status} before migration checkpoint:\n#{boot_log(output)}"
+        )
     after
       30_000 -> flunk("first boot did not enter the migration transaction:\n#{boot_log(output)}")
     end
@@ -162,7 +175,8 @@ defmodule Tightbeam.ReleaseFixtureUpgradeTest do
   defp intact?(db), do: sqlite(db, "PRAGMA integrity_check; PRAGMA foreign_key_check;") == "ok\n"
 
   defp provider_schema?(db) do
-    sqlite(db, "SELECT name FROM sqlite_schema WHERE name = 'provider_account_schema_stamp'") != ""
+    sqlite(db, "SELECT name FROM sqlite_schema WHERE name = 'provider_account_schema_stamp'") !=
+      ""
   end
 
   defp preserved_rows(db) do

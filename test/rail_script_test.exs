@@ -52,6 +52,7 @@ defmodule Tightbeam.RailScriptTest do
         DROP TRIGGER IF EXISTS execution_map_revision_decision_requests_delete;
         DROP TABLE assignments;
         """)
+
       assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
     end
 

@@ -76,16 +76,16 @@ defmodule Tightbeam.PeopleMessages do
   end
 
   defp dispatch_enabled(
-        db,
-        %{
-          verb: "people-" <> command,
-          principal: {:session, session},
-          transport_session_key: session,
-          params: params
-        },
-        relay
-      )
-      when is_map(params) do
+         db,
+         %{
+           verb: "people-" <> command,
+           principal: {:session, session},
+           transport_session_key: session,
+           params: params
+         },
+         relay
+       )
+       when is_map(params) do
     cond do
       command in @relay_commands and session != relay ->
         error("forbidden", "people-message relay permission required")
@@ -131,7 +131,8 @@ defmodule Tightbeam.PeopleMessages do
     end
   end
 
-  defp dispatch_enabled(_db, _call, _relay), do: error("forbidden", "authenticated session required")
+  defp dispatch_enabled(_db, _call, _relay),
+    do: error("forbidden", "authenticated session required")
 
   defp mutate(txn, kind, session, params, relay) do
     key = params["key"]

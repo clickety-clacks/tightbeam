@@ -40,7 +40,9 @@ defmodule Tightbeam.ModelCatalog do
             when is_tuple(reason) and tuple_size(reason) == 2 and
                    elem(reason, 0) in [:needs_onboarding, :credential_status_unavailable]
 
-  @type health :: :fresh | :stale | {:unavailable, term()}
+  @type freshness :: :fresh | :stale
+  @type usable_health :: freshness() | {:incomplete, freshness(), pos_integer()}
+  @type health :: usable_health() | {:unavailable, term()}
   @type key :: {host :: String.t(), harness :: String.t()}
   @typedoc """
   One vendor model on one host, as fields. `family` and `context` are the
@@ -71,7 +73,16 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
-  @doc "Return one host's cached harness inventory and its freshness health."
+  @doc "Return the cached entries and health for every inventory from one snapshot."
+  @spec snapshot(GenServer.server()) :: %{key() => {[entry()], health()}}
+  def snapshot(server \\ __MODULE__) do
+    case safe_call(server, :snapshot) do
+      {:ok, inventories} -> inventories
+      :unavailable -> %{}
+    end
+  end
+
+  @doc "Return one host's cached harness inventory and its freshness and completeness health."
   @spec get(String.t(), String.t(), GenServer.server()) :: {[entry()], health()}
   def get(host, harness, server) when is_binary(host) and is_binary(harness) do
     _ = Harness.parse!(harness)
@@ -111,7 +122,7 @@ defmodule Tightbeam.ModelCatalog do
           harness: String.t(),
           provider: String.t(),
           entry: entry(),
-          health: :fresh | :stale
+          health: usable_health()
         }
 
   @doc """
@@ -351,6 +362,17 @@ defmodule Tightbeam.ModelCatalog do
      enqueue_background({:info, :refresh_due}, state)}
   end
 
+  def handle_call(:snapshot, _from, state) do
+    now = now_ms(state)
+
+    inventories =
+      Map.new(state.entries, fn {key, cache} ->
+        {key, {cache.entries, health(cache, now, state.ttl_ms)}}
+      end)
+
+    {:reply, inventories, enqueue_background({:info, :refresh_due}, state)}
+  end
+
   def handle_call({:get, key}, _from, state) do
     answer =
       case state.entries[key] do
@@ -547,24 +569,18 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   defp background_info({:catalog_refresh, key, {:ok, entries}}, state) do
+    background_info({:catalog_refresh, key, {:ok, entries, 0}}, state)
+  end
+
+  defp background_info({:catalog_refresh, key, {:ok, entries, omitted}}, state) do
     case terminal_incident(state, key) do
       %{id: incident_id} ->
         cache = terminal_cache(Map.get(state.entries, key, new_cache()), incident_id)
         {:noreply, put_in(state, [:entries, key], cache)}
 
       nil ->
-        now = now_ms(state)
         recheck? = match?(%{recheck: true}, state.entries[key])
-
-        cache = %{
-          entries: entries,
-          derived_at: now,
-          attempted_at: now,
-          reason: nil,
-          refreshing: false,
-          recheck: false
-        }
-
+        cache = successful_cache(entries, omitted, now_ms(state))
         state = put_in(state, [:entries, key], cache)
         {:noreply, maybe_recheck(state, key, recheck?)}
     end
@@ -643,7 +659,7 @@ defmodule Tightbeam.ModelCatalog do
   defp optional_harness_absence?(_harness, _reason), do: false
 
   defp background_info({:catalog_recovery, key, incident_id, fact_id, result}, state) do
-    {outcome, entries} = recovery_outcome(result)
+    {outcome, entries, omitted} = recovery_outcome(result)
 
     resolution =
       TerminalCredentialFailure.finish_recovery(state.db, incident_id, fact_id, outcome)
@@ -651,16 +667,7 @@ defmodule Tightbeam.ModelCatalog do
     state =
       case {resolution, entries} do
         {{:resolved, _incident}, [_ | _]} ->
-          now = now_ms(state)
-
-          put_in(state, [:entries, key], %{
-            entries: entries,
-            derived_at: now,
-            attempted_at: now,
-            reason: nil,
-            refreshing: false,
-            recheck: false
-          })
+          put_in(state, [:entries, key], successful_cache(entries, omitted, now_ms(state)))
 
         {{:open, incident, successor}, _} ->
           state =
@@ -847,6 +854,18 @@ defmodule Tightbeam.ModelCatalog do
 
   defp new_cache do
     %{entries: [], derived_at: nil, attempted_at: nil, reason: :not_derived, refreshing: false}
+  end
+
+  defp successful_cache(entries, omitted, now) do
+    %{
+      entries: entries,
+      omitted: omitted,
+      derived_at: now,
+      attempted_at: now,
+      reason: nil,
+      refreshing: false,
+      recheck: false
+    }
   end
 
   # What the probe sees is the OWNING host: its base_dir (where its credential
@@ -1049,7 +1068,12 @@ defmodule Tightbeam.ModelCatalog do
     do: {:unavailable, reason}
 
   defp health(cache, now, ttl) do
-    if now - cache.derived_at < ttl, do: :fresh, else: :stale
+    freshness = if now - cache.derived_at < ttl, do: :fresh, else: :stale
+
+    case cache do
+      %{omitted: omitted} when omitted > 0 -> {:incomplete, freshness, omitted}
+      _ -> freshness
+    end
   end
 
   # Reads retry credential failures on a shorter interval than the catalog TTL.
@@ -1102,11 +1126,15 @@ defmodule Tightbeam.ModelCatalog do
 
   defp final_401?(_reason), do: false
 
-  defp recovery_outcome({:ok, [_ | _] = entries}), do: {"catalog_published", entries}
-  defp recovery_outcome({:ok, []}), do: {"empty_catalog", []}
+  defp recovery_outcome({:ok, [_ | _] = entries}), do: {"catalog_published", entries, 0}
+
+  defp recovery_outcome({:ok, [_ | _] = entries, omitted}),
+    do: {"catalog_published", entries, omitted}
+
+  defp recovery_outcome({:ok, []}), do: {"empty_catalog", [], 0}
 
   defp recovery_outcome({:error, reason}) do
-    {if(final_401?(reason), do: "final_401", else: "transient_failure"), []}
+    {if(final_401?(reason), do: "final_401", else: "transient_failure"), [], 0}
   end
 
   defp safe_call(server, request) do

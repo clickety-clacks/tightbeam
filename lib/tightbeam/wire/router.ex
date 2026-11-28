@@ -1623,11 +1623,12 @@ defmodule Tightbeam.Wire.Router do
            true <- cursor != "",
            {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
            {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
-           true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
            true <- payload["version"] == @d1_cursor_version,
            true <- payload["route"] == route and payload["resource"] == resource,
            true <- payload["direction"] == direction,
            true <- payload["filters"] == d1_filter_fingerprint(filters),
+           true <- payload["principalKind"] in ~w(observer session user user-admin),
+           true <- is_binary(payload["principalId"]) and payload["principalId"] != "",
            true <-
              payload["principalKind"] != state_cursor_principal_kind(principal) or
                payload["principalId"] != Map.get(principal, :id),
@@ -1667,7 +1668,6 @@ defmodule Tightbeam.Wire.Router do
   defp state_cursor_decode(cursor, direction, route, resource, filters, principal, tuple_valid?) do
     with {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
          {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
-         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
          true <- payload["version"] == @d1_cursor_version,
          true <- payload["route"] == route and payload["resource"] == resource,
          true <- payload["direction"] == direction,
@@ -2719,6 +2719,9 @@ defmodule Tightbeam.Wire.Router do
         resource when resource in [:assignments, :wakes, :turns] ->
           d1_core_state_collection(conn, request, boundary, principal, spec)
 
+        :work_items ->
+          d1_work_item_collection(conn, request, boundary, principal, spec)
+
         :decision_requests ->
           {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
           d1_send(conn, 200, d1_collection_envelope(spec, items, page))
@@ -2726,24 +2729,6 @@ defmodule Tightbeam.Wire.Router do
         resource ->
           result =
             cond do
-              spec.resource == "work items" ->
-                page =
-                  StateResources.query_work_item_page(
-                    db(conn),
-                    request.filters,
-                    %{rest_principal: principal},
-                    boundary,
-                    request.limit
-                  )
-
-                %{
-                  items: Enum.map(page.rows, &StateResources.work_item/1),
-                  flags: %{
-                    has_more_before: page.has_more_before,
-                    has_more_after: page.has_more_after
-                  }
-                }
-
               resource == :harness_processes ->
                 if D1Read.visible?(resource, principal.is_admin) do
                   page =
@@ -2789,6 +2774,45 @@ defmodule Tightbeam.Wire.Router do
     error in [ArgumentError, KeyError, MatchError] ->
       reraise_overload(error, __STACKTRACE__)
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_work_item_collection(conn, request, boundary, principal, spec) do
+    page =
+      StateResources.query_work_item_page(
+        db(conn),
+        request.filters,
+        %{rest_principal: principal},
+        boundary,
+        request.limit
+      )
+
+    result = %{
+      items: Enum.map(page.rows, &StateResources.work_item/1),
+      flags: %{has_more_before: page.has_more_before, has_more_after: page.has_more_after}
+    }
+
+    {selected, page} = d1_keyset_page(result, request, principal, spec, conn)
+
+    {encoded, partial?} =
+      Enum.reduce(selected, {[], false}, fn item, {items, partial?} ->
+        try do
+          {[d1_encode(:work_items, item) | items], partial?}
+        rescue
+          error in [ArgumentError, KeyError, MatchError] ->
+            reraise_overload(error, __STACKTRACE__)
+
+            Logger.warning("Scoped work item projection omitted a row",
+              work_item_id: item["id"],
+              projection_error: error.__struct__
+            )
+
+            {items, true}
+        end
+      end)
+
+    encoded_items = encoded |> Enum.reverse() |> Enum.join(",")
+    page = if partial?, do: Map.put(page, :partial, true), else: page
+    d1_send(conn, 200, d1_encoded_collection_envelope(spec, encoded_items, page))
   end
 
   defp d1_core_state_collection(conn, request, boundary, principal, spec) do
@@ -3445,7 +3469,6 @@ defmodule Tightbeam.Wire.Router do
   defp d1_decode_cursor(cursor, direction, request, principal, spec, _conn) do
     with {:ok, payload_bytes} <- Base.url_decode64(cursor, padding: false),
          {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
-         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
          true <- payload["version"] == @d1_cursor_version,
          true <- payload["route"] == spec.route and payload["resource"] == spec.resource,
          true <-
@@ -3557,10 +3580,6 @@ defmodule Tightbeam.Wire.Router do
     Base.url_encode64(payload, padding: false)
   end
 
-  defp d1_cursor_keys do
-    Enum.sort(~w(direction filters principalId principalKind resource route tuple version))
-  end
-
   defp d1_filter_fingerprint(filters),
     do:
       filters
@@ -3593,6 +3612,12 @@ defmodule Tightbeam.Wire.Router do
   defp d1_collection_envelope(spec, items, page) do
     encoded_items = Enum.map_join(items, ",", &d1_encode(d1_resource(spec), &1))
 
+    d1_encoded_collection_envelope(spec, encoded_items, page)
+  end
+
+  defp d1_encoded_collection_envelope(spec, encoded_items, page) do
+    partial = if Map.get(page, :partial), do: ",\"partial\":true", else: ""
+
     "{\"schemaVersion\":1,\"resource\":" <>
       JSON.encode!(spec.resource) <>
       ",\"items\":[" <>
@@ -3602,7 +3627,8 @@ defmodule Tightbeam.Wire.Router do
       ",\"newestCursor\":" <>
       JSON.encode!(page.newest) <>
       ",\"hasMoreBefore\":" <>
-      JSON.encode!(page.before) <> ",\"hasMoreAfter\":" <> JSON.encode!(page.after) <> "}}"
+      JSON.encode!(page.before) <>
+      ",\"hasMoreAfter\":" <> JSON.encode!(page.after) <> partial <> "}}"
   end
 
   defp d1_detail_envelope(spec, item),

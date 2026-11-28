@@ -49,6 +49,7 @@ defmodule Tightbeam.Readiness do
           adapter: :present | {:missing, String.t()} | {:unknown, atom()},
           binary: :runnable | {:broken, term()} | {:unknown, atom()},
           credential: :live | {:absent, atom()} | {:unknown, term()} | {:degraded, term()},
+          catalog_health: ModelCatalog.health(),
           model: :selectable | :unset | {:unroutable, Unroutable.t()} | :unknown,
           runnable?: boolean()
         }
@@ -165,6 +166,7 @@ defmodule Tightbeam.Readiness do
       adapter: adapter,
       binary: binary,
       credential: credential,
+      catalog_health: health,
       model: model,
       # An UNKNOWN adapter or an UNKNOWN binary does not veto. Boot establishes
       # both with local checks that cannot see a satellite, and this module's rule
@@ -289,6 +291,7 @@ defmodule Tightbeam.Readiness do
     ["READY: #{ready} can run turns."] ++
       terminal_statement_lines(summary) ++
       Enum.flat_map(blocked, &harness_lines/1) ++
+      catalog_completeness_lines(rows) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       supervision_lines()
@@ -302,6 +305,7 @@ defmodule Tightbeam.Readiness do
     ] ++
       terminal_statement_lines(summary) ++
       Enum.flat_map(rows, &harness_lines/1) ++
+      catalog_completeness_lines(rows) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
@@ -311,6 +315,12 @@ defmodule Tightbeam.Readiness do
     case Map.get(summary, :terminal_credentials, []) do
       [] -> []
       incidents -> [""] ++ Enum.map(incidents, & &1.canonical_statement)
+    end
+  end
+
+  defp catalog_completeness_lines(rows) do
+    for %{catalog_health: {:incomplete, _freshness, omitted}} = row <- rows do
+      "#{row.harness} on #{row.host}: model catalog is incomplete (#{omitted} unreadable lines)."
     end
   end
 

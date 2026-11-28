@@ -3,6 +3,7 @@ defmodule Tightbeam.CursorRegistrationTest do
 
   alias Tightbeam.Harness
   alias Tightbeam.Harness.Cursor
+  alias Tightbeam.{Model, ModelCatalog, Readiness}
 
   setup do
     previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
@@ -226,6 +227,58 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     assert {:error, {:cursor_catalog_probe_failed, 42, "denied"}} =
              Cursor.fetch_catalog(put_in(base_state, [:options, :sh], fn _ -> {"denied", 42} end))
+  end
+
+  test "Cursor keeps readable model rows and reports an incomplete listing" do
+    target = cursor_target()
+    parent = self()
+    host = target.host_name
+    valid = "auto - Auto (default)\nnew-model - New Model - Beta\n"
+    mixed = "Account model access may vary.\nmissing-name - \n" <> valid
+
+    for {output, expected_health} <- [
+          {mixed, {:incomplete, :fresh, 2}},
+          {valid, :fresh}
+        ] do
+      sh = fn argv ->
+        send(parent, {:catalog_probe, argv})
+        {"Available models\n\n" <> output, 0}
+      end
+
+      name = :"cursor_catalog_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {ModelCatalog,
+         name: name,
+         base_dir: target.base_dir,
+         hosts: fn -> %{host => target.host_config} end,
+         now: fn -> 0 end,
+         credential_status: fn
+           :cursor -> :onboarded
+           _ -> {:needs_onboarding, :missing}
+         end,
+         credential_kind: :api_key,
+         sh: sh,
+         find_executable: target.find_executable,
+         realpath: target.realpath,
+         sha256: target.sha256},
+        id: name
+      )
+
+      assert_receive {:catalog_probe, _argv}
+      assert :ok = Readiness.await_settled(name, 1_000, 5)
+      assert {entries, ^expected_health} = ModelCatalog.get(host, "cursor", name)
+
+      assert Enum.map(entries, &{&1.family, &1.display_name}) == [
+               {"auto", "Auto"},
+               {"new-model", "New Model - Beta"}
+             ]
+
+      assert {:ok, %{health: ^expected_health}} =
+               ModelCatalog.route(host, "cursor", Model.new("auto"), name)
+
+      refute_receive {:catalog_probe, _argv}
+    end
   end
 
   test "Cursor integrity failures remain typed at probe and launch" do

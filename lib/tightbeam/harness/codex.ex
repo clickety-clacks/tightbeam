@@ -102,7 +102,8 @@ defmodule Tightbeam.Harness.Codex do
       {:error,
        %{
          code: "codex_sandbox_unavailable",
-         message: "Codex is disabled on this machine until Tightbeam setup can verify its sandbox."
+         message:
+           "Codex is disabled on this machine until Tightbeam setup can verify its sandbox."
        }}
     else
       {:ok, opts}
