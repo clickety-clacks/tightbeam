@@ -207,6 +207,7 @@ defmodule Tightbeam.GatewayTest do
 
   @archetype_reference_writers [
     {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
+    {:tour_guide_seed, "lib/tightbeam/first_run_tour.ex", "Org.create_in_txn"},
     {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
     {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_in_txn"},
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
