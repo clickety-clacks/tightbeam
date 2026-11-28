@@ -4022,7 +4022,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert %{"items" => [first, item], "page" => page} = JSON.decode!(list.resp_body)
     assert first["id"] == neighbour
-    assert Map.delete(item, "hasActiveTurn") == JSON.decode!(detail.resp_body)["item"]
+    assert Map.delete(item, "activeTurnSeqs") == JSON.decode!(detail.resp_body)["item"]
     assert item["effectiveCommitRefs"] == [Map.take(reference, ["repo", "commit"])]
     refute Map.has_key?(page, "partial")
 
@@ -4048,20 +4048,20 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
 
-    flags = fn ->
+    active_turns = fn ->
       response = get(ctx, path)
       assert response.status == 200
 
       Map.new(
         JSON.decode!(response.resp_body)["items"],
-        &{&1["id"], Map.fetch!(&1, "hasActiveTurn")}
+        &{&1["id"], Map.fetch!(&1, "activeTurnSeqs")}
       )
     end
 
-    assert flags.() == %{id => false, other => false}
+    assert active_turns.() == %{id => [], other => []}
     assert {:ok, running} = Ledger.claim_next(ctx.db, creator, "active-turn-fixture")
     assert running.seq == ctx.turn_seq
-    assert flags.() == %{id => true, other => false}
+    assert active_turns.() == %{id => [running.seq], other => []}
 
     for limit <- [1, 2] do
       {response, trace} = traced_get(ctx, path <> "&limit=#{limit}", ctx.token)
@@ -4083,15 +4083,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     # A job ref without a recorded assignment does not qualify.
     query!(ctx.db, "UPDATE turns SET assignmentId=NULL WHERE seq=?", [running.seq])
-    assert flags.() == %{id => false, other => false}
+    assert active_turns.() == %{id => [], other => []}
 
     query!(ctx.db, "UPDATE turns SET assignmentId=? WHERE seq=?", [ctx.assignment.id, running.seq])
 
     query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [other, running.seq])
-    assert flags.() == %{id => false, other => false}
+    assert active_turns.() == %{id => [], other => []}
 
     query!(ctx.db, "UPDATE turns SET jobRef=NULL WHERE seq=?", [running.seq])
-    assert flags.() == %{id => true, other => false}
+    assert active_turns.() == %{id => [running.seq], other => []}
 
     query!(
       ctx.db,
@@ -4103,25 +4103,84 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert partial.status == 200
 
     assert %{
-             "items" => [%{"id" => ^other, "hasActiveTurn" => false}],
+             "items" => [%{"id" => ^other, "activeTurnSeqs" => []}],
              "page" => %{"partial" => true}
            } = JSON.decode!(partial.resp_body)
 
     query!(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?", [id])
 
+    query!(
+      ctx.db,
+      "INSERT OR REPLACE INTO work_item_priorities(workItemId,priority) VALUES (?,4.5)",
+      [other]
+    )
+
+    assert %{
+             "items" => [%{"id" => ^id, "activeTurnSeqs" => [seq]}],
+             "page" => %{"partial" => true}
+           } = JSON.decode!(get(ctx, path).resp_body)
+
+    assert seq == running.seq
+    query!(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?", [other])
+
     detail = get(ctx, "/api/work-items/" <> id)
     assert detail.status == 200
-    refute Map.has_key?(JSON.decode!(detail.resp_body)["item"], "hasActiveTurn")
+    refute Map.has_key?(JSON.decode!(detail.resp_body)["item"], "activeTurnSeqs")
     legacy = get(ctx, "/api/work-items")
     assert legacy.status == 200
-    refute Enum.any?(JSON.decode!(legacy.resp_body)["items"], &Map.has_key?(&1, "hasActiveTurn"))
+    refute Enum.any?(JSON.decode!(legacy.resp_body)["items"], &Map.has_key?(&1, "activeTurnSeqs"))
 
     assert :ok =
              Ledger.finish(ctx.db, running.seq, "delivered", nil,
                owner_lease: running.owner_lease
              )
 
-    assert flags.() == %{id => false, other => false}
+    assert active_turns.() == %{id => [], other => []}
+  end
+
+  test "creator-scoped list omits an overflowing active-turn set", ctx do
+    creator = ctx.admin_session.session_key
+    id = ctx.work_item.id
+    query!(ctx.db, "UPDATE work_items SET createdBySession=? WHERE id=?", [creator, id])
+
+    query!(
+      ctx.db,
+      """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 33
+      )
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,createdAt)
+      SELECT ?1, 'active-turn-overflow-' || n, 'process:test', 'fixture', ?2, ?3, 'running', n
+      FROM numbers
+      """,
+      [creator, ctx.assignment.id, id]
+    )
+
+    path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+    {response, trace} = traced_get(ctx, path, ctx.token)
+    assert response.status == 200
+    assert %{"items" => [%{"id" => ^id} = row], "page" => page} = JSON.decode!(response.resp_body)
+    refute Map.has_key?(row, "activeTurnSeqs")
+    refute Map.has_key?(page, "partial")
+
+    assert [{:sql_query, sql, params}] =
+             Enum.filter(trace, fn
+               {:sql_query, sql, _} -> String.contains?(sql, "INDEXED BY turns_pending")
+               _ -> false
+             end)
+
+    assert {:ok, [[^id, first] | _] = candidates} = DB.query(ctx.db, sql, params)
+    assert length(candidates) == 33
+
+    query!(ctx.db, "UPDATE turns SET status='delivered' WHERE seq=?", [first])
+
+    assert %{"items" => [%{"id" => ^id, "activeTurnSeqs" => retained}]} =
+             JSON.decode!(get(ctx, path).resp_body)
+
+    expected = candidates |> Enum.map(&List.last/1) |> Enum.sort() |> List.delete(first)
+    assert retained == expected
+    assert length(retained) == 32
   end
 
   test "scoped work item pages advance across mixed, trailing and all unprojectable rows", ctx do

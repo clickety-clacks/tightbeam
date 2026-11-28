@@ -14,6 +14,7 @@ defmodule Tightbeam.StateResources do
   }
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken", "rowSchemaRevision"])
+  @active_turn_seq_limit 32
 
   @session_select """
   SELECT sessions.sessionKey, sessions.displayName, sessions.kind, sessions.orderIndex,
@@ -340,7 +341,7 @@ defmodule Tightbeam.StateResources do
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
       integers: ~w(createdInTurnSeq createdAt priority rowVersion),
-      booleans: ~w(isBug createdContextKnown started hasActiveTurn),
+      booleans: ~w(isBug createdContextKnown started),
       nullable:
         ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
@@ -498,6 +499,7 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"work items", "activeTurnSeqs"} => {:array, :positive_integer, :preserve},
     {"work items", "holders"} => {:array, :string, :sort},
     {"work items", "attestCounts"} => :json,
     {"work items", "verdictCounts"} => :json,
@@ -734,19 +736,33 @@ defmodule Tightbeam.StateResources do
     active =
       query.(
         """
-        SELECT DISTINCT a.workItemId
-        FROM turns AS t INDEXED BY turns_pending
-        CROSS JOIN assignments AS a
-        WHERE t.status IN ('queued', 'running') AND t.status = 'running'
-          AND a.id = t.assignmentId
-          AND a.workItemId IN (SELECT value FROM json_each(?1))
-          AND (t.jobRef IS NULL OR t.jobRef = a.workItemId)
+        SELECT workItemId, seq
+        FROM (
+          SELECT a.workItemId, t.seq,
+                 ROW_NUMBER() OVER (PARTITION BY a.workItemId ORDER BY t.seq) AS position
+          FROM turns AS t INDEXED BY turns_pending
+          CROSS JOIN assignments AS a
+          WHERE t.status IN ('queued', 'running') AND t.status = 'running'
+            AND a.id = t.assignmentId
+            AND a.workItemId IN (SELECT value FROM json_each(?1))
+            AND (t.jobRef IS NULL OR t.jobRef = a.workItemId)
+        )
+        WHERE position <= ?2
         """,
-        [ids]
+        [ids, @active_turn_seq_limit + 1]
       )
-      |> MapSet.new(fn [id] -> id end)
+      |> Enum.group_by(fn [id, _seq] -> id end, fn [_id, seq] -> seq end)
 
-    Enum.map(rows, &Map.put(&1, :has_active_turn, MapSet.member?(active, &1.id)))
+    Enum.map(rows, fn row ->
+      case Map.get(active, row.id, []) do
+        seqs when length(seqs) <= @active_turn_seq_limit ->
+          Map.put(row, :active_turn_seqs, Enum.sort(seqs))
+
+        _overflow ->
+          # An incomplete set could let an end event clear the pill too soon.
+          row
+      end
+    end)
   end
 
   defp attach_work_item_summaries(txn, rows, selection, call) do
@@ -2789,8 +2805,8 @@ defmodule Tightbeam.StateResources do
   defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
     do: fields ++ ["waitReason"]
 
-  defp conditional_fields!("work items", fields, %{"hasActiveTurn" => _}),
-    do: fields ++ ["hasActiveTurn"]
+  defp conditional_fields!("work items", fields, %{"activeTurnSeqs" => _}),
+    do: fields ++ ["activeTurnSeqs"]
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 
