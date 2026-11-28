@@ -1105,7 +1105,7 @@ defmodule Tightbeam.Wire.Router do
              conn,
              spec.resource,
              :request_validation,
-             fn -> state_detail_request(query) end
+             fn -> core_detail_request(query, spec.resource) end
            ),
          {:ok, key} <-
            core_detail_operation(
@@ -1120,6 +1120,11 @@ defmodule Tightbeam.Wire.Router do
           not_found_when_empty?: true
         )
       else
+        principal =
+          if spec.resource == "work items" and query["activeTurnSeqs"] == ["true"],
+            do: Map.put(principal, :include_active_turn, true),
+            else: principal
+
         core_detail_item(conn, spec, key, principal)
       end
     else
@@ -1134,6 +1139,11 @@ defmodule Tightbeam.Wire.Router do
       reraise_overload(error, __STACKTRACE__)
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp core_detail_request(%{"activeTurnSeqs" => ["true"]} = query, "work items"),
+    do: state_detail_request(Map.delete(query, "activeTurnSeqs"))
+
+  defp core_detail_request(query, _resource), do: state_detail_request(query)
 
   defp core_detail_item(conn, spec, key, principal) do
     with :ok <- core_detail_probe(conn, spec.resource, :lookup),
@@ -2297,6 +2307,7 @@ defmodule Tightbeam.Wire.Router do
     call = %{
       principal: core_detail_principal(principal),
       rest_principal: principal,
+      include_active_turn: Map.get(principal, :include_active_turn, false),
       params: %{}
     }
 

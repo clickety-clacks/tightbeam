@@ -4063,6 +4063,29 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert running.seq == ctx.turn_seq
     assert active_turns.() == %{id => [running.seq], other => []}
 
+    detail_path = "/api/work-items/" <> id <> "?activeTurnSeqs=true"
+    {detail, trace} = traced_get(ctx, detail_path, ctx.token)
+    assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["item"]["activeTurnSeqs"] == [running.seq]
+
+    assert Enum.count(trace, fn
+             {:sql_query, sql, _} -> String.contains?(sql, "INDEXED BY turns_pending")
+             _ -> false
+           end) == 1
+
+    assert {:sql_query, lookup_sql, lookup_params} =
+             Enum.find(trace, fn
+               {:sql_query, sql, _} -> String.contains?(sql, "FROM work_items AS wi")
+               _ -> false
+             end)
+
+    assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> lookup_sql, lookup_params)
+
+    assert Enum.any?(plan, fn [_, _, _, description] ->
+             String.contains?(description, "SEARCH wi") and
+               String.contains?(description, "(id=?)")
+           end)
+
     for limit <- [1, 2] do
       {response, trace} = traced_get(ctx, path <> "&limit=#{limit}", ctx.token)
       assert response.status == 200
@@ -4132,6 +4155,21 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     legacy = get(ctx, "/api/work-items")
     assert legacy.status == 200
     refute Enum.any?(JSON.decode!(legacy.resp_body)["items"], &Map.has_key?(&1, "activeTurnSeqs"))
+
+    assert %{attest: %{id: _}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "session:" <> creator,
+               principal: {:session, creator},
+               session_key: creator,
+               params: %{assignment_id: ctx.assignment.id, kind: "completion", note: "Done"}
+             })
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?", [running.seq])
+
+    assert active_turns.() == %{id => [], other => []}
+    assert JSON.decode!(get(ctx, detail_path).resp_body)["item"]["activeTurnSeqs"] == []
 
     assert :ok =
              Ledger.finish(ctx.db, running.seq, "delivered", nil,

@@ -594,6 +594,7 @@ defmodule Tightbeam.StateResources do
     {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
+    id_filter = if is_map(selection), do: "?1 IS NULL", else: "wi.id = ?1"
 
     rows =
       with_read_transaction(db, fn txn ->
@@ -612,7 +613,7 @@ defmodule Tightbeam.StateResources do
           FROM work_items AS wi
           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
           LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
-          WHERE (?1 IS NULL OR wi.id = ?1) AND (
+          WHERE #{id_filter} AND (
             ?2 = 1 OR
             (?3 = 'user' AND wi.ownerUserId = ?4) OR
             ?3 = 'session'
@@ -645,6 +646,10 @@ defmodule Tightbeam.StateResources do
         )
         |> Enum.map(&work_item_query_row/1)
         |> then(&attach_work_item_summaries(txn, &1, selection, call))
+        |> attach_active_turns(
+          fn sql, params -> observed_query(txn, principal, sql, params) end,
+          Map.get(call, :include_active_turn, false)
+        )
       end)
 
     if is_map(selection), do: rows, else: List.first(rows)
@@ -757,6 +762,7 @@ defmodule Tightbeam.StateResources do
             AND r.jobRef IN (SELECT value FROM json_each(?1))
             AND a.id = r.assignmentId
             AND a.workItemId = r.jobRef
+            AND a.state = 'open'
         )
         WHERE position <= ?2
         UNION ALL
