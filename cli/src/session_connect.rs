@@ -1829,7 +1829,7 @@ fn session_item_capability_compatible(item: &Value) -> bool {
     let Some(capability) = capabilities.get("setHarness") else {
         return true;
     };
-    capabilities.len() == 1 && set_harness_capability_compatible(capability)
+    set_harness_capability_compatible(capability)
 }
 
 fn set_harness_capability_compatible(capability: &Value) -> bool {
@@ -1838,25 +1838,25 @@ fn set_harness_capability_compatible(capability: &Value) -> bool {
     };
     match capability.get("supported") {
         Some(Value::Bool(false)) => {
-            capability.len() == 2 && capability.get("reason").is_some_and(Value::is_string)
+            !capability.contains_key("options")
+                && capability.get("reason").is_some_and(Value::is_string)
         }
         Some(Value::Bool(true)) => {
             let Some(options) = capability.get("options").and_then(Value::as_array) else {
                 return false;
             };
-            capability.len() == 2
+            !capability.contains_key("reason")
                 && options.iter().all(|option| {
                     let Some(option) = option.as_object() else {
                         return false;
                     };
-                    option.len() == 3
-                        && option
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .is_some_and(|title| {
-                                !title.is_empty()
-                                    && option.get("value").and_then(Value::as_str) == Some(title)
-                            })
+                    option
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .is_some_and(|title| {
+                            !title.is_empty()
+                                && option.get("value").and_then(Value::as_str) == Some(title)
+                        })
                         && option.get("enabled").is_some_and(Value::is_boolean)
                 })
                 && options
@@ -3718,7 +3718,34 @@ mod tests {
     }
 
     #[test]
-    fn session_reader_rejects_mixed_or_open_capability_shapes() {
+    fn session_readers_accept_additive_capability_fields() {
+        for capability in [
+            json!({"supported": false, "reason": "inactive", "hint": "retry"}),
+            json!({
+                "supported": true,
+                "optionSource": "gateway",
+                "options": [
+                    {"title": "codex", "value": "codex", "enabled": true, "label": "Codex"}
+                ]
+            }),
+        ] {
+            let item = json!({
+                "sessionKey": "s",
+                "capabilities": {
+                    "setHarness": capability,
+                    "anotherCapability": {"supported": true}
+                }
+            });
+            assert!(session_item_capability_compatible(&item));
+            assert!(session_change_frame_compatible(&json!({
+                "class": "session.updated",
+                "payload": item
+            })));
+        }
+    }
+
+    #[test]
+    fn session_reader_rejects_mixed_or_invalid_consumed_capability_shapes() {
         for item in [
             json!({
                 "capabilities": {
@@ -3726,14 +3753,6 @@ mod tests {
                         "supported": false,
                         "reason": "session is not active",
                         "options": []
-                    }
-                }
-            }),
-            json!({
-                "capabilities": {
-                    "setHarness": {
-                        "supported": true,
-                        "options": [{"title": "codex", "value": "codex", "enabled": true, "extra": true}]
                     }
                 }
             }),
@@ -3755,7 +3774,7 @@ mod tests {
             }),
             json!({
                 "capabilities": {
-                    "setHarness": {"supported": false, "reason": "session is not active"},
+                    "setHarness": {"supported": false, "reason": false},
                     "anotherCapability": {"supported": true}
                 }
             }),

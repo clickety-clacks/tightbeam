@@ -2137,12 +2137,6 @@ fn parse_local_release_identity(bytes: &[u8]) -> Result<ReleaseIdentity, String>
     let Some(object) = value.as_object() else {
         return Err("local release provenance is not an object".to_owned());
     };
-    let expected_keys = ["commit", "format", "repository", "tag"];
-    if object.len() != expected_keys.len()
-        || expected_keys.iter().any(|key| !object.contains_key(*key))
-    {
-        return Err("local release provenance has unexpected fields".to_owned());
-    }
     if object.get("format").and_then(serde_json::Value::as_str)
         != Some("tightbeam-release-provenance/v1")
         || object.get("repository").and_then(serde_json::Value::as_str) != Some(RELEASE_REPOSITORY)
@@ -2324,19 +2318,6 @@ fn validate_published_release(
     let object = value
         .as_object()
         .ok_or_else(|| "published release provenance is not an object".to_owned())?;
-    let expected_keys = [
-        "assets",
-        "checksums",
-        "commit",
-        "repository",
-        "tag",
-        "workflow",
-    ];
-    if object.len() != expected_keys.len()
-        || expected_keys.iter().any(|key| !object.contains_key(*key))
-    {
-        return Err("published release provenance has unexpected fields".to_owned());
-    }
     if object.get("repository").and_then(serde_json::Value::as_str) != Some(RELEASE_REPOSITORY)
         || object.get("tag").and_then(serde_json::Value::as_str) != Some(identity.tag.as_str())
         || object.get("commit").and_then(serde_json::Value::as_str)
@@ -5585,6 +5566,37 @@ mod tests {
                 .iter()
                 .any(|call| call.contains("linux-x86_64"))
         );
+    }
+
+    #[test]
+    fn release_readers_ignore_additive_metadata_but_validate_consumed_fields() {
+        let fixture = test_release_fixture(b"candidate-darwin-cli", "darwin", "arm64", None);
+        let mut local = serde_json::json!({
+            "format": "tightbeam-release-provenance/v1",
+            "repository": RELEASE_REPOSITORY,
+            "tag": fixture.identity.tag,
+            "commit": fixture.identity.commit,
+            "buildMetadata": {"runnerVersion": 2}
+        });
+        let parsed = parse_local_release_identity(&serde_json::to_vec(&local).unwrap()).unwrap();
+        assert_eq!(parsed.commit, fixture.identity.commit);
+        local["commit"] = serde_json::json!(17);
+        assert!(parse_local_release_identity(&serde_json::to_vec(&local).unwrap()).is_err());
+
+        let key = format!("{}/release-provenance.json", fixture.identity.tag);
+        let mut published: serde_json::Value =
+            serde_json::from_slice(&fixture.assets[&key]).unwrap();
+        published["buildMetadata"] = serde_json::json!({"runnerVersion": 2});
+        let validate = |value: &serde_json::Value| {
+            validate_published_release(
+                &serde_json::to_vec(value).unwrap(),
+                &fixture.identity,
+                &fixture.package_name,
+            )
+        };
+        assert!(validate(&published).is_ok());
+        published["workflow"] = serde_json::json!(false);
+        assert!(validate(&published).is_err());
     }
 
     #[test]
