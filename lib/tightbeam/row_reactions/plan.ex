@@ -1,6 +1,13 @@
 defmodule Tightbeam.RowReactions.Plan do
   @moduledoc false
+  alias Tightbeam.{FeatureFlags, SubtreeScope}
   alias Tightbeam.RowReactions.Expression
+
+  @subtree_facts "scope_subtree"
+
+  @doc false
+  # The facts key holding subtree-rule inputs; present only with the flag on.
+  def subtree_facts_key, do: @subtree_facts
 
   def compile!(rail, provenance, owner \\ :substrate, owned_archetypes \\ [])
 
@@ -35,9 +42,23 @@ defmodule Tightbeam.RowReactions.Plan do
   end
 
   def compile!(rail, provenance, owner, owned_archetypes) do
-    fields!(rail, ~w(name family events when effects), ~w(bind english archetypes policy_context))
+    subtree? = FeatureFlags.subtree_rules?()
+    optional = ~w(bind english archetypes policy_context)
+    optional = if subtree?, do: optional ++ ~w(scope roles), else: optional
+    fields!(rail, ~w(name family events when effects), optional)
     Enum.each(~w(name family), &text!(rail[&1]))
     archetypes = validate_archetypes!(rail, owner, owned_archetypes)
+
+    subtree =
+      if subtree?,
+        do: SubtreeScope.parse!(rail, &raise(ArgumentError, "reaction #{rail["name"]}: " <> &1)),
+        else: %{}
+
+    archetypes =
+      if subtree? and owner == :substrate and archetypes == [] and
+           not Map.has_key?(rail, "archetypes") and not Map.has_key?(rail, "roles"),
+         do: ["*"],
+         else: archetypes
 
     policy_context = Map.get(rail, "policy_context", "participants")
 
@@ -57,8 +78,10 @@ defmodule Tightbeam.RowReactions.Plan do
       fields!(binding, ~w(name value), [])
       name = binding["name"]
 
+      reserved = if subtree?, do: ~w(event facts anchor), else: ~w(event facts)
+
       unless is_binary(name) and Regex.match?(~r/^[a-zA-Z_][a-zA-Z0-9_]*$/, name) and
-               name not in ~w(event facts),
+               name not in reserved,
              do: raise(ArgumentError, "invalid reaction binding")
 
       Expression.validate!(binding["value"])
@@ -105,6 +128,7 @@ defmodule Tightbeam.RowReactions.Plan do
       english: english,
       provenance: provenance
     }
+    |> Map.merge(subtree)
   end
 
   @doc false
@@ -272,37 +296,74 @@ defmodule Tightbeam.RowReactions.Plan do
 
   # Organization-level declarations elect policy independently of their audience.
   # Session-scoped declarations retain the existing participant restrictions.
-  defp scope_matches?(%{policy_context: "organization"}, _event, _facts, _value), do: true
+  defp scope_matches?(rail, event, facts, value) do
+    who_matches?(rail, event, facts, value) and where_matches?(rail, facts)
+  rescue
+    _ -> false
+  end
 
-  defp scope_matches?(rail, _event, facts, value) do
+  defp who_matches?(%{policy_context: "organization"}, _event, _facts, _value), do: true
+
+  defp who_matches?(rail, _event, facts, value) do
     base = Map.get(facts, "scope_participant_archetypes", [])
 
-    effect =
+    effect_key =
       case value do
-        %{"session_key" => key} when is_binary(key) ->
-          [scope_session_archetype(facts, key)]
-
-        %{session_key: key} when is_binary(key) ->
-          [scope_session_archetype(facts, key)]
-
-        _ ->
-          []
+        %{"session_key" => key} when is_binary(key) -> key
+        %{session_key: key} when is_binary(key) -> key
+        _ -> nil
       end
+
+    effect = if effect_key, do: [scope_session_archetype(facts, effect_key)], else: []
 
     participants = base ++ effect
 
     cond do
       participants != [] ->
-        Tightbeam.RailScope.matches_agents?(rail.archetypes, participants)
+        case Map.get(rail, :roles, []) do
+          [] ->
+            Tightbeam.RailScope.matches_agents?(rail.archetypes, participants)
+
+          roles ->
+            keys =
+              get_in(facts, [@subtree_facts, "participants"]) ++ List.wrap(effect_key)
+
+            Tightbeam.RailScope.matches_participants?(
+              rail.archetypes,
+              roles,
+              Enum.zip_with(participants, keys, fn archetype, key ->
+                %{archetype: archetype, roles: held_roles(facts, key)}
+              end)
+            )
+        end
 
       rail.owner == :substrate ->
         true
 
       true ->
-        scope_records_belong?(rail.owned_archetypes, facts)
+        scope_records_belong?(rail, facts)
     end
-  rescue
-    _ -> false
+  end
+
+  # A reaction anchored to a role covers only work owed to that role's current
+  # active holder or to a session under it; an unbound role covers nobody.
+  defp where_matches?(rail, facts) do
+    case Map.get(rail, :scope_role) do
+      nil ->
+        true
+
+      role ->
+        subtree = Map.fetch!(facts, @subtree_facts)
+        holder = get_in(subtree, ["anchors", role, "session_key"])
+        is_binary(holder) and holder in Map.get(subtree, "owner_lineage", [])
+    end
+  end
+
+  defp held_roles(facts, key) do
+    facts
+    |> get_in([@subtree_facts, "role_bindings"])
+    |> Enum.flat_map(fn {role, holder} -> if holder == key, do: [role], else: [] end)
+    |> Enum.sort()
   end
 
   defp scope_session_archetype(facts, key) do
@@ -311,31 +372,49 @@ defmodule Tightbeam.RowReactions.Plan do
     |> Enum.find_value(fn
       %{"sessionKey" => ^key, "archetype" => archetype} -> archetype
       _ -> nil
-    end)
+    end) || get_in(facts, [@subtree_facts, "holder_archetypes", key])
   end
 
-  defp scope_records_belong?(owned_archetypes, facts) when is_list(owned_archetypes) do
+  defp scope_records_belong?(%{owned_archetypes: owned_archetypes} = rail, facts)
+       when is_list(owned_archetypes) do
     allowed = MapSet.new(owned_archetypes)
+    roles = Map.get(rail, :roles, [])
     groups = Map.get(facts, "scope_record_session_groups", [])
 
     groups != [] and
       Enum.all?(groups, fn keys ->
-        archetypes = Enum.map(keys, &scope_session_archetype(facts, &1))
+        keys != [] and
+          Enum.all?(keys, fn key ->
+            archetype = scope_session_archetype(facts, key)
 
-        archetypes != [] and
-          Enum.all?(archetypes, fn archetype ->
-            is_binary(archetype) and MapSet.member?(allowed, archetype)
+            # A role the kungfu names reaches its holder whatever the agent type.
+            (is_binary(archetype) and MapSet.member?(allowed, archetype)) or
+              (roles != [] and SubtreeScope.role_admits?(roles, held_roles(facts, key)))
           end)
       end)
   end
 
-  defp scope_records_belong?(_owned_archetypes, _facts), do: false
+  defp scope_records_belong?(_rail, _facts), do: false
 
   defp context(rail, event, facts),
     do:
-      Enum.reduce(rail.bindings, %{"event" => event, "facts" => facts}, fn binding, context ->
+      Enum.reduce(rail.bindings, base_context(rail, event, facts), fn binding, context ->
         Map.put(context, binding["name"], Expression.evaluate(binding["value"], context))
       end)
+
+  # Bind the live anchor separately for each rule, preserving other names.
+  defp base_context(%{scope_role: role}, event, facts) do
+    anchor = get_in(facts, [@subtree_facts, "anchors", role]) || %{}
+    names = Map.put(Map.get(facts, "names", %{}), "anchor", anchor["name"])
+
+    %{
+      "event" => event,
+      "facts" => Map.put(facts, "names", names),
+      "anchor" => %{"role" => role, "session_key" => anchor["session_key"]}
+    }
+  end
+
+  defp base_context(_rail, event, facts), do: %{"event" => event, "facts" => facts}
 
   defp text!(value) when is_binary(value) and value != "", do: value
   defp text!(_), do: raise(ArgumentError, "reaction name must be nonempty text")

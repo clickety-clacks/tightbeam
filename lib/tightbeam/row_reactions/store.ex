@@ -86,7 +86,7 @@ defmodule Tightbeam.RowReactions.Store do
   def admit(txn, event, facts) do
     case event(txn, event["org"], event["id"]) do
       nil ->
-        put_event(txn, event, facts)
+        put_event(txn, event, Map.delete(facts, Tightbeam.RowReactions.Plan.subtree_facts_key()))
 
         for plan <- Rules.reaction_plans(event, Map.put(facts, "original", facts)),
             plan.selected,
