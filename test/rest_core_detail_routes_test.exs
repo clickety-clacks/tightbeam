@@ -4090,8 +4090,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [other, running.seq])
     assert active_turns.() == %{id => [], other => []}
 
+    # The item subscription cannot receive turn events without this ref.
     query!(ctx.db, "UPDATE turns SET jobRef=NULL WHERE seq=?", [running.seq])
-    assert active_turns.() == %{id => [running.seq], other => []}
+    assert active_turns.() == %{id => [], other => []}
+
+    query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [id, running.seq])
 
     query!(
       ctx.db,
@@ -4181,6 +4184,38 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     expected = candidates |> Enum.map(&List.last/1) |> Enum.sort() |> List.delete(first)
     assert retained == expected
     assert length(retained) == 32
+  end
+
+  test "creator-scoped list omits active-turn decoration after the running-row budget", ctx do
+    creator = ctx.admin_session.session_key
+    id = ctx.work_item.id
+    query!(ctx.db, "UPDATE work_items SET createdBySession=? WHERE id=?", [creator, id])
+
+    query!(
+      ctx.db,
+      """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 4097
+      )
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt)
+      SELECT ?1, 'active-turn-budget-' || n, 'process:test', 'fixture', 'running', n
+      FROM numbers
+      """,
+      [creator]
+    )
+
+    path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+    response = get(ctx, path)
+    assert response.status == 200
+    assert %{"items" => [%{"id" => ^id} = row], "page" => page} = JSON.decode!(response.resp_body)
+    refute Map.has_key?(row, "activeTurnSeqs")
+    refute Map.has_key?(page, "partial")
+
+    query!(ctx.db, "DELETE FROM turns WHERE messageId='active-turn-budget-4097'", [])
+
+    assert %{"items" => [%{"id" => ^id, "activeTurnSeqs" => []}]} =
+             JSON.decode!(get(ctx, path).resp_body)
   end
 
   test "scoped work item pages advance across mixed, trailing and all unprojectable rows", ctx do

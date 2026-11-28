@@ -15,6 +15,8 @@ defmodule Tightbeam.StateResources do
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken", "rowSchemaRevision"])
   @active_turn_seq_limit 32
+  @running_turn_scan_limit 4_096
+  @max_wire_turn_seq 9_007_199_254_740_991
 
   @session_select """
   SELECT sessions.sessionKey, sessions.displayName, sessions.kind, sessions.orderIndex,
@@ -733,36 +735,55 @@ defmodule Tightbeam.StateResources do
   defp attach_active_turns(rows, query, true) do
     ids = rows |> Enum.map(& &1.id) |> JSON.encode!()
 
-    active =
+    matches =
       query.(
         """
+        WITH running AS MATERIALIZED (
+          SELECT t.seq, t.assignmentId, t.jobRef
+          FROM turns AS t INDEXED BY turns_pending
+          WHERE t.status IN ('queued', 'running') AND t.status = 'running'
+          LIMIT ?3
+        ), budget AS (
+          SELECT COUNT(*) < ?3 AS within_limit FROM running
+        )
         SELECT workItemId, seq
         FROM (
-          SELECT a.workItemId, t.seq,
-                 ROW_NUMBER() OVER (PARTITION BY a.workItemId ORDER BY t.seq) AS position
-          FROM turns AS t INDEXED BY turns_pending
+          SELECT r.jobRef AS workItemId, r.seq,
+                 ROW_NUMBER() OVER (PARTITION BY r.jobRef ORDER BY r.seq) AS position
+          FROM budget
+          CROSS JOIN running AS r
           CROSS JOIN assignments AS a
-          WHERE t.status IN ('queued', 'running') AND t.status = 'running'
-            AND a.id = t.assignmentId
-            AND a.workItemId IN (SELECT value FROM json_each(?1))
-            AND (t.jobRef IS NULL OR t.jobRef = a.workItemId)
+          WHERE budget.within_limit
+            AND r.jobRef IN (SELECT value FROM json_each(?1))
+            AND a.id = r.assignmentId
+            AND a.workItemId = r.jobRef
         )
         WHERE position <= ?2
+        UNION ALL
+        SELECT NULL, NULL FROM budget WHERE NOT within_limit
         """,
-        [ids, @active_turn_seq_limit + 1]
+        [ids, @active_turn_seq_limit + 1, @running_turn_scan_limit + 1]
       )
-      |> Enum.group_by(fn [id, _seq] -> id end, fn [_id, seq] -> seq end)
 
-    Enum.map(rows, fn row ->
-      case Map.get(active, row.id, []) do
-        seqs when length(seqs) <= @active_turn_seq_limit ->
-          Map.put(row, :active_turn_seqs, Enum.sort(seqs))
+    case matches do
+      [[nil, nil]] ->
+        rows
 
-        _overflow ->
+      matches ->
+        active = Enum.group_by(matches, fn [id, _seq] -> id end, fn [_id, seq] -> seq end)
+
+        Enum.map(rows, fn row ->
+          seqs = Map.get(active, row.id, [])
+
           # An incomplete set could let an end event clear the pill too soon.
-          row
-      end
-    end)
+          if length(seqs) <= @active_turn_seq_limit and
+               Enum.all?(seqs, &(&1 > 0 and &1 <= @max_wire_turn_seq)) do
+            Map.put(row, :active_turn_seqs, Enum.sort(seqs))
+          else
+            row
+          end
+        end)
+    end
   end
 
   defp attach_work_item_summaries(txn, rows, selection, call) do
