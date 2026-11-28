@@ -2782,7 +2782,7 @@ defmodule Tightbeam.Wire.Router do
         db(conn),
         request.filters,
         %{
-          rest_principal: principal,
+          rest_principal: core_detail_trace_principal(conn, principal),
           include_active_turn: Map.get(request.filters, "createdBySession", []) != []
         },
         boundary,

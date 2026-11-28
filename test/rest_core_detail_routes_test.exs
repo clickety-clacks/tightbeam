@@ -4063,6 +4063,30 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert running.seq == ctx.turn_seq
     assert flags.() == %{id => true, other => false}
 
+    for limit <- [1, 2] do
+      {response, trace} = traced_get(ctx, path <> "&limit=#{limit}", ctx.token)
+      assert response.status == 200
+
+      assert [{:sql_query, sql, params}] =
+               Enum.filter(trace, fn
+                 {:sql_query, sql, _} -> String.contains?(sql, "INDEXED BY turns_pending")
+                 _ -> false
+               end)
+
+      assert length(JSON.decode!(hd(params))) == limit
+      assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+
+      assert Enum.any?(plan, fn [_, _, _, description] ->
+               String.contains?(description, "SEARCH t USING INDEX turns_pending (status=?)")
+             end)
+    end
+
+    # A job ref without a recorded assignment does not qualify.
+    query!(ctx.db, "UPDATE turns SET assignmentId=NULL WHERE seq=?", [running.seq])
+    assert flags.() == %{id => false, other => false}
+
+    query!(ctx.db, "UPDATE turns SET assignmentId=? WHERE seq=?", [ctx.assignment.id, running.seq])
+
     query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [other, running.seq])
     assert flags.() == %{id => false, other => false}
 
