@@ -48,7 +48,7 @@ class Fixture:
         self.reads.append(endpoint)
         path = endpoint.split("?")[0]
         ref = "main" if self.pattern.startswith("trunk") else "release/2.x"
-        if path.endswith("/pulls/17") and self.pattern == "trunk-open":
+        if path.endswith("/pulls/17") and self.pattern in {"trunk-open", "trunk-all-terminal"}:
             return {"head": {"sha": HEAD}, "base": {"ref": ref}, "state": "open"}
         if path.endswith("/pulls/17"):
             return {"head": {"sha": HEAD, "repo": {"full_name": "fork/widget"}},
@@ -69,7 +69,9 @@ class Fixture:
             return {"check_runs": [
                 {"id": 2, "name": "ci", "status": "completed", "app": {"id": 42},
                  "conclusion": "failure", "extra": 1},
-                {"id": 3, "name": "advisory", "status": "queued", "conclusion": None},
+                {"id": 3, "name": "advisory",
+                 "status": "completed" if self.pattern == "trunk-all-terminal" else "queued",
+                 "conclusion": "success" if self.pattern == "trunk-all-terminal" else None},
             ]}
         if path.endswith("/statuses"):
             return []

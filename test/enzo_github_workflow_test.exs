@@ -114,9 +114,19 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     attach(ctx, item, "github-target", ~s({"ref":"refs/heads/main","repo":"github.com/example/widget"}))
     attach(ctx, item, "github-pr", scope)
     subscribe(ctx, "pr.checks-completed", scope)
+    subscribe(ctx, "pr.observed-checks-terminal", scope)
     run!(ctx, "trunk-open")
     assert [{^scope, @head, "required-checks-terminal"}] = observations(ctx, "pr.checks-completed")
     assert observations(ctx, "pr.merged") == []
+    assert observations(ctx, "pr.observed-checks-terminal") == []
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
+
+    run!(ctx, "trunk-all-terminal")
+    run!(ctx, "trunk-all-terminal")
+    assert [{^scope, @head, "observed-checks-terminal"}] =
+             observations(ctx, "pr.observed-checks-terminal")
+
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
     refute File.read!(Path.join(ctx.root, "github-reads")) =~ "/timeline"
 
     merged = @pull <> "17"
@@ -131,7 +141,7 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     assert_feature_owner(ctx, item)
     assert %{"uncle-enzo/github-pr" => [^scope]} = metadata(ctx, item)
     assert observations(ctx, "release.published") == []
-    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
+    assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
   end
 
   test "Enzo-only backport keeps advisory failure, integration, and tag publication distinct", ctx do
