@@ -4022,7 +4022,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert %{"items" => [first, item], "page" => page} = JSON.decode!(list.resp_body)
     assert first["id"] == neighbour
-    assert item == JSON.decode!(detail.resp_body)["item"]
+    assert Map.delete(item, "hasActiveTurn") == JSON.decode!(detail.resp_body)["item"]
     assert item["effectiveCommitRefs"] == [Map.take(reference, ["repo", "commit"])]
     refute Map.has_key?(page, "partial")
 
@@ -4030,6 +4030,74 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              DB.query(ctx.db, "SELECT commitRefs FROM attests WHERE id=?", [attest_id])
 
     assert JSON.decode!(stored) == [reference]
+  end
+
+  test "creator-scoped list reports only running turns attributed to its items", ctx do
+    creator = ctx.admin_session.session_key
+    owner = ctx.admin_device.user_id
+    id = ctx.work_item.id
+    other = projection_fixture_item(ctx, creator, 10, owner)
+
+    query!(ctx.db, "UPDATE work_items SET createdBySession=? WHERE id=?", [creator, id])
+
+    query!(
+      ctx.db,
+      "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?,?,?,?,?,'open',?)",
+      ["asg_other_activity", "Other work", creator, owner, 1, other]
+    )
+
+    path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+
+    flags = fn ->
+      response = get(ctx, path)
+      assert response.status == 200
+
+      Map.new(
+        JSON.decode!(response.resp_body)["items"],
+        &{&1["id"], Map.fetch!(&1, "hasActiveTurn")}
+      )
+    end
+
+    assert flags.() == %{id => false, other => false}
+    assert {:ok, running} = Ledger.claim_next(ctx.db, creator, "active-turn-fixture")
+    assert running.seq == ctx.turn_seq
+    assert flags.() == %{id => true, other => false}
+
+    query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [other, running.seq])
+    assert flags.() == %{id => false, other => false}
+
+    query!(ctx.db, "UPDATE turns SET jobRef=NULL WHERE seq=?", [running.seq])
+    assert flags.() == %{id => true, other => false}
+
+    query!(
+      ctx.db,
+      "INSERT OR REPLACE INTO work_item_priorities(workItemId,priority) VALUES (?,4.5)",
+      [id]
+    )
+
+    partial = get(ctx, path)
+    assert partial.status == 200
+
+    assert %{
+             "items" => [%{"id" => ^other, "hasActiveTurn" => false}],
+             "page" => %{"partial" => true}
+           } = JSON.decode!(partial.resp_body)
+
+    query!(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?", [id])
+
+    detail = get(ctx, "/api/work-items/" <> id)
+    assert detail.status == 200
+    refute Map.has_key?(JSON.decode!(detail.resp_body)["item"], "hasActiveTurn")
+    legacy = get(ctx, "/api/work-items")
+    assert legacy.status == 200
+    refute Enum.any?(JSON.decode!(legacy.resp_body)["items"], &Map.has_key?(&1, "hasActiveTurn"))
+
+    assert :ok =
+             Ledger.finish(ctx.db, running.seq, "delivered", nil,
+               owner_lease: running.owner_lease
+             )
+
+    assert flags.() == %{id => false, other => false}
   end
 
   test "scoped work item pages advance across mixed, trailing and all unprojectable rows", ctx do

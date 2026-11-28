@@ -340,7 +340,7 @@ defmodule Tightbeam.StateResources do
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
       integers: ~w(createdInTurnSeq createdAt priority rowVersion),
-      booleans: ~w(isBug createdContextKnown started),
+      booleans: ~w(isBug createdContextKnown started hasActiveTurn),
       nullable:
         ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
@@ -709,6 +709,7 @@ defmodule Tightbeam.StateResources do
              page.rows
              |> Enum.map(&work_item_query_row/1)
              |> then(&WorkItemSummary.attach_many(txn, &1))
+             |> attach_active_turns(query, Map.get(call, :include_active_turn, false))
 
            %{page | rows: rows}
          end) do
@@ -722,6 +723,30 @@ defmodule Tightbeam.StateResources do
       {:error, error} ->
         raise error
     end
+  end
+
+  defp attach_active_turns(rows, _query, false), do: rows
+  defp attach_active_turns([], _query, true), do: []
+
+  defp attach_active_turns(rows, query, true) do
+    ids = rows |> Enum.map(& &1.id) |> JSON.encode!()
+
+    active =
+      query.(
+        """
+        SELECT DISTINCT a.workItemId
+        FROM turns AS t INDEXED BY turns_pending
+        CROSS JOIN assignments AS a
+        WHERE t.status IN ('queued', 'running') AND t.status = 'running'
+          AND a.id = t.assignmentId
+          AND a.workItemId IN (SELECT value FROM json_each(?1))
+          AND (t.jobRef IS NULL OR t.jobRef = a.workItemId)
+        """,
+        [ids]
+      )
+      |> MapSet.new(fn [id] -> id end)
+
+    Enum.map(rows, &Map.put(&1, :has_active_turn, MapSet.member?(active, &1.id)))
   end
 
   defp attach_work_item_summaries(txn, rows, selection, call) do
@@ -2763,6 +2788,9 @@ defmodule Tightbeam.StateResources do
 
   defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
     do: fields ++ ["waitReason"]
+
+  defp conditional_fields!("work items", fields, %{"hasActiveTurn" => _}),
+    do: fields ++ ["hasActiveTurn"]
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 

@@ -2781,7 +2781,10 @@ defmodule Tightbeam.Wire.Router do
       StateResources.query_work_item_page(
         db(conn),
         request.filters,
-        %{rest_principal: principal},
+        %{
+          rest_principal: principal,
+          include_active_turn: Map.get(request.filters, "createdBySession", []) != []
+        },
         boundary,
         request.limit
       )
