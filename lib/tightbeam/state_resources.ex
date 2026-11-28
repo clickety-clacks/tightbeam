@@ -14,6 +14,9 @@ defmodule Tightbeam.StateResources do
   }
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken", "rowSchemaRevision"])
+  @active_turn_seq_limit 32
+  @running_turn_scan_limit 4_096
+  @max_wire_turn_seq 9_007_199_254_740_991
 
   @session_select """
   SELECT sessions.sessionKey, sessions.displayName, sessions.kind, sessions.orderIndex,
@@ -498,6 +501,7 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"work items", "activeTurnSeqs"} => {:array, :positive_integer, :preserve},
     {"work items", "holders"} => {:array, :string, :sort},
     {"work items", "attestCounts"} => :json,
     {"work items", "verdictCounts"} => :json,
@@ -590,6 +594,7 @@ defmodule Tightbeam.StateResources do
     {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
+    id_filter = if is_map(selection), do: "?1 IS NULL", else: "wi.id = ?1"
 
     rows =
       with_read_transaction(db, fn txn ->
@@ -608,7 +613,7 @@ defmodule Tightbeam.StateResources do
           FROM work_items AS wi
           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
           LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
-          WHERE (?1 IS NULL OR wi.id = ?1) AND (
+          WHERE #{id_filter} AND (
             ?2 = 1 OR
             (?3 = 'user' AND wi.ownerUserId = ?4) OR
             ?3 = 'session'
@@ -641,6 +646,10 @@ defmodule Tightbeam.StateResources do
         )
         |> Enum.map(&work_item_query_row/1)
         |> then(&attach_work_item_summaries(txn, &1, selection, call))
+        |> attach_active_turns(
+          fn sql, params -> observed_query(txn, principal, sql, params) end,
+          Map.get(call, :include_active_turn, false)
+        )
       end)
 
     if is_map(selection), do: rows, else: List.first(rows)
@@ -709,6 +718,7 @@ defmodule Tightbeam.StateResources do
              page.rows
              |> Enum.map(&work_item_query_row/1)
              |> then(&WorkItemSummary.attach_many(txn, &1))
+             |> attach_active_turns(query, Map.get(call, :include_active_turn, false))
 
            %{page | rows: rows}
          end) do
@@ -721,6 +731,64 @@ defmodule Tightbeam.StateResources do
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  defp attach_active_turns(rows, _query, false), do: rows
+  defp attach_active_turns([], _query, true), do: []
+
+  defp attach_active_turns(rows, query, true) do
+    ids = rows |> Enum.map(& &1.id) |> JSON.encode!()
+
+    matches =
+      query.(
+        """
+        WITH running AS MATERIALIZED (
+          SELECT t.seq, t.assignmentId, t.jobRef
+          FROM turns AS t INDEXED BY turns_pending
+          WHERE t.status IN ('queued', 'running') AND t.status = 'running'
+          LIMIT ?3
+        ), budget AS (
+          SELECT COUNT(*) < ?3 AS within_limit FROM running
+        )
+        SELECT workItemId, seq
+        FROM (
+          SELECT r.jobRef AS workItemId, r.seq,
+                 ROW_NUMBER() OVER (PARTITION BY r.jobRef ORDER BY r.seq) AS position
+          FROM budget
+          CROSS JOIN running AS r
+          CROSS JOIN assignments AS a
+          WHERE budget.within_limit
+            AND r.jobRef IN (SELECT value FROM json_each(?1))
+            AND a.id = r.assignmentId
+            AND a.workItemId = r.jobRef
+            AND a.state = 'open'
+        )
+        WHERE position <= ?2
+        UNION ALL
+        SELECT NULL, NULL FROM budget WHERE NOT within_limit
+        """,
+        [ids, @active_turn_seq_limit + 1, @running_turn_scan_limit + 1]
+      )
+
+    case matches do
+      [[nil, nil]] ->
+        rows
+
+      matches ->
+        active = Enum.group_by(matches, fn [id, _seq] -> id end, fn [_id, seq] -> seq end)
+
+        Enum.map(rows, fn row ->
+          seqs = Map.get(active, row.id, [])
+
+          # An incomplete set could let an end event clear the pill too soon.
+          if length(seqs) <= @active_turn_seq_limit and
+               Enum.all?(seqs, &(&1 > 0 and &1 <= @max_wire_turn_seq)) do
+            Map.put(row, :active_turn_seqs, Enum.sort(seqs))
+          else
+            row
+          end
+        end)
     end
   end
 
@@ -2763,6 +2831,9 @@ defmodule Tightbeam.StateResources do
 
   defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
     do: fields ++ ["waitReason"]
+
+  defp conditional_fields!("work items", fields, %{"activeTurnSeqs" => _}),
+    do: fields ++ ["activeTurnSeqs"]
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 

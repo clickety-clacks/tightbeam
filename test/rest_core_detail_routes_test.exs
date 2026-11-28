@@ -4022,7 +4022,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert %{"items" => [first, item], "page" => page} = JSON.decode!(list.resp_body)
     assert first["id"] == neighbour
-    assert item == JSON.decode!(detail.resp_body)["item"]
+    assert Map.delete(item, "activeTurnSeqs") == JSON.decode!(detail.resp_body)["item"]
     assert item["effectiveCommitRefs"] == [Map.take(reference, ["repo", "commit"])]
     refute Map.has_key?(page, "partial")
 
@@ -4030,6 +4030,230 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              DB.query(ctx.db, "SELECT commitRefs FROM attests WHERE id=?", [attest_id])
 
     assert JSON.decode!(stored) == [reference]
+  end
+
+  test "creator-scoped list reports only running turns attributed to its items", ctx do
+    creator = ctx.admin_session.session_key
+    owner = ctx.admin_device.user_id
+    id = ctx.work_item.id
+    other = projection_fixture_item(ctx, creator, 10, owner)
+
+    query!(ctx.db, "UPDATE work_items SET createdBySession=? WHERE id=?", [creator, id])
+
+    query!(
+      ctx.db,
+      "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?,?,?,?,?,'open',?)",
+      ["asg_other_activity", "Other work", creator, owner, 1, other]
+    )
+
+    path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+
+    active_turns = fn ->
+      response = get(ctx, path)
+      assert response.status == 200
+
+      Map.new(
+        JSON.decode!(response.resp_body)["items"],
+        &{&1["id"], Map.fetch!(&1, "activeTurnSeqs")}
+      )
+    end
+
+    assert active_turns.() == %{id => [], other => []}
+    assert {:ok, running} = Ledger.claim_next(ctx.db, creator, "active-turn-fixture")
+    assert running.seq == ctx.turn_seq
+    assert active_turns.() == %{id => [running.seq], other => []}
+
+    detail_path = "/api/work-items/" <> id <> "?activeTurnSeqs=true"
+    {detail, trace} = traced_get(ctx, detail_path, ctx.token)
+    assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["item"]["activeTurnSeqs"] == [running.seq]
+
+    assert Enum.count(trace, fn
+             {:sql_query, sql, _} -> String.contains?(sql, "INDEXED BY turns_pending")
+             _ -> false
+           end) == 1
+
+    assert {:sql_query, lookup_sql, lookup_params} =
+             Enum.find(trace, fn
+               {:sql_query, sql, _} -> String.contains?(sql, "FROM work_items AS wi")
+               _ -> false
+             end)
+
+    assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> lookup_sql, lookup_params)
+
+    assert Enum.any?(plan, fn [_, _, _, description] ->
+             String.contains?(description, "SEARCH wi") and
+               String.contains?(description, "(id=?)")
+           end)
+
+    for limit <- [1, 2] do
+      {response, trace} = traced_get(ctx, path <> "&limit=#{limit}", ctx.token)
+      assert response.status == 200
+
+      assert [{:sql_query, sql, params}] =
+               Enum.filter(trace, fn
+                 {:sql_query, sql, _} -> String.contains?(sql, "INDEXED BY turns_pending")
+                 _ -> false
+               end)
+
+      assert length(JSON.decode!(hd(params))) == limit
+      assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+
+      assert Enum.any?(plan, fn [_, _, _, description] ->
+               String.contains?(description, "SEARCH t USING INDEX turns_pending (status=?)")
+             end)
+    end
+
+    # A job ref without a recorded assignment does not qualify.
+    query!(ctx.db, "UPDATE turns SET assignmentId=NULL WHERE seq=?", [running.seq])
+    assert active_turns.() == %{id => [], other => []}
+
+    query!(ctx.db, "UPDATE turns SET assignmentId=? WHERE seq=?", [ctx.assignment.id, running.seq])
+
+    query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [other, running.seq])
+    assert active_turns.() == %{id => [], other => []}
+
+    # The item subscription cannot receive turn events without this ref.
+    query!(ctx.db, "UPDATE turns SET jobRef=NULL WHERE seq=?", [running.seq])
+    assert active_turns.() == %{id => [], other => []}
+
+    query!(ctx.db, "UPDATE turns SET jobRef=? WHERE seq=?", [id, running.seq])
+
+    query!(
+      ctx.db,
+      "INSERT OR REPLACE INTO work_item_priorities(workItemId,priority) VALUES (?,4.5)",
+      [id]
+    )
+
+    partial = get(ctx, path)
+    assert partial.status == 200
+
+    assert %{
+             "items" => [%{"id" => ^other, "activeTurnSeqs" => []}],
+             "page" => %{"partial" => true}
+           } = JSON.decode!(partial.resp_body)
+
+    query!(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?", [id])
+
+    query!(
+      ctx.db,
+      "INSERT OR REPLACE INTO work_item_priorities(workItemId,priority) VALUES (?,4.5)",
+      [other]
+    )
+
+    assert %{
+             "items" => [%{"id" => ^id, "activeTurnSeqs" => [seq]}],
+             "page" => %{"partial" => true}
+           } = JSON.decode!(get(ctx, path).resp_body)
+
+    assert seq == running.seq
+    query!(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?", [other])
+
+    detail = get(ctx, "/api/work-items/" <> id)
+    assert detail.status == 200
+    refute Map.has_key?(JSON.decode!(detail.resp_body)["item"], "activeTurnSeqs")
+    legacy = get(ctx, "/api/work-items")
+    assert legacy.status == 200
+    refute Enum.any?(JSON.decode!(legacy.resp_body)["items"], &Map.has_key?(&1, "activeTurnSeqs"))
+
+    assert %{attest: %{id: _}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "session:" <> creator,
+               principal: {:session, creator},
+               session_key: creator,
+               params: %{assignment_id: ctx.assignment.id, kind: "completion", note: "Done"}
+             })
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?", [running.seq])
+
+    assert active_turns.() == %{id => [], other => []}
+    assert JSON.decode!(get(ctx, detail_path).resp_body)["item"]["activeTurnSeqs"] == []
+
+    assert :ok =
+             Ledger.finish(ctx.db, running.seq, "delivered", nil,
+               owner_lease: running.owner_lease
+             )
+
+    assert active_turns.() == %{id => [], other => []}
+  end
+
+  test "creator-scoped list omits an overflowing active-turn set", ctx do
+    creator = ctx.admin_session.session_key
+    id = ctx.work_item.id
+    query!(ctx.db, "UPDATE work_items SET createdBySession=? WHERE id=?", [creator, id])
+
+    query!(
+      ctx.db,
+      """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 33
+      )
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,createdAt)
+      SELECT ?1, 'active-turn-overflow-' || n, 'process:test', 'fixture', ?2, ?3, 'running', n
+      FROM numbers
+      """,
+      [creator, ctx.assignment.id, id]
+    )
+
+    path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+    {response, trace} = traced_get(ctx, path, ctx.token)
+    assert response.status == 200
+    assert %{"items" => [%{"id" => ^id} = row], "page" => page} = JSON.decode!(response.resp_body)
+    refute Map.has_key?(row, "activeTurnSeqs")
+    refute Map.has_key?(page, "partial")
+
+    assert [{:sql_query, sql, params}] =
+             Enum.filter(trace, fn
+               {:sql_query, sql, _} -> String.contains?(sql, "INDEXED BY turns_pending")
+               _ -> false
+             end)
+
+    assert {:ok, [[^id, first] | _] = candidates} = DB.query(ctx.db, sql, params)
+    assert length(candidates) == 33
+
+    query!(ctx.db, "UPDATE turns SET status='delivered' WHERE seq=?", [first])
+
+    assert %{"items" => [%{"id" => ^id, "activeTurnSeqs" => retained}]} =
+             JSON.decode!(get(ctx, path).resp_body)
+
+    expected = candidates |> Enum.map(&List.last/1) |> Enum.sort() |> List.delete(first)
+    assert retained == expected
+    assert length(retained) == 32
+  end
+
+  test "creator-scoped list omits active-turn decoration after the running-row budget", ctx do
+    creator = ctx.admin_session.session_key
+    id = ctx.work_item.id
+    query!(ctx.db, "UPDATE work_items SET createdBySession=? WHERE id=?", [creator, id])
+
+    query!(
+      ctx.db,
+      """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 4097
+      )
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt)
+      SELECT ?1, 'active-turn-budget-' || n, 'process:test', 'fixture', 'running', n
+      FROM numbers
+      """,
+      [creator]
+    )
+
+    path = "/api/work-items?createdBySession=" <> URI.encode_www_form(creator)
+    response = get(ctx, path)
+    assert response.status == 200
+    assert %{"items" => [%{"id" => ^id} = row], "page" => page} = JSON.decode!(response.resp_body)
+    refute Map.has_key?(row, "activeTurnSeqs")
+    refute Map.has_key?(page, "partial")
+
+    query!(ctx.db, "DELETE FROM turns WHERE messageId='active-turn-budget-4097'", [])
+
+    assert %{"items" => [%{"id" => ^id, "activeTurnSeqs" => []}]} =
+             JSON.decode!(get(ctx, path).resp_body)
   end
 
   test "scoped work item pages advance across mixed, trailing and all unprojectable rows", ctx do
