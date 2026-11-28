@@ -3470,9 +3470,25 @@ defmodule Tightbeam.Gateway do
     base_dir =
       Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
 
+    {models, partial} = picker_catalog(base_dir, Tightbeam.DB)
+
+    %{
+      harnesses: Enum.map(Harness.all(), & &1.wire_name()),
+      models: models,
+      hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
+      archetypes:
+        Enum.map(Archetypes.names(), fn name ->
+          a = Archetypes.get(name)
+          %{name: a.name, where: a.where, defaults: wire_defaults(a.defaults)}
+        end)
+    }
+    |> maybe_put(:modelCatalogPartial, partial)
+  end
+
+  defp picker_catalog(base_dir, db) do
     snapshot = ModelCatalog.snapshot()
     catalog = Map.new(snapshot, fn {key, {entries, _health}} -> {key, entries} end)
-    models = picker_models(base_dir, Tightbeam.DB, catalog)
+    models = picker_models(base_dir, db, catalog)
 
     partial =
       Enum.reduce(snapshot, %{}, fn
@@ -3485,23 +3501,13 @@ defmodule Tightbeam.Gateway do
           acc
       end)
 
-    %{
-      harnesses: Enum.map(Harness.all(), & &1.wire_name()),
-      models: models,
-      hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
-      archetypes:
-        Enum.map(Archetypes.names(), fn name ->
-          a = Archetypes.get(name)
-          %{name: a.name, where: a.where, defaults: wire_defaults(a.defaults)}
-        end)
-    }
-    |> maybe_put(:modelCatalogPartial, if(partial != %{}, do: partial))
+    {models, if(partial != %{}, do: partial)}
   end
 
   # %{host => %{harness => [model]}} — the shape both pickers (org-options) and
   # inspect publish. Hosts come from the registry, so a host whose catalog is
   # still degraded appears with an empty list rather than vanishing.
-  defp picker_models(base_dir, db, catalog \\ ModelCatalog.get()) do
+  defp picker_models(base_dir, db, catalog) do
     base_dir
     |> Placement.hosts(db)
     |> Map.keys()
@@ -8407,6 +8413,8 @@ defmodule Tightbeam.Gateway do
           |> Enum.filter(&MapSet.member?(keys, &1.session_key))
           |> Enum.map(&inspect_wake(db, &1))
 
+        {models, partial} = picker_catalog(config.base_dir, gateway_db(config))
+
         # Discovery beats documentation: the org's SHAPE — what archetypes
         # exist (and their WHERE), what hosts are known, what model refs are
         # valid — is not a secret from its members. Without this, agents
@@ -8424,8 +8432,7 @@ defmodule Tightbeam.Gateway do
               }
             end),
           hosts:
-            config.base_dir |> Placement.hosts(gateway_db(config)) |> Map.keys() |> Enum.sort(),
-          models: picker_models(config.base_dir, gateway_db(config))
+            config.base_dir |> Placement.hosts(gateway_db(config)) |> Map.keys() |> Enum.sort()
         }
 
         result = %{
@@ -8441,8 +8448,9 @@ defmodule Tightbeam.Gateway do
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,
-          models: org_shape.models
+          models: models
         }
+        |> maybe_put(:modelCatalogPartial, partial)
 
         result =
           if admin_caller?(db, call) do
