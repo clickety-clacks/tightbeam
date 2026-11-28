@@ -19,6 +19,7 @@ text = """
 #include "operating-manual.md"
 
 #include "uncle-enzo.md"
+#include "github-workflow.md"
 
 #include "exec.md"
 """
