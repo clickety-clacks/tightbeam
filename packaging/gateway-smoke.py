@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from urllib.error import HTTPError
 from urllib.parse import quote
 from contextlib import closing, contextmanager
 
@@ -250,26 +251,59 @@ def prepare_provider(root, fixture):
         'AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);\n'
         '// Turn-over is when a title may have landed or become\n'
     )
-    (provider / ".bin/claude-agent-acp").symlink_to(fixture / "fixture-acp.js")
+    # Executable selection resolves the shim and checks its enclosing package.
+    executable = adapter / "dist/fixture-acp.js"
+    shutil.copyfile(fixture / "fixture-acp.js", executable)
+    executable.chmod(0o700)
+    (provider / ".bin/claude-agent-acp").symlink_to(executable)
 
 
-def write_provider_inputs(root, fixture):
-    base = root / "base"
-    home = base / "homes/packaged-smoke/claude"
-    # Boot with no credential. Once the packaged launcher is serving, replace only
-    # the scratch catalog projection, then make the generated credential visible.
-    cli = base / "bin/tightbeam"
+def onboard_provider(root, fixture, origin, headers):
+    # The gateway installs its real CLI at boot. Substitute only the scratch
+    # projection before committing the generated credential.
+    cli = root / "base/bin/tightbeam"
     temporary = cli.with_suffix(".fixture")
     shutil.copyfile(fixture / "catalog-probe-fixture.sh", temporary)
     temporary.chmod(0o700)
     temporary.replace(cli)
-    credentials = (home / ".tightbeam/credential.json", home / ".credentials.json")
-    credentials[0].write_text('{"onboarded":true,"kind":"subscription"}')
-    credentials[1].write_text(json.dumps({"claudeAiOauth": {
-        "accessToken": "generated-only", "refreshToken": "generated-only",
-        "expiresAt": 4102444800000, "scopes": []
-    }}))
-    return credentials
+
+    params = {"provider": "anthropic", "kind": "subscription", "machine": "packaged-smoke"}
+
+    def onboard(phase, **extra):
+        try:
+            response = ordinary_http(origin, "/agent/dispatch", headers, {
+                "verb": "onboard", "asProcess": "packaged-smoke",
+                "params": dict(params, phase=phase, **extra),
+            })
+        except HTTPError as error:
+            raise SmokeError(f"generated credential onboarding {phase} refused (HTTP {error.code})") from error
+        result = response.get("result") if isinstance(response, dict) else None
+        if not isinstance(result, dict):
+            raise SmokeError(f"generated credential onboarding {phase} did not return a result")
+        return result
+
+    lease = onboard("begin")
+    lease_id, raw_path = lease.get("leaseId"), lease.get("stagingPath")
+    if (lease.get("status") != "ready" or not isinstance(lease_id, str) or not lease_id
+            or not isinstance(raw_path, str)):
+        raise SmokeError("generated credential onboarding did not open a lease")
+    staging = Path(raw_path)
+    if (staging.parent != root / "tmp" or not staging.name.startswith("tightbeam-anthropic-onboard-")
+            or staging.resolve(strict=True) != staging or not staging.is_dir()):
+        raise SmokeError("generated credential staging is outside the private smoke directory")
+
+    credential = staging / ".credentials.json"
+    fd = os.open(credential, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"claudeAiOauth": {
+                "accessToken": "generated-only", "refreshToken": "generated-only",
+                "expiresAt": 4102444800000, "scopes": [],
+            }}, stream)
+        if onboard("finish", leaseId=lease_id).get("status") != "onboarded":
+            raise SmokeError("generated credential onboarding did not commit")
+    finally:
+        credential.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -364,8 +398,9 @@ def packaged_chat(gateway, root, env, port, lsof, log, expected, org_token):
                 verify(origin, "Alpha", previous)
             catalog = root / "fixture-catalog.log"
             catalog.unlink(missing_ok=True)
-            inputs = write_provider_inputs(root, fixture)
+            home = root / "base/homes/packaged-smoke/claude"
             try:
+                onboard_provider(root, fixture, origin, org_headers)
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     ordinary_http(origin, "/api/sessions?asUser=packaged-smoke", org_headers)
@@ -393,8 +428,8 @@ def packaged_chat(gateway, root, env, port, lsof, log, expected, org_token):
                 verify(origin, label, row)
                 saved = row
             finally:
-                for generated_input in inputs:
-                    generated_input.unlink()
+                for generated_input in (home / ".tightbeam/credential.json", home / ".credentials.json"):
+                    generated_input.unlink(missing_ok=True)
     if (root / "fixture-turns.log").read_text().splitlines() != ["Alpha", "Bravo"]:
         raise SmokeError("generated provider did not receive exactly the two Chat turns")
 
