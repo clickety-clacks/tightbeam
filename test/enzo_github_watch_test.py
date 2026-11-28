@@ -115,6 +115,27 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(fixture.posts[0]["revision"], MERGE)
         self.assertEqual(json.loads(fixture.posts[0]["observation"])["headRepository"], "fork/widget")
 
+    def test_long_timeline_resumes_last_page_with_bounded_overlap(self):
+        class Paged(Fixture):
+            def rest(self, endpoint):
+                if "/timeline?" not in endpoint:
+                    return super().rest(endpoint)
+                self.reads.append(endpoint)
+                page = int(endpoint.split("page=")[-1])
+                if page <= 2:
+                    return [{"event": "commented", "id": page * 100 + i} for i in range(100)]
+                return [{"event": "merged", "id": 400, "created_at": "2026-01-01T00:00:00Z",
+                         "commit_id": MERGE}]
+
+        fixture = Paged([demand("pr.merged", PULL + "17")], "trunk")
+        self.assertTrue(self.watch.Observer(fixture, self.cursor).poll())
+        pages = lambda: [x.split("page=")[-1] for x in fixture.reads if "/timeline?" in x]
+        self.assertEqual(pages(), ["1", "2", "3"])
+        fixture.reads.clear()
+        self.assertTrue(self.watch.Observer(fixture, self.cursor).poll())
+        self.assertEqual(pages(), ["3"])
+        self.assertEqual(fixture.posts[0], fixture.posts[1])
+
     def test_release_branch_tag_publication_and_advisory_red_checks_are_distinct(self):
         fixture = Fixture([
             demand("pr.checks-completed", PULL + "89"),

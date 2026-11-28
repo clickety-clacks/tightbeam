@@ -247,10 +247,14 @@ class Observer:
                     raise ReadError("legacy protection response is incomplete")
                 legacy = protection.get("required_status_checks")
                 if legacy is not None:
-                    rows = legacy.get("checks")
-                    if rows is None:
-                        rows = [{"context": name} for name in legacy["contexts"]]
-                    required.update(self.requirement_rows(rows, "app_id"))
+                    rows = legacy.get("checks", [])
+                    named = list(self.requirement_rows(rows, "app_id"))
+                    contexts = legacy["contexts"]
+                    if not isinstance(contexts, list) or not all(isinstance(name, str) and name for name in contexts):
+                        raise ReadError("legacy required contexts are incomplete")
+                    covered = {name for name, _ in named}
+                    required.update(named)
+                    required.update((name, None) for name in contexts if name not in covered)
             elif protected is not False:
                 raise ReadError("branch protection state is unknown")
         except (ReadError, KeyError, TypeError, ValueError, AttributeError) as error:
@@ -323,7 +327,7 @@ class Observer:
         if completed:
             attempts = [
                 [row["context"], row["requiredApp"],
-                 [[check["source"], check["id"], check["app"] if "app" in check else None,
+                 [[check["source"], check["id"], check.get("app"),
                    check["conclusion"]] for check in row["attempts"]]]
                 for row in completed
             ]
