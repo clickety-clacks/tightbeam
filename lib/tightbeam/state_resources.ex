@@ -671,6 +671,16 @@ defmodule Tightbeam.StateResources do
         filters
       )
 
+    {source, params} =
+      case filters["ids"] do
+        nil ->
+          {"work_items AS wi", params}
+
+        ids ->
+          {"json_each(?) AS selected_ids CROSS JOIN work_items AS wi ON wi.id = selected_ids.value",
+           [JSON.encode!(ids) | params]}
+      end
+
     select_from = """
     SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
            wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
@@ -680,13 +690,14 @@ defmodule Tightbeam.StateResources do
              CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
            ELSE p.priority END,
            COALESCE(v.rowVersion, wi.createdAt)
-    FROM work_items AS wi
+    FROM #{source}
     LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
     LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
     """
 
     probe_from =
-      "work_items AS wi LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
+      source <>
+        " LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
         "LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id"
 
     case DB.read_transaction(db, fn txn ->

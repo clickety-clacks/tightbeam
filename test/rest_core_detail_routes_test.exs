@@ -4113,6 +4113,85 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(detail.resp_body)["error"]["code"] == "projection_invalid"
   end
 
+  test "creator-scoped work item subsets read only authorized IDs in creation order", ctx do
+    reader = outsider_device(ctx)
+    creator = ctx.admin_session.session_key
+    old = projection_fixture_item(ctx, creator, 10, reader.user_id)
+    newest = projection_fixture_item(ctx, creator, 20, reader.user_id)
+    _unselected = projection_fixture_item(ctx, creator, 30, reader.user_id)
+    private = projection_fixture_item(ctx, creator, 40, ctx.admin_device.user_id)
+    wrong_creator = projection_fixture_item(ctx, nil, 50, reader.user_id)
+    unknown = "wi_" <> Tightbeam.Id.uuid4()
+
+    base =
+      "/api/work-items?asUser=#{reader.user_id}&createdBySession=" <> URI.encode_www_form(creator)
+
+    ids = Enum.map_join([newest, unknown, private, old, wrong_creator, newest], &("&ids=" <> &1))
+    {response, trace} = traced_get(ctx, base <> ids, "tbc_core_detail")
+
+    assert response.status == 200
+    assert %{"items" => items, "page" => page} = JSON.decode!(response.resp_body)
+    assert Enum.map(items, & &1["id"]) == [old, newest]
+
+    assert page == %{
+             "oldestCursor" => nil,
+             "newestCursor" => nil,
+             "hasMoreBefore" => false,
+             "hasMoreAfter" => false
+           }
+
+    assert [{:sql_query, sql, params}] =
+             Enum.filter(trace, fn
+               {:sql_query, sql, _} -> String.contains?(sql, "json_each(?) AS selected_ids")
+               _ -> false
+             end)
+
+    assert length(JSON.decode!(hd(params))) == 5
+    assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+
+    assert Enum.any?(plan, fn [_, _, _, description] ->
+             String.contains?(description, "SEARCH wi") and
+               String.contains?(description, "(id=?)")
+           end)
+
+    query!(
+      ctx.db,
+      "INSERT OR REPLACE INTO work_item_priorities(workItemId,priority) VALUES (?,4.5)",
+      [newest]
+    )
+
+    partial = get(ctx, base <> ids, "tbc_core_detail")
+    assert partial.status == 200
+
+    assert %{"items" => [%{"id" => ^old}], "page" => partial_page} =
+             JSON.decode!(partial.resp_body)
+
+    assert partial_page == Map.put(page, "partial", true)
+
+    empty = get(ctx, base <> "&ids=" <> unknown, "tbc_core_detail")
+    assert empty.status == 200
+    assert JSON.decode!(empty.resp_body)["items"] == []
+
+    accepted = get(ctx, base <> String.duplicate("&ids=" <> old, 50), "tbc_core_detail")
+    assert accepted.status == 200
+    assert %{"items" => [%{"id" => ^old}]} = JSON.decode!(accepted.resp_body)
+
+    for path <- [
+          "/api/work-items?ids=" <> old,
+          base <> "&ids=",
+          base <> "&ids=" <> old <> "&createdBySession=" <> URI.encode_www_form(creator),
+          base <> "&ids=" <> old <> "&before=cursor",
+          base <> "&ids=" <> old <> "&after=cursor",
+          base <> "&ids=" <> old <> "&tail=true",
+          base <> "&ids=" <> old <> "&limit=50",
+          base <> String.duplicate("&ids=" <> old, 51)
+        ] do
+      response = get(ctx, path, "tbc_core_detail")
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_filter"
+    end
+  end
+
   defp projection_fixture_item(ctx, creator, created_at, owner) do
     id = "wi_" <> Tightbeam.Id.uuid4()
 

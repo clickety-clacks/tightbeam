@@ -2791,7 +2791,10 @@ defmodule Tightbeam.Wire.Router do
       flags: %{has_more_before: page.has_more_before, has_more_after: page.has_more_after}
     }
 
-    {selected, page} = d1_keyset_page(result, request, principal, spec, conn)
+    {selected, page} =
+      if Map.has_key?(request.filters, "ids"),
+        do: {result.items, %{oldest: nil, newest: nil, before: false, after: false}},
+        else: d1_keyset_page(result, request, principal, spec, conn)
 
     {encoded, partial?} =
       Enum.reduce(selected, {[], false}, fn item, {items, partial?} ->
@@ -2851,9 +2854,24 @@ defmodule Tightbeam.Wire.Router do
   defp d1_d2_collection_request(query, spec) do
     case d1_resource(spec) do
       :artifacts -> d1_artifact_collection_request(query, spec)
+      :work_items when is_map_key(query, "ids") -> work_item_subset_request(query)
       _resource -> d1_collection_request(query, spec)
     end
   end
+
+  defp work_item_subset_request(%{"ids" => ids, "createdBySession" => [creator]} = query)
+       when creator != "" and length(ids) in 1..50 do
+    if Enum.all?(Map.keys(query), &(&1 in ~w(asUser createdBySession ids))) and
+         Enum.all?(ids, &(&1 != "")) do
+      ids = Enum.uniq(ids)
+      filters = %{"createdBySession" => [creator], "ids" => ids}
+      {:ok, %{before: nil, after: nil, tail: nil, limit: length(ids), filters: filters}}
+    else
+      {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp work_item_subset_request(_query), do: {:error, 400, "invalid_filter", nil}
 
   defp d1_artifact_collection_request(query, spec) do
     states = Map.get(query, "state", [])
