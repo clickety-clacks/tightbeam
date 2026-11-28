@@ -6,6 +6,8 @@ archetypes = [
   "uncle-enzo.deliverator",
   "uncle-enzo.exec",
   "uncle-enzo.generic",
+  "uncle-enzo.github-contributor",
+  "uncle-enzo.github-maintainer",
 ]
 tool = "Bash"
 action = "git-stash"
@@ -19,6 +21,8 @@ archetypes = [
   "uncle-enzo.deliverator",
   "uncle-enzo.exec",
   "uncle-enzo.generic",
+  "uncle-enzo.github-contributor",
+  "uncle-enzo.github-maintainer",
 ]
 tool = "Bash"
 action = "git-reset-hard"
@@ -32,6 +36,8 @@ archetypes = [
   "uncle-enzo.deliverator",
   "uncle-enzo.exec",
   "uncle-enzo.generic",
+  "uncle-enzo.github-contributor",
+  "uncle-enzo.github-maintainer",
 ]
 tool = "Bash"
 action = "git-clean-force"
@@ -45,6 +51,8 @@ archetypes = [
   "uncle-enzo.deliverator",
   "uncle-enzo.exec",
   "uncle-enzo.generic",
+  "uncle-enzo.github-contributor",
+  "uncle-enzo.github-maintainer",
 ]
 tool = "Bash"
 action = "git-checkout-discard"
@@ -60,6 +68,8 @@ archetypes = [
   "uncle-enzo.deliverator",
   "uncle-enzo.exec",
   "uncle-enzo.generic",
+  "uncle-enzo.github-contributor",
+  "uncle-enzo.github-maintainer",
 ]
 tool = "Bash"
 action = "git-restore"

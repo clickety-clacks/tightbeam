@@ -9,57 +9,94 @@ phrases = [
 ]
 
 [[sentinels]]
-name = "github-landing-watch"
-command = "sentinels/github-landing-watch"
+name = "github-watch"
+command = "sentinels/github-watch"
 requires = ["GH_CONFIG_DIR"]
 
-[[events]]
-name = "landing.settled"
-description = "A demanded GitHub pull request merged, closed, or stopped progressing automatically."
-details = [
-  { name = "scope", description = "Repository and pull request number." },
-  { name = "outcome", description = "Observed landing disposition." },
-  { name = "head", description = "Observed pull request head commit." },
-  { name = "base", description = "Observed base branch." },
-  { name = "commit", description = "Merge commit, or an empty string before merge." },
-  { name = "evidence", description = "GitHub evidence URL." },
-]
-
-[[events]]
+[[sentinels.events]]
 name = "pr.checks-completed"
-description = "Required checks observed on a demanded exact pull request head have completed."
+description = "The observed pull request head has a nonempty set of terminal check results."
 details = [
-  { name = "scope", description = "Repository and pull request number." },
-  { name = "head", description = "Commit checked." },
-  { name = "outcome", description = "Observed pass or fail." },
-  { name = "evidence", description = "GitHub checks URL." },
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
 ]
 
-[[events]]
-name = "landing.branch-attention"
-description = "A required check failed on a demanded branch tip."
+[[sentinels.events]]
+name = "pr.merged"
+description = "A demanded pull request merged."
 details = [
-  { name = "scope", description = "Repository and branch." },
-  { name = "head", description = "Commit checked." },
-  { name = "check", description = "Required failing check." },
-  { name = "evidence", description = "GitHub evidence URL." },
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "pr.closed"
+description = "A demanded pull request closed without merging."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "pr.settled"
+description = "A demanded pull request merged or closed without merging."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "branch.check-failed"
+description = "A check failed on the observed branch tip."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "tag.observed"
+description = "A demanded tag ref resolves."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "release.published"
+description = "A release for a demanded tag is published."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
 ]
 
 [[mementos]]
-name = "integration-target"
+name = "github-target"
 records = ["work_item", "assignment"]
+many = true
 
 [[mementos]]
-name = "pull-request"
+name = "github-pr"
 records = ["work_item", "assignment", "attest"]
 many = true
 
 [[mementos]]
-name = "merge"
+name = "github-revision"
+records = ["assignment", "attest"]
+many = true
+
+[[mementos]]
+name = "github-integration"
 records = ["work_item", "assignment", "attest"]
 many = true
 
 [[mementos]]
-name = "evidence"
+name = "github-evidence"
 records = ["work_item", "assignment", "attest"]
 many = true

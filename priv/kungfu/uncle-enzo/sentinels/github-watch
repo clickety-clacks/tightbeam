@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Poll GitHub for explicitly demanded Uncle Enzo sentinel events."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote, unquote
+
+PREFIX = "uncle-enzo/github-watch/"
+KINDS = {
+    "pr.checks-completed": "pull",
+    "pr.merged": "pull",
+    "pr.closed": "pull",
+    "pr.settled": "pull",
+    "branch.check-failed": "branch",
+    "tag.observed": "tag",
+    "release.published": "release",
+}
+POLL_SECONDS = 60
+MAX_BACKOFF_SECONDS = 900
+CLAIM_RENEW_SECONDS = 900
+GH_TIMEOUT = 120
+TIGHTBEAM_TIMEOUT = 60
+SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+FAILURE = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "STALE"}
+NAME = r"[a-z0-9][a-z0-9._-]*"
+REPO = rf"({NAME})/({NAME})"
+PR = re.compile(rf"https://github\.com/{REPO}/pull/([1-9][0-9]*)")
+REF = re.compile(rf"https://api\.github\.com/repos/{REPO}/git/ref/(heads|tags)/([^/]+)")
+RELEASE = re.compile(rf"https://api\.github\.com/repos/{REPO}/releases/tags/([^/]+)")
+
+
+class ReadError(Exception):
+    """A GitHub read that did not return complete, usable data."""
+
+
+class Runner:
+    """Runs gh and tightbeam. Tests replace it with a fake."""
+
+    def __init__(self, as_process: str | None):
+        self.as_process = as_process
+        self.last_claim_at = None
+
+    def _gh(self, args: list[str]) -> str:
+        try:
+            done = subprocess.run(
+                ["gh", *args],
+                capture_output=True,
+                text=True,
+                timeout=GH_TIMEOUT,
+                env={**os.environ, "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReadError(f"gh failed: {error}") from error
+        if done.returncode != 0:
+            raise ReadError(f"gh exited {done.returncode}: {one_line(done.stderr or done.stdout)}")
+        return done.stdout
+
+    def rest(self, path: str):
+        try:
+            return json.loads(self._gh(["api", path]))
+        except json.JSONDecodeError as error:
+            raise ReadError(f"gh returned malformed JSON: {error}") from error
+
+    def tightbeam_json(self, args: list[str]) -> dict:
+        argv = ["tightbeam", *args]
+        if self.as_process:
+            argv += ["--as-process", self.as_process]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=TIGHTBEAM_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReadError(f"tightbeam failed: {error}") from error
+        if done.returncode:
+            raise ReadError(f"tightbeam exited {done.returncode}: {one_line(done.stderr)}")
+        try:
+            value = json.loads(done.stdout)
+        except json.JSONDecodeError as error:
+            raise ReadError(f"tightbeam returned malformed JSON: {error}") from error
+        if not isinstance(value, dict):
+            raise ReadError("tightbeam returned a non-object")
+        return value
+
+
+def one_line(text: str) -> str:
+    return " ".join((text or "").split())[:500]
+
+
+def compact(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def digest(value):
+    return hashlib.sha256(compact(value).encode()).hexdigest()
+
+
+def subject(scope):
+    match = PR.fullmatch(scope)
+    if match:
+        owner, repository, number = match.groups()
+        return "pull", f"{owner}/{repository}", number
+
+    match = REF.fullmatch(scope) or RELEASE.fullmatch(scope)
+    if match:
+        owner, repository, *parts = match.groups()
+        ref = unquote(parts[-1], errors="strict")
+        if not ref or quote(ref, safe="") != parts[-1]:
+            return None
+        kind = {"heads": "branch", "tags": "tag"}[parts[0]] if len(parts) == 2 else "release"
+        return kind, f"{owner}/{repository}", parts[-1]
+    return None
+
+
+def demands(response):
+    entries = response.get("demand")
+    if not isinstance(entries, list):
+        raise ReadError("missing demand array")
+    grouped = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ReadError("malformed demand entry")
+        kind = entry.get("kind", "")
+        if not isinstance(kind, str) or not kind.startswith(PREFIX):
+            continue
+        short = kind.removeprefix(PREFIX)
+        if short not in KINDS:
+            continue
+        filters = entry.get("filter", {})
+        scopes = filters.get("scope", []) if isinstance(filters, dict) else None
+        if not isinstance(scopes, list):
+            raise ReadError("malformed scope filter")
+        for scope in scopes:
+            if not isinstance(scope, str):
+                continue
+            try:
+                parsed = subject(scope)
+            except UnicodeError:
+                continue
+            if parsed and parsed[0] == KINDS[short]:
+                grouped.setdefault(scope, set()).add(short)
+    return grouped
+
+
+class Observer:
+    def __init__(self, runner, cursor_dir):
+        self.runner = runner
+        self.cursor_dir = cursor_dir
+        self.claimed_at = None
+
+    def claim(self):
+        now = time.monotonic()
+        if self.claimed_at is not None and now - self.claimed_at < CLAIM_RENEW_SECONDS:
+            return
+        args = ["fact-producer-claim", "--producer", "uncle-enzo/github-watch", "--live-for", "1h"]
+        for kind in KINDS:
+            args.extend(["--kind", PREFIX + kind])
+        self.runner.tightbeam_json(args)
+        self.claimed_at = now
+
+    def poll(self):
+        self.claim()
+        pending = demands(self.runner.tightbeam_json(["sentinel", "demand", "--kind-prefix", PREFIX]))
+        failed = False
+        for scope, kinds in pending.items():
+            try:
+                self.claim()
+                self.observe(scope, kinds)
+            except (ReadError, KeyError, TypeError, ValueError, OSError, AttributeError) as error:
+                print(f"github-watch: incomplete observation for {scope}: {error}", file=sys.stderr)
+                failed = True
+        return not failed
+
+    def post(self, kind, scope, revision, occurrence, observation):
+        self.claim()
+        key = "enzo-github:" + digest([PREFIX + kind, scope, occurrence])
+        self.runner.tightbeam_json([
+            "sentinel", "post", "--event", PREFIX + kind, "--key", key,
+            "--detail", f"scope={scope}", "--detail", f"revision={revision}",
+            "--detail", "observation=" + compact(observation),
+        ])
+
+    def read(self, endpoint):
+        return self.runner.rest(endpoint)
+
+    def pages(self, endpoint, field=None, start=1):
+        page = start
+        while True:
+            self.claim()
+            separator = "&" if "?" in endpoint else "?"
+            result = self.read(f"{endpoint}{separator}per_page=100&page={page}")
+            records = result[field] if field else result
+            if not isinstance(records, list):
+                raise ReadError("expected a GitHub result page")
+            yield page, records
+            if len(records) < 100:
+                break
+            page += 1
+
+    def checks(self, repository, oid):
+        root = f"repos/{repository}/commits/{oid}"
+        checks = []
+        for _, page in self.pages(f"{root}/check-runs?filter=all", "check_runs"):
+            for row in page:
+                conclusion = row.get("conclusion")
+                checks.append({
+                    "source": "check-run", "id": row["id"], "name": row["name"],
+                    "conclusion": conclusion if row["status"] == "completed" else None,
+                    "evidence": row.get("html_url") or f"https://github.com/{repository}/commit/{oid}/checks",
+                })
+        for _, page in self.pages(f"{root}/statuses"):
+            for row in page:
+                checks.append({
+                    "source": "status", "id": row["id"], "name": row["context"],
+                    "conclusion": row["state"], "evidence": row.get("target_url") or
+                    f"https://github.com/{repository}/commit/{oid}",
+                })
+        unique = {(row["source"], row["id"]): row for row in checks}
+        return sorted(unique.values(), key=lambda row: (row["source"], row["id"]))
+
+    def pull(self, scope, repository, number, kinds):
+        endpoint = f"repos/{repository}/pulls/{number}"
+        before = self.read(endpoint)
+        head, base, state = self.pull_identity(before)
+        checks = []
+        if "pr.checks-completed" in kinds and state == "open":
+            checks = self.checks(repository, head)
+
+        terminal = kinds & {"pr.merged", "pr.closed", "pr.settled"}
+        timeline = []
+        last_page = None
+        cursor = None
+        if terminal:
+            cursor = self.cursor_dir / digest([scope, sorted(terminal)])
+            start = int(cursor.read_text()) if cursor.exists() else 1
+            for last_page, rows in self.pages(f"repos/{repository}/issues/{number}/timeline", start=start):
+                timeline.extend(row for row in rows if row.get("event") in {"closed", "merged"})
+
+        after = self.read(endpoint)
+        if self.pull_identity(after) != (head, base, state):
+            raise ReadError("pull request moved during read")
+
+        if checks and all(self.terminal(row) for row in checks):
+            attempts = [[row["source"], row["id"], row["conclusion"]] for row in checks]
+            # Report terminal observations only. Required-check and merge decisions
+            # belong to the local repository workflow, even if all observed checks pass.
+            self.post("pr.checks-completed", scope, head, [head, attempts], {
+                "state": "observed-checks-terminal", "count": len(checks),
+                "attemptsDigest": digest(attempts), "evidence": scope + "/checks",
+            })
+
+        merged = [row for row in timeline if row["event"] == "merged"]
+        merge_times = {row.get("created_at") for row in merged}
+        for row in timeline:
+            when = row.get("created_at")
+            if row["event"] == "closed" and when in merge_times:
+                continue
+            kind = "pr.merged" if row["event"] == "merged" else "pr.closed"
+            revision = (row.get("commit_id") or "") if kind == "pr.merged" else ""
+            if kind == "pr.merged" and not revision:
+                raise ReadError("merge timeline event has no integration commit")
+            outcome = {
+                "state": "merged" if kind == "pr.merged" else "closed-unmerged",
+                "sourceId": row["id"], "transitionAt": when, "evidence": scope,
+            }
+            if kind == "pr.closed":
+                outcome["unknown"] = "historical-head"
+            # PR merger metadata is stable after the merge. Close events can
+            # precede reopen/retarget, so present-day base/head would be misleading.
+            if kind == "pr.merged" and after.get("merge_commit_sha") == revision:
+                head_repo = after["head"].get("repo") or {}
+                outcome.update(base=base, head=head, headRepository=head_repo.get("full_name"))
+            for event in sorted(terminal & {kind, "pr.settled"}):
+                self.post(event, scope, revision, [row["id"], revision, outcome], outcome)
+
+        if cursor is not None and last_page is not None:
+            self.cursor_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=self.cursor_dir, mode="w", delete=False) as file:
+                temporary = Path(file.name)
+                file.write(str(last_page))
+            try:
+                temporary.replace(cursor)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def pull_identity(row):
+        return row["head"]["sha"], row["base"]["ref"], row["state"]
+
+    @staticmethod
+    def terminal(row):
+        conclusion = row["conclusion"]
+        return isinstance(conclusion, str) and conclusion.upper() in SUCCESS | FAILURE
+
+    def ref(self, repository, kind, name):
+        return self.read(f"repos/{repository}/git/ref/{kind}/{name}")["object"]
+
+    def branch(self, scope, repository, name):
+        tip = self.ref(repository, "heads", name)
+        if tip["type"] != "commit":
+            raise ReadError("branch ref did not resolve to a commit")
+        oid = tip["sha"]
+        checks = self.checks(repository, oid)
+        if self.ref(repository, "heads", name)["sha"] != oid:
+            raise ReadError("branch moved during read")
+        for row in checks:
+            conclusion = row["conclusion"]
+            if isinstance(conclusion, str) and conclusion.upper() in FAILURE:
+                self.post("branch.check-failed", scope, oid, [oid, row["source"], row["id"], conclusion], row)
+
+    def tag(self, repository, name):
+        original = self.ref(repository, "tags", name)
+        peeled = original
+        seen = set()
+        while peeled["type"] == "tag":
+            oid = peeled["sha"]
+            if oid in seen or len(seen) >= 16:
+                raise ReadError("tag chain did not resolve")
+            seen.add(oid)
+            peeled = self.read(f"repos/{repository}/git/tags/{oid}")["object"]
+        if self.ref(repository, "tags", name) != original:
+            raise ReadError("tag moved during read")
+        return original["sha"], peeled["sha"] if peeled["type"] == "commit" else ""
+
+    def observe(self, scope, kinds):
+        kind, repository, name = subject(scope)
+        if kind == "pull":
+            self.pull(scope, repository, name, kinds)
+        elif kind == "branch":
+            self.branch(scope, repository, name)
+        elif kind == "tag":
+            tag, revision = self.tag(repository, name)
+            self.post("tag.observed", scope, revision, tag, {
+                "state": "resolved", "tagObject": tag, "evidence": scope,
+            })
+        else:
+            release = self.read(f"repos/{repository}/releases/tags/{name}")
+            if release.get("draft") is not False or not release.get("published_at"):
+                return
+            tag, revision = self.tag(repository, name)
+            observation = {
+                "state": "published", "releaseId": release["id"], "tag": release["tag_name"],
+                "publishedAt": release["published_at"], "prerelease": release["prerelease"],
+                "tagObject": tag, "evidence": release["html_url"],
+            }
+            self.post("release.published", scope, revision, observation, observation)
+
+
+def run(argv, env):
+    if argv[1:] not in ([], ["--once"]):
+        return 2
+    if not os.path.isdir(env.get("GH_CONFIG_DIR", "")):
+        print("github-watch: GH_CONFIG_DIR must identify the GitHub CLI config directory", file=sys.stderr)
+        return 2
+    runner = Runner(env.get("TIGHTBEAM_AS_PROCESS", "sentinel:uncle-enzo/github-watch"))
+    observer = Observer(runner, Path(".github-watch-cursors"))
+    failures = 0
+    while True:
+        try:
+            complete = observer.poll()
+        except (ReadError, TypeError, ValueError, AttributeError) as error:
+            print(f"github-watch: cannot read demand: {error}", file=sys.stderr)
+            complete = False
+        if argv[1:]:
+            return 0 if complete else 1
+        failures = 0 if complete else min(failures + 1, 4)
+        time.sleep(min(POLL_SECONDS * (2 ** failures), MAX_BACKOFF_SECONDS))
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv, os.environ))

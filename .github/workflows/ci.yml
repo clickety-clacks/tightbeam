@@ -107,9 +107,10 @@ jobs:
           fi
 
       - name: Verify exact-candidate CI contract
-        run: |
-          python3 test/exact_head_ci_test.py
-          python3 test/enzo_github_watch_test.py
+        run: python3 test/exact_head_ci_test.py
+
+      - name: Verify Enzo GitHub observations
+        run: python3 test/enzo_github_watch_test.py
 
       - name: Shipped assets contain no internal identifiers
         run: python3 scripts/verify_shipped_privacy.py

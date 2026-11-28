@@ -1,0 +1,8 @@
+name = "github-contributor"
+skills = ["enzo-github-change", "enzo-github-observe"]
+
+[guidance]
+text = """
+#include "operating-manual.md"
+#include "enzo-github-context.md"
+"""

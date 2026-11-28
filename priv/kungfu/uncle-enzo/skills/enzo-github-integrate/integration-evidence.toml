@@ -1,0 +1,12 @@
+[[rule]]
+name = "integration-evidence-on-completion"
+archetypes = ["uncle-enzo.github-maintainer"]
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Attach the repository evidence using --memento uncle-enzo/github-evidence=<ref> on the completion attest."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.has_memento.uncle-enzo/github-target", op = "eq", value = true },
+  { fact = "call.has_memento.uncle-enzo/github-evidence", op = "eq", value = false },
+]

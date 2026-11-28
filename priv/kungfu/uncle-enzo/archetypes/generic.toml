@@ -4,5 +4,4 @@ skills = []
 [guidance]
 text = """
 #include "operating-manual.md"
-#include "github-workflow.md"
 """
