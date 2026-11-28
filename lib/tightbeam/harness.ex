@@ -128,7 +128,9 @@ defmodule Tightbeam.Harness do
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
-  @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
+  @doc "Fetch one catalog. A positive omission count marks a usable but incomplete listing."
+  @callback fetch_catalog(map()) ::
+              {:ok, [map()]} | {:ok, [map()], pos_integer()} | {:error, term()}
 
   @callback records_tool_calls?() :: boolean()
   @doc "Whether a running turn accepts model tuning without replacing its conversation."

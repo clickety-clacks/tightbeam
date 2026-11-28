@@ -1314,7 +1314,8 @@ defmodule Tightbeam.Org do
   # SN9: a pending notice to the retiring session is readdressed whatever its
   # targetGate. Effort timers keep the earlier gated selection and handling.
   defp readdress_retirement_notices_in_txn!(txn, session_key) do
-    people_exclusions = if Tightbeam.PeopleMessages.enabled?(), do: people_wake_exclusions(), else: ""
+    people_exclusions =
+      if Tightbeam.PeopleMessages.enabled?(), do: people_wake_exclusions(), else: ""
 
     Txn.q(
       txn,
