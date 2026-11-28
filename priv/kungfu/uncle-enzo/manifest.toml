@@ -15,7 +15,7 @@ requires = ["GH_CONFIG_DIR"]
 
 [[sentinels.events]]
 name = "pr.checks-completed"
-description = "The observed pull request head has a nonempty set of terminal check results."
+description = "All known required checks for the observed pull request head are terminal."
 details = [
   { name = "scope", description = "Canonical GitHub subject URL." },
   { name = "revision", description = "Observed commit OID, or empty when unknown." },

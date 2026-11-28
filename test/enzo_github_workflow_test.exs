@@ -105,7 +105,7 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     attach(ctx, item, "github-pr", scope)
     subscribe(ctx, "pr.checks-completed", scope)
     run!(ctx, "trunk-open")
-    assert [{^scope, @head, "observed-checks-terminal"}] = observations(ctx, "pr.checks-completed")
+    assert [{^scope, @head, "required-checks-terminal"}] = observations(ctx, "pr.checks-completed")
     assert observations(ctx, "pr.merged") == []
     refute File.read!(Path.join(ctx.root, "github-reads")) =~ "/timeline"
 

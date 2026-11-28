@@ -2,12 +2,14 @@
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 PROGRAM = Path(__file__).resolve().parents[1] / "priv/kungfu/uncle-enzo/sentinels/github-watch"
 PREFIX = "uncle-enzo/github-watch/"
@@ -57,9 +59,18 @@ class Fixture:
                      "commit_id": MERGE}]
         if path.endswith("/pulls/89"):
             return {"head": {"sha": HEAD}, "base": {"ref": ref}, "state": "open"}
+        if "/rules/branches/" in path:
+            return [{"type": "required_status_checks", "parameters": {"required_status_checks": [
+                {"context": "ci", "integration_id": 42}
+            ]}}]
+        if "/branches/" in path:
+            return {"protected": False}
         if path.endswith("/check-runs"):
-            return {"check_runs": [{"id": 2, "name": "ci", "status": "completed",
-                                    "conclusion": "failure", "extra": 1}]}
+            return {"check_runs": [
+                {"id": 2, "name": "ci", "status": "completed", "app": {"id": 42},
+                 "conclusion": "failure", "extra": 1},
+                {"id": 3, "name": "advisory", "status": "queued", "conclusion": None},
+            ]}
         if path.endswith("/statuses"):
             return []
         if "/git/ref/" in path:
@@ -114,9 +125,43 @@ class WatchTest(unittest.TestCase):
         self.assertTrue(self.watch.Observer(fixture, self.cursor).poll())
         self.assertEqual({row["event"] for row in fixture.posts}, {row["kind"] for row in fixture.demand})
         completed = json.loads(fixture.posts[0]["observation"])
-        self.assertEqual(completed["state"], "observed-checks-terminal")
+        self.assertEqual(completed["state"], "required-checks-terminal")
+        self.assertEqual(completed["requirements"], [["ci", 42, [["check-run", 2, 42, "failure"]]]])
         self.assertNotIn("pass", completed)
-        self.assertNotIn("required", completed)
+
+    def test_unknown_and_known_empty_requirements_do_not_emit(self):
+        watch = self.watch
+
+        class RulesFixture(Fixture):
+            def rest(self, endpoint):
+                if "/rules/branches/" in endpoint:
+                    return []
+                if endpoint.endswith("/protection"):
+                    raise watch.ReadError("unreadable protection")
+                if "/branches/" in endpoint:
+                    return {"protected": self.protected}
+                return super().rest(endpoint)
+
+        for protected, message in ((True, "requirement evidence unavailable"),
+                                   (False, "no required checks")):
+            with self.subTest(protected=protected):
+                fixture = RulesFixture([demand("pr.checks-completed", PULL + "89")], "backport")
+                fixture.protected = protected
+                with unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
+                    self.assertTrue(watch.Observer(fixture, self.cursor).poll())
+                    self.assertIn(message, errors.getvalue())
+                self.assertEqual(fixture.posts, [])
+
+    def test_required_source_and_latest_attempt_must_match(self):
+        observer = self.watch.Observer(None, self.cursor)
+        required = [("ci", 42), ("macos", None)]
+        ci = {"source": "check-run", "id": 1, "name": "ci", "app": 42, "conclusion": "failure"}
+        macos = {"source": "status", "id": 2, "name": "macos", "conclusion": "success"}
+        self.assertEqual(observer.completed_requirements(required, [ci]), [])
+        self.assertEqual(observer.completed_requirements(required, [{**ci, "app": 41}, macos]), [])
+        pending = {**ci, "id": 3, "conclusion": None}
+        self.assertEqual(observer.completed_requirements(required, [ci, macos, pending]), [])
+        self.assertEqual(observer.completed_requirements(required, [ci, macos])[0]["attempts"], [ci])
 
     def test_empty_and_unknown_checks_do_not_establish_completion(self):
         class MissingCheck(Fixture):
