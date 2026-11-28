@@ -98,6 +98,7 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
   end
 
   test "Enzo-only trunk queue separates head-check evidence and landing on a linked row", ctx do
+    elect_evidence_rule!(ctx, :trunk)
     item = work!(ctx, "Trunk change")
     scope = @pull <> "17"
     attach(ctx, item, "github-target", ~s({"ref":"refs/heads/main","repo":"github.com/example/widget"}))
@@ -116,12 +117,14 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     attach(ctx, item, "github-integration",
       ~s({"oid":"#{@merge}","pr":17,"ref":"refs/heads/main","repo":"github.com/example/widget"}))
     attach(ctx, item, "github-evidence", scope <> "/checks")
+    complete_with_evidence!(ctx, item, "code", scope <> "/checks")
     assert %{"uncle-enzo/github-pr" => [^scope]} = metadata(ctx, item)
     assert observations(ctx, "release.published") == []
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
   end
 
   test "Enzo-only backport keeps advisory failure, integration, and tag publication distinct", ctx do
+    elect_evidence_rule!(ctx, :release)
     item = work!(ctx, "Release backport")
     sibling = work!(ctx, "Unrelated follow-up")
     target = ~s({"ref":"refs/heads/release/2.x","repo":"github.com/example/widget"})
@@ -145,8 +148,66 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     assert [{^release, @merge, "published"}] = observations(ctx, "release.published")
     attach(ctx, item, "github-pr", merged)
     attach(ctx, item, "github-evidence", [tag, release])
+    complete_with_evidence!(ctx, item, "release", release)
     assert %{"uncle-enzo/github-target" => [^target]} = metadata(ctx, item)
     assert metadata(ctx, sibling) == %{}
+  end
+
+  defp elect_evidence_rule!(ctx, pattern) do
+    identity = Path.join(ctx.base, "identity")
+    template = Path.join(identity, "skills/enzo-github-integrate/integration-evidence.toml")
+    data = File.read!(template)
+
+    data =
+      if pattern == :release do
+        String.replace(
+          data,
+          ~s(  { fact = "attest.kind", op = "eq", value = "completion" },),
+          ~s(  { fact = "attest.kind", op = "eq", value = "completion" },) <>
+            ~s(\n  { fact = "assignment.effect_kind", op = "eq", value = "release" },)
+        )
+      else
+        data
+      end
+
+    File.write!(Path.join(identity, "rules/local-integration-evidence.toml"), data)
+    prior = Identity.live_revision!(ctx.base)
+    git!(identity, ["add", "-A"])
+    git!(identity, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "Elect evidence rule"])
+    revision = git!(identity, ["rev-parse", "HEAD"])
+    assert {:ok, ^revision} = Identity.publish_live!(ctx.base, %{candidate_revision: revision, expected_prior: prior})
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
+    Rules.load!(ctx.base, Map.keys(handlers))
+  end
+
+  defp git!(directory, args) do
+    {output, 0} = System.cmd("git", args, cd: directory, stderr_to_stdout: true)
+    String.trim(output)
+  end
+
+  defp complete_with_evidence!(ctx, item, effect_kind, evidence) do
+    target = metadata(ctx, item)["uncle-enzo/github-target"] |> List.first()
+
+    assignment =
+      cli!(ctx, [
+        "assign", "--subject", "Verify integration", "--session", "fixture-maintainer",
+        "--work-item", item, "--effect-kind", effect_kind,
+        "--memento", "uncle-enzo/github-target=" <> target
+      ])
+
+    id = Map.fetch!(assignment, "id")
+    args = ["attest", id, "--kind", "completion", "--note", "Verified the observed integration"]
+    {refusal, status} = run_cli(ctx, args)
+    assert status != 0
+    assert refusal =~ "integration-evidence-on-completion" or refusal =~ "Attach the repository evidence"
+    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [id])
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [id])
+
+    filed = cli!(ctx, args ++ ["--memento", "uncle-enzo/github-evidence=" <> evidence])
+    attest = filed["attest"]["id"]
+    assert {:ok, [["closed"]]} = DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [id])
+    assert metadata_for(ctx, "attest:" <> attest)["uncle-enzo/github-evidence"] == [evidence]
   end
 
   defp work!(ctx, title) do
@@ -166,10 +227,14 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     assert %{"mementos" => %{}} = cli!(ctx, args)
   end
 
-  defp metadata(ctx, item), do: cli!(ctx, ["mementos", "--record", "work_item:" <> item])["mementos"]
+  defp metadata(ctx, item), do: metadata_for(ctx, "work_item:" <> item)
+  defp metadata_for(ctx, record), do: cli!(ctx, ["mementos", "--record", record])["mementos"]
+
+  defp run_cli(ctx, args),
+    do: System.cmd(@cli, args, cd: ctx.root, env: ctx.env, stderr_to_stdout: true)
 
   defp cli!(ctx, args) do
-    {output, status} = System.cmd(@cli, args, cd: ctx.root, env: ctx.env, stderr_to_stdout: true)
+    {output, status} = run_cli(ctx, args)
     assert status == 0, output
     JSON.decode!(output)
   end
