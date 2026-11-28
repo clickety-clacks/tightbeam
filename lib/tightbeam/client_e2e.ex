@@ -241,6 +241,11 @@ defmodule Tightbeam.ClientE2E do
       )
 
     case module.fetch_catalog(catalog_target) do
+      {:ok, [_ | _], omitted} ->
+        Scorecard.pass(step, label,
+          note: "credential is live; model catalog is incomplete (#{omitted} unreadable lines)"
+        )
+
       {:ok, [_ | _]} ->
         Scorecard.pass(step, label,
           note: "credential store ready; authenticated liveness probe returned :live"
@@ -287,6 +292,7 @@ defmodule Tightbeam.ClientE2E do
 
       case module.fetch_catalog(target(scratch)) do
         {:ok, [_ | _]} -> false
+        {:ok, [_ | _], _omitted} -> false
         _ -> true
       end
     after

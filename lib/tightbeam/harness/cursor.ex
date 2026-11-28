@@ -514,16 +514,11 @@ defmodule Tightbeam.Harness.Cursor do
       |> Map.merge(%{host_config: host_config, sh: sh})
 
     with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
-         {output, 0} <- sh.(catalog_argv(host_config, launcher, state.base_dir)),
-         {:ok, entries} <- parse_catalog(output),
-         true <- entries != [] do
-      {:ok, entries}
+         {output, 0} <- sh.(catalog_argv(host_config, launcher, state.base_dir)) do
+      parse_catalog(output)
     else
       {output, exit} when is_binary(output) and is_integer(exit) ->
         {:error, {:cursor_catalog_probe_failed, exit, String.trim(output)}}
-
-      false ->
-        {:error, :empty_inventory}
 
       {:error, reason} ->
         {:error, reason}
@@ -546,17 +541,27 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   defp parse_catalog(output) when is_binary(output) do
-    entries =
+    {entries, unreadable} =
       output
       |> String.split("\n")
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == "" or &1 == "Available models" or String.starts_with?(&1, "Tip:")))
       |> Enum.map(&parse_catalog_line/1)
+      |> Enum.split_with(&match?({:ok, _}, &1))
 
-    if entries != [] and Enum.all?(entries, &match?({:ok, _}, &1)) do
-      {:ok, Enum.map(entries, fn {:ok, entry} -> entry end)}
-    else
-      {:error, :malformed_catalog}
+    case {entries, unreadable} do
+      {[], _} ->
+        {:error, :malformed_catalog}
+
+      {entries, []} ->
+        {:ok, Enum.map(entries, fn {:ok, entry} -> entry end)}
+
+      {entries, unreadable} ->
+        omitted = length(unreadable)
+
+        Logger.warning("Cursor model catalog is incomplete: skipped #{omitted} unreadable lines")
+
+        {:ok, Enum.map(entries, fn {:ok, entry} -> entry end), omitted}
     end
   end
 

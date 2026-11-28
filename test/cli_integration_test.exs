@@ -1199,6 +1199,90 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "inspect"}}
   end
 
+  test "list passes through the scoped model catalog partial marker", ctx do
+    outside_host = "outside-inspect-scope"
+    host_config = %{base_dir: ctx.base_dir, ssh: nil}
+    hosts = %{"testhost" => host_config, outside_host => host_config}
+    model_ids = ["second-model", "first-model"]
+
+    entries =
+      Enum.map(model_ids, fn id ->
+        %{
+          family: id,
+          context: nil,
+          display_name: id,
+          efforts: [],
+          max_input_tokens: nil,
+          capabilities: %{},
+          provider: :anthropic
+        }
+      end)
+
+    catalog =
+      start_supervised!(
+        {Tightbeam.ModelCatalog,
+         base_dir: ctx.base_dir,
+         hosts: fn -> hosts end,
+         now: fn -> 0 end,
+         credential_status: fn _ -> {:needs_onboarding, :missing} end}
+      )
+
+    complete_cache = %{
+      entries: entries,
+      derived_at: 0,
+      attempted_at: 0,
+      reason: nil,
+      refreshing: false
+    }
+
+    put_cache = fn host, cache ->
+      key = {host, "claude"}
+
+      :sys.replace_state(catalog, fn state ->
+        state
+        |> put_in([:entries, key], cache)
+        |> update_in([:versions, key], &((&1 || 0) + 1))
+      end)
+    end
+
+    put_cache.(outside_host, Map.put(complete_cache, :omitted, 1))
+    put_cache.("testhost", complete_cache)
+
+    list = fn ->
+      assert {output, 0} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir)
+      assert_receive {:cli_call, %{verb: "inspect"}}
+      JSON.decode!(output)
+    end
+
+    complete = list.()
+    refute Map.has_key?(complete, "modelCatalogPartial")
+    refute Map.has_key?(complete["models"], outside_host)
+    assert Enum.map(complete["models"]["testhost"]["claude"], & &1["model"]) == model_ids
+
+    put_cache.("testhost", Map.put(complete_cache, :omitted, 2))
+
+    :erlang.trace(catalog, true, [:receive])
+
+    partial =
+      try do
+        list.()
+      after
+        :erlang.trace(catalog, false, [:receive])
+      end
+
+    assert_receive {:trace, ^catalog, :receive, {:"$gen_call", _, :snapshot}}
+    refute_received {:trace, ^catalog, :receive, {:"$gen_call", _, _}}
+
+    assert partial ==
+             Map.put(complete, "modelCatalogPartial", %{"testhost" => %{"claude" => true}})
+
+    put_cache.("testhost", %{complete_cache | entries: []})
+
+    unavailable = list.()
+    assert unavailable["models"]["testhost"]["claude"] == []
+    refute Map.has_key?(unavailable, "modelCatalogPartial")
+  end
+
   test "real CLI build is the exact gateway-required version", ctx do
     {version, 0} = System.cmd(ctx.binary, ["version"])
     version = String.trim(version)
