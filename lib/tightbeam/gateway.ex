@@ -1213,6 +1213,11 @@ defmodule Tightbeam.Gateway do
         )
       end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
+      {"rule-set", []} => fn call -> Tightbeam.SavedRules.command(db, "rule-set", call) end,
+      {"rule-withdraw", []} => fn call ->
+        Tightbeam.SavedRules.command(db, "rule-withdraw", call)
+      end,
+      {"rule-show", []} => fn call -> Tightbeam.SavedRules.command(db, "rule-show", call) end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
           authorized: admin_caller?(db, call),
@@ -12652,6 +12657,7 @@ defmodule Tightbeam.Gateway do
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
+                |> maybe_put_retired_rules(result[:saved_rules])
                 |> then(fn response ->
                   if result[:unfinished_retirement],
                     do: Map.put(response, :unfinished_retirement, result.unfinished_retirement),
@@ -12750,9 +12756,11 @@ defmodule Tightbeam.Gateway do
         }
 
       %{owner_user_id: ^owner, state: "active"} ->
-        {:ok, plan} =
+        {:ok, {plan, saved_rules}} =
           DB.transaction(db, fn txn ->
-            retirement_plan_in_txn(txn, call.session_key, owner, true)
+            plan = retirement_plan_in_txn(txn, call.session_key, owner, true)
+            keys = Enum.map(plan.retired, & &1.session_key)
+            {plan, Tightbeam.SavedRules.anchored_to(txn, keys)}
           end)
 
         scans =
@@ -12767,6 +12775,7 @@ defmodule Tightbeam.Gateway do
           requires_keep_open_descendants: plan.frontiers != [],
           sessions_with_held_work: Enum.count(scans, &(&1.losses != []))
         }
+        |> maybe_put_retired_rules(saved_rules)
 
       %{owner_user_id: ^owner} = session ->
         retired_workspace_response(config, db, call, session, false)
@@ -13089,6 +13098,11 @@ defmodule Tightbeam.Gateway do
     walk.(walk, root_key)
   end
 
+  defp maybe_put_retired_rules(result, rules) when rules in [nil, []], do: result
+
+  defp maybe_put_retired_rules(result, rules),
+    do: Map.put(result, :saved_rules_without_anchor, rules)
+
   defp retire_cascade_in_txn(
          txn,
          plan,
@@ -13114,7 +13128,9 @@ defmodule Tightbeam.Gateway do
       end)
 
     if leased == [] do
-      Tightbeam.Retirements.retiring_in_txn(txn, Enum.map(subtree, & &1.session_key))
+      keys = Enum.map(subtree, & &1.session_key)
+      saved_rules = Tightbeam.SavedRules.anchored_to(txn, keys)
+      Tightbeam.Retirements.retiring_in_txn(txn, keys)
 
       kept_descendants =
         Enum.flat_map(plan.frontiers, fn frontier ->
@@ -13176,7 +13192,12 @@ defmodule Tightbeam.Gateway do
       |> Enum.uniq()
       |> Enum.each(&Tightbeam.WorkItemSummary.publish_change_in_txn(txn, &1, call))
 
-      %{retired: retired, deferred: [], kept_descendants: kept_descendants}
+      %{
+        retired: retired,
+        deferred: [],
+        kept_descendants: kept_descendants,
+        saved_rules: saved_rules
+      }
     else
       deadline = Enum.max_by(leased, & &1.hard_deadline).hard_deadline
 
