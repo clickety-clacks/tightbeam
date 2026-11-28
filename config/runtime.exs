@@ -26,6 +26,13 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_DECISIONS must be true or false"
   end
 
+  case System.get_env("TIGHTBEAM_DIAGNOSTIC_EXPIRY") do
+    nil -> :ok
+    "true" -> config :tightbeam, :diagnostic_expiry, true
+    "false" -> config :tightbeam, :diagnostic_expiry, false
+    _ -> raise ArgumentError, "TIGHTBEAM_DIAGNOSTIC_EXPIRY must be true or false"
+  end
+
   case System.get_env("TIGHTBEAM_SUBTREE_RULES") do
     nil -> :ok
     "true" -> config :tightbeam, :subtree_rules, true

@@ -351,6 +351,7 @@ defmodule Tightbeam.Gateway do
        [
          {ModelCatalog, base_dir: config.base_dir, db: db},
          {Tightbeam.Retention, db: db},
+         if(Tightbeam.DiagnosticExpiry.enabled?(), do: {Tightbeam.DiagnosticExpiry, db: db}),
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ArtifactBlobStore, blob_options},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
