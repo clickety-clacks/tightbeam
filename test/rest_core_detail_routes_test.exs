@@ -1822,13 +1822,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert first.status == 200
     cursor = JSON.decode!(first.resp_body)["page"]["newestCursor"]
 
-    one_field =
-      cursor
-      |> Base.url_decode64!(padding: false)
-      |> JSON.decode!()
-      |> Map.put("tuple", [1])
-      |> JSON.encode!()
-      |> Base.url_encode64(padding: false)
+    additive = rewrite_cursor(cursor, &Map.put(&1, "futureMetadata", %{"producer" => 2}))
+    prior_format = get(ctx, path <> "?after=" <> cursor, outsider_device.token)
+    new_format = get(ctx, path <> "?after=" <> additive, outsider_device.token)
+    assert prior_format.status == 200
+    assert new_format.status == 200
+    assert JSON.decode!(prior_format.resp_body) == JSON.decode!(new_format.resp_body)
+
+    one_field = rewrite_cursor(additive, &Map.put(&1, "tuple", [1]))
 
     response = get(ctx, path <> "?after=" <> one_field, outsider_device.token)
     assert response.status == 400
@@ -2782,6 +2783,19 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert JSON.decode!(observer_with_admin_cursor.resp_body)["items"] ==
              JSON.decode!(anonymous_sessions.resp_body)["items"]
+
+    additive = rewrite_cursor(org_session_cursor, &Map.put(&1, "futureMetadata", true))
+
+    from_additive =
+      get_without_authorization(ctx, "/api/sessions?limit=1&after=#{additive}")
+
+    assert from_additive.status == 200
+    assert from_additive.resp_body == observer_with_admin_cursor.resp_body
+
+    unbound = rewrite_cursor(additive, &Map.delete(&1, "principalId"))
+    refused = get_without_authorization(ctx, "/api/sessions?limit=1&after=#{unbound}")
+    assert refused.status == 400
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_cursor"
 
     anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
     org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
@@ -3934,6 +3948,16 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     prior = get(ctx, "/api/work-items?state=open&limit=2&before=" <> URI.encode_www_form(cursor))
     assert prior.status == 200
     assert JSON.decode!(prior.resp_body)["items"] ++ page["items"] == items
+    additive = rewrite_cursor(cursor, &Map.put(&1, "futureMetadata", %{"producer" => 2}))
+    newer_prior = get(ctx, "/api/work-items?state=open&limit=2&before=" <> additive)
+    assert newer_prior.status == 200
+    assert JSON.decode!(newer_prior.resp_body) == JSON.decode!(prior.resp_body)
+
+    bad_version = rewrite_cursor(additive, &Map.put(&1, "version", "1"))
+    invalid = get(ctx, "/api/work-items?state=open&before=" <> bad_version)
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_cursor"
+
     mismatch = get(ctx, "/api/work-items?state=closed&before=" <> URI.encode_www_form(cursor))
     assert mismatch.status == 400
     assert JSON.decode!(mismatch.resp_body)["error"]["code"] == "invalid_cursor"
@@ -4196,6 +4220,36 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.any?(notices, fn notice ->
              inspect(notice) =~ "work_item.updated" and inspect(notice) =~ "Example/Repo"
            end)
+
+    # Simulate the same record written by a newer producer. Its added metadata
+    # remains stored, while the existing list and detail emit the same fields.
+    additive = Map.put(input.payload, "futureMetadata", %{"producer" => 2})
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE condition_facts SET payload=? WHERE kind=? AND scope=?", [
+               JSON.encode!(additive),
+               input.kind,
+               input.scope
+             ])
+
+    newer_list = get(ctx, "/api/work-items?state=open")
+    newer_detail = get(ctx, "/api/work-items/" <> ctx.work_item.id)
+    assert newer_list.status == 200
+    assert newer_detail.status == 200
+    assert JSON.decode!(newer_list.resp_body) == JSON.decode!(list.resp_body)
+    assert JSON.decode!(newer_detail.resp_body) == JSON.decode!(detail.resp_body)
+
+    # Match via the merge commit but reject an invalid consumed head commit.
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE condition_facts SET payload=? WHERE kind=? AND scope=?", [
+               JSON.encode!(Map.put(additive, "headCommit", "invalid")),
+               input.kind,
+               input.scope
+             ])
+
+    invalid = get(ctx, "/api/work-items/" <> ctx.work_item.id)
+    assert invalid.status == 500
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "projection_invalid"
   end
 
   test "B2 missing priority sidecar preserves configured and fallback defaults across reads and notices",
@@ -4750,6 +4804,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(#{table})")
       assert Enum.any?(columns, fn [_cid, name | _rest] -> name == "recordEventIds" end)
     end
+  end
+
+  defp rewrite_cursor(cursor, edit) do
+    cursor
+    |> Base.url_decode64!(padding: false)
+    |> JSON.decode!()
+    |> edit.()
+    |> JSON.encode!()
+    |> Base.url_encode64(padding: false)
   end
 
   defp get(ctx, path, bearer \\ nil, headers \\ []) do

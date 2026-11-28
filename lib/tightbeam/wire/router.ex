@@ -1623,11 +1623,12 @@ defmodule Tightbeam.Wire.Router do
            true <- cursor != "",
            {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
            {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
-           true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
            true <- payload["version"] == @d1_cursor_version,
            true <- payload["route"] == route and payload["resource"] == resource,
            true <- payload["direction"] == direction,
            true <- payload["filters"] == d1_filter_fingerprint(filters),
+           true <- payload["principalKind"] in ~w(observer session user user-admin),
+           true <- is_binary(payload["principalId"]) and payload["principalId"] != "",
            true <-
              payload["principalKind"] != state_cursor_principal_kind(principal) or
                payload["principalId"] != Map.get(principal, :id),
@@ -1667,7 +1668,6 @@ defmodule Tightbeam.Wire.Router do
   defp state_cursor_decode(cursor, direction, route, resource, filters, principal, tuple_valid?) do
     with {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
          {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
-         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
          true <- payload["version"] == @d1_cursor_version,
          true <- payload["route"] == route and payload["resource"] == resource,
          true <- payload["direction"] == direction,
@@ -3469,7 +3469,6 @@ defmodule Tightbeam.Wire.Router do
   defp d1_decode_cursor(cursor, direction, request, principal, spec, _conn) do
     with {:ok, payload_bytes} <- Base.url_decode64(cursor, padding: false),
          {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
-         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
          true <- payload["version"] == @d1_cursor_version,
          true <- payload["route"] == spec.route and payload["resource"] == spec.resource,
          true <-
@@ -3579,10 +3578,6 @@ defmodule Tightbeam.Wire.Router do
       })
 
     Base.url_encode64(payload, padding: false)
-  end
-
-  defp d1_cursor_keys do
-    Enum.sort(~w(direction filters principalId principalKind resource route tuple version))
   end
 
   defp d1_filter_fingerprint(filters),
