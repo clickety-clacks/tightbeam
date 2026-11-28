@@ -342,6 +342,9 @@ jobs:
       - name: Assemble and stage the native package
         env:
           PLATFORM: ${{ matrix.platform }}
+          CANDIDATE_BRANCH: ${{ needs.metadata.outputs.candidate_branch }}
+          CANDIDATE_REF: ${{ needs.metadata.outputs.candidate_ref }}
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
         run: |
           sh packaging/assemble.sh
           package=$(find _build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz')
@@ -439,7 +442,8 @@ jobs:
             --source-sha "$CANDIDATE_SHA" \
             --workflow-sha "$WORKFLOW_SHA" \
             --release-tag "$release_tag" \
-            --version "$version"
+            --version "$version" \
+            --require-embedded-provenance
           (
             cd candidate-stage
             sha256sum --check SHA256SUMS

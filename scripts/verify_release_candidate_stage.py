@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,28 @@ def expected_values(args: argparse.Namespace) -> dict[str, str]:
         "workflow_url": f"{server_url}/{args.repository}/actions/runs/{args.run_id}",
     }
 
+
+def verify_embedded_provenance(path: Path, expected: dict[str, str]) -> None:
+    record = {
+        "format": "tightbeam-release-provenance/v1",
+        "repository": expected["repository"],
+        "tag": expected["release_tag"],
+        "commit": expected["source_sha"],
+    }
+    with tarfile.open(path, "r:gz") as archive:
+        members = [member for member in archive if member.name == "tightbeam/release-provenance.json"]
+        if len(members) != 1 or not members[0].isfile():
+            refuse(f"{path.name}: expected exactly one regular embedded release provenance member")
+        try:
+            with archive.extractfile(members[0]) as contents:
+                fields = json.load(contents, object_pairs_hook=list)
+        except (ValueError, UnicodeError) as error:
+            refuse(f"{path.name}: invalid embedded release provenance: {error}")
+        # Retain duplicate keys during decoding so they cannot match the record.
+        if not isinstance(fields, list) or len(fields) != len(record) or any(
+            pair not in fields for pair in record.items()
+        ):
+            refuse(f"{path.name}: embedded release provenance does not match the exact release")
 
 def proof_packages(proof: dict[str, Any], evidence_root: Path, expected: dict[str, str]) -> dict[str, Path]:
     if set(proof) != PROOF_KEYS:
@@ -238,6 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workflow-sha", required=True)
     parser.add_argument("--release-tag", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--require-embedded-provenance", action="store_true")
     return parser.parse_args()
 
 
@@ -250,12 +274,15 @@ def main() -> int:
         if proof_path.read_bytes() != canonical_bytes(proof):
             refuse("candidate proof is not canonical JSON")
         packages = proof_packages(proof, args.evidence_root, expected)
+        if args.require_embedded_provenance:
+            for package in packages.values():
+                verify_embedded_provenance(package, expected)
         if args.command == "create":
             create(args, expected, proof_path, packages)
         else:
             expected_stage_files(args.stage_root, proof_path, packages, expected)
         return 0
-    except (OSError, Refusal, subprocess.SubprocessError) as error:
+    except (OSError, Refusal, tarfile.TarError, subprocess.SubprocessError) as error:
         print(f"release candidate stage: {error}", file=sys.stderr)
         return 1
 

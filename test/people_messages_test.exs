@@ -112,6 +112,7 @@ defmodule Tightbeam.PeopleMessagesTest do
       PeopleReadiness.wait(5_000, fn ->
         if Process.delete(:first_read) do
           send(parent, {:empty_snapshot, self()})
+
           receive do
             :park -> %{records: []}
           end
