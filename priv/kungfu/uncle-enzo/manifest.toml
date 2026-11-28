@@ -7,3 +7,105 @@ phrases = [
   "I want each feature to have one owner who sees it through.",
   "I want my agents to coordinate with each other directly.",
 ]
+
+[[sentinels]]
+name = "github-watch"
+command = "sentinels/github-watch"
+requires = ["GH_CONFIG_DIR"]
+
+[[sentinels.events]]
+name = "pr.observed-checks-terminal"
+description = "A nonempty snapshot of all visible checks for the observed pull request head is terminal."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "pr.checks-completed"
+description = "All known required checks for the observed pull request head are terminal."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "pr.merged"
+description = "A demanded pull request merged."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "pr.closed"
+description = "A demanded pull request closed without merging."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "pr.settled"
+description = "A demanded pull request merged or closed without merging."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "branch.check-failed"
+description = "A check failed on the observed branch tip."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "tag.observed"
+description = "A demanded tag ref resolves."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
+name = "release.published"
+description = "A release for a demanded tag is published."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID, or empty when unknown." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[mementos]]
+name = "github-target"
+records = ["work_item", "assignment"]
+many = true
+
+[[mementos]]
+name = "github-pr"
+records = ["work_item", "assignment", "attest"]
+many = true
+
+[[mementos]]
+name = "github-revision"
+records = ["assignment", "attest"]
+many = true
+
+[[mementos]]
+name = "github-integration"
+records = ["work_item", "assignment", "attest"]
+many = true
+
+[[mementos]]
+name = "github-evidence"
+records = ["work_item", "assignment", "attest"]
+many = true

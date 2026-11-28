@@ -154,6 +154,12 @@ defmodule Tightbeam.KungfuPackageTest do
     assert "skills/human-communication/SKILL.md" in engineering_receipt
     assert "skills/human-communication/SKILL.md" in receipt_paths(ctx.base, "uncle-enzo")
 
+    assert {:ok, _} = Tightbeam.Sentinels.resolve(ctx.base, "agentic-engineering/landing-watch")
+    assert {:ok, enzo} = Tightbeam.Sentinels.resolve(ctx.base, "uncle-enzo/github-watch")
+    assert enzo.requires == ["GH_CONFIG_DIR"]
+    assert {:ok, _} = Tightbeam.Sentinels.resolve_event(ctx.base, "landing.settled")
+    assert {:ok, _} = Tightbeam.Sentinels.resolve_event(ctx.base, "uncle-enzo/github-watch/pr.settled")
+
     # Relearn refreshes the shipped bundle and leaves the retained one as it was.
     assert {:ok, candidate} = Identity.relearn!(ctx.base, "test")
     publish!(ctx.base, candidate)

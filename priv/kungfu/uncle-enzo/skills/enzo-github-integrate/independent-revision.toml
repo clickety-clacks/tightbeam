@@ -1,0 +1,40 @@
+# Elect only for assignments whose local policy requires exact review.
+# Narrow the selectors or target predicate before copying this into identity rules.
+[[rule]]
+name = "integration-needs-independent-judgment"
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Record the independent linked review for this integration."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.has_memento.uncle-enzo/github-target", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.independent", op = "eq", value = false },
+]
+
+[[rule]]
+name = "integration-needs-clean-judgment"
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Use the locally selected clean review judgment for this integration."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.has_memento.uncle-enzo/github-target", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.judgment_kind", op = "ne", value = "reviewed-clean" },
+]
+
+[[rule]]
+name = "integration-needs-review-of-current-revision"
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "The linked review and completion need matching exact revision mementos."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.has_memento.uncle-enzo/github-target", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.memento_matches_call.uncle-enzo/github-revision", op = "eq", value = false },
+]
