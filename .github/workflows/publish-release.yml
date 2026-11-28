@@ -175,7 +175,8 @@ jobs:
             --source-sha "$CANDIDATE_SHA" \
             --workflow-sha "$CANDIDATE_SHA" \
             --release-tag "$RELEASE_TAG" \
-            --version "$version"
+            --version "$version" \
+            --require-embedded-provenance
 
       - name: Prepare release from the verified candidate bytes
         shell: bash
@@ -210,6 +211,8 @@ jobs:
           linux="tightbeam-$version-linux-x86_64-$short_sha.tgz"
           cp "$darwin_source" "$release_dir/$darwin"
           cp "$linux_source" "$release_dir/$linux"
+          cmp "$darwin_source" "$release_dir/$darwin"
+          cmp "$linux_source" "$release_dir/$linux"
           cp candidate-stage/release-candidate-manifest.json "$release_dir/release-candidate-manifest.json"
 
           (

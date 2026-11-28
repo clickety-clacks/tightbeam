@@ -53,9 +53,8 @@ if SOURCE=$(git rev-parse --verify HEAD 2>/dev/null); then
   printf '{"commit":"%s","tag":"v%s+%s"}\n' "$SOURCE" "$VERSION" "$BUILD" > "$OUT/setup-build.json"
 fi
 
-# Only the validated tagged push release carries automatic live-base adoption
-# authority. Candidate and manually dispatched workflows intentionally omit this
-# file, even when their ref happens to be a tag-shaped name.
+# Only the validated tagged push and exact canonical main release-candidate
+# lanes embed automatic live-base adoption authority.
 sh packaging/write-release-provenance.sh "$OUT/release-provenance.json"
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"

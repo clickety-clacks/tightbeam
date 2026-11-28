@@ -340,6 +340,56 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert changed =~ "staged candidate package differs from its proof bytes"
   end
 
+  test "required embedded authority binds both exact package bytes before staging", evidence do
+    fixture = proof_fixture!(evidence, "main")
+    fixture = Map.put(fixture, :workflow_sha, fixture.f2)
+    build = git!(fixture.repo, ["rev-list", "--count", fixture.f2])
+    tag = "v1.0.0+#{build}"
+    stage_root = Path.join(fixture.root, "candidate-stage")
+    required = ["--require-embedded-provenance"]
+
+    assert {"", 0} = create_manifest(fixture)
+    assert {missing, 1} = stage_command(fixture, stage_root, "create", tag, required)
+    assert missing =~ "expected exactly one regular embedded release provenance member"
+    refute File.exists?(stage_root)
+
+    record = %{
+      "format" => "tightbeam-release-provenance/v1",
+      "repository" => "clickety-clacks/tightbeam",
+      "tag" => tag,
+      "commit" => fixture.f2
+    }
+
+    darwin =
+      Path.join(fixture.evidence, "packages/darwin-aarch64/tightbeam-1.0.0-darwin-aarch64.tgz")
+
+    # These tiny archives only exercise the embedded metadata verifier. The
+    # complete real-package proof and byte-preserving copy are tested separately.
+    record_tar!(fixture, fixture.package, record)
+    record_tar!(fixture, darwin, Map.put(record, "commit", fixture.f1))
+    assert {"", 0} = create_manifest(fixture)
+    assert {mismatch, 1} = stage_command(fixture, stage_root, "create", tag, required)
+    assert mismatch =~ "embedded release provenance does not match the exact release"
+    refute File.exists?(stage_root)
+
+    record_tar!(fixture, darwin, record)
+    assert {"", 0} = create_manifest(fixture)
+    assert {"", 0} = stage_command(fixture, stage_root, "create", tag, required)
+    assert {"", 0} = stage_command(fixture, stage_root, "verify", tag, required)
+
+    for {platform, path} <- [{"darwin-aarch64", darwin}, {"linux-x86_64", fixture.package}] do
+      name = "tightbeam-1.0.0-#{platform}-#{String.slice(fixture.f2, 0, 7)}.tgz"
+      assert File.read!(Path.join(stage_root, name)) == File.read!(path)
+    end
+  end
+
+  defp record_tar!(fixture, path, record) do
+    staging = Path.join(fixture.root, "embedded-fixture")
+    File.mkdir_p!(Path.join(staging, "tightbeam"))
+    File.write!(Path.join(staging, "tightbeam/release-provenance.json"), JSON.encode!(record))
+    assert {_, 0} = command("tar", ["-czf", path, "tightbeam"], cd: staging)
+  end
+
   test "manifest verifier fails closed on wrong source and package hashes", evidence do
     fixture = proof_fixture!(evidence)
     assert {"", 0} = create_manifest(fixture)
@@ -479,7 +529,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     ])
   end
 
-  defp stage_command(fixture, stage_root, operation, tag) do
+  defp stage_command(fixture, stage_root, operation, tag, extra \\ []) do
     command(
       "python3",
       [
@@ -507,7 +557,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
         tag,
         "--version",
         "1.0.0"
-      ],
+      ] ++ extra,
       cd: fixture.repo
     )
   end
