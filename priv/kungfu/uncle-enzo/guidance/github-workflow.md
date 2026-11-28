@@ -1,8 +1,10 @@
 # GitHub delivery
 
-Record the repository and authorized integration branch on the work item before staffing. Use the repository's branch policy and the operator's explicit routing decisions. Open a short-lived pull request against that target. A release branch is a distinct delivery lane only when the release owner has designated it. Keep restricted lanes separate until the operator authorizes promotion.
+Record the repository and authorized destination branch on the work item when the work uses GitHub. Follow the repository's branch and review policy, including any operator routing decision. Each PR has its own base and head. A fork changes where the head lives, while the base identifies the branch that receives the change. Keep restricted lanes separate until the operator authorizes promotion.
 
-Record the PR link, tested head, required CI results and independent review on the linked work. Recheck the head and approvals at merge time. A new head needs its own verification and review. Merge only with the authority for that destination, then read back the merge commit and its reachability from the target. The release owner selects the exact source for a candidate and verifies that candidate before publication.
+Choose the steps the repository uses. A trunk-based project can send its PRs to the trunk and let a merge queue perform landing checks. A release-branch project can use a separate PR and evidence for each backport. Projects may use manual landing, required reviews, CODEOWNERS or CI requirements. Apply the merge strategy the repository elects, then record the resulting target commit. Squashing and rebasing can change the commit IDs that appear on the target.
+
+Record the PR link, tested head and the checks and reviews the repository requires. Recheck relevant evidence when the head changes. Merge with the authority for that destination and verify the result is reachable there. For tag-driven releases, the release owner selects the exact source and records the candidate evidence before publication.
 
 ## Observe GitHub when work needs it
 

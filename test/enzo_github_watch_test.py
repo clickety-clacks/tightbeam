@@ -14,8 +14,10 @@ loader.exec_module(watch)
 
 
 class Runner:
-    def __init__(self, demand=()):
+    def __init__(self, demand=(), *, base="main", queued=False):
         self.demand = list(demand)
+        self.base = base
+        self.queued = queued
         self.posts = []
         self.reads = []
 
@@ -35,7 +37,8 @@ class Runner:
             "merged": True,
             "mergeCommit": {"oid": "merge"},
             "headRefOid": "head",
-            "baseRefName": "main",
+            "baseRefName": self.base,
+            "mergeQueueEntry": {"id": "queue"} if self.queued else None,
             "timelineItems": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         }
         return {"repository": {"pullRequest": pull}}
@@ -65,6 +68,16 @@ class WatchTest(unittest.TestCase):
         self.assertIn("head=head", first)
         self.assertIn("commit=merge", first)
         self.assertIn("evidence=https://github.com/org/repo/pull/1", first)
+
+    def test_same_demand_contract_observes_trunk_and_release_branch(self):
+        for base, queued in (("main", True), ("release/2", False)):
+            with self.subTest(base=base):
+                runner = Runner([
+                    {"kind": watch.PREFIX + watch.SETTLED, "filter": {"scope": ["org/repo#1"]}},
+                ], base=base, queued=queued)
+                self.assertEqual(watch.run(["watch", "--once"], {}, runner, self.log), 0)
+                self.assertEqual(len(runner.posts), 1)
+                self.assertIn(f"base={base}", runner.posts[0])
 
     def test_checks_require_visible_expected_checks_and_terminal_results(self):
         linux = {"__typename": "CheckRun", "id": "a", "name": "linux",
