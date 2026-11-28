@@ -282,7 +282,7 @@ defmodule Tightbeam.Gateway do
       config = Map.merge(adapter_config, Map.new(context))
 
       with {:ok, opts} <- Placement.adapter_opts(config, key) do
-        run = config[:sh_out] || &Tightbeam.Harness.Support.system_cmd_out/1
+        run = config[:sh_out] || (&Tightbeam.Harness.Support.system_cmd_out/1)
         Harness.check_launch(Harness.module!(harness), opts, host, run)
       end
     end
@@ -304,7 +304,9 @@ defmodule Tightbeam.Gateway do
         session_status: fn session_key -> session_status(session_key, db, config) end,
         adapter_coordinator: Tightbeam.AdapterCoordinator,
         setup_readiness: fn ->
-          readiness = Tightbeam.Readiness.summary(config, Tightbeam.ModelCatalog, Archetypes.all())
+          readiness =
+            Tightbeam.Readiness.summary(config, Tightbeam.ModelCatalog, Archetypes.all())
+
           %{ready: readiness.runnable?, lines: Tightbeam.Readiness.render(readiness, config)}
         end
       })
