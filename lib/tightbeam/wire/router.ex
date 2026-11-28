@@ -2781,7 +2781,7 @@ defmodule Tightbeam.Wire.Router do
       StateResources.query_work_item_page(
         db(conn),
         request.filters,
-        %{rest_principal: principal},
+        %{rest_principal: core_detail_trace_principal(conn, principal)},
         boundary,
         request.limit
       )
