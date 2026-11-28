@@ -173,6 +173,61 @@ class WatchTest(unittest.TestCase):
                     self.assertIn(message, errors.getvalue())
                 self.assertEqual(fixture.posts, [])
 
+    def test_paired_events_use_distinct_evidence_and_demand(self):
+        watch = self.watch
+        visible = "pr.observed-checks-terminal"
+        required = "pr.checks-completed"
+        a = {"id": 4, "name": "A", "status": "completed", "conclusion": "failure"}
+        b = {"id": 5, "name": "B", "status": "completed", "conclusion": "success"}
+        pending_b = {**b, "status": "queued", "conclusion": None}
+
+        class ChecksFixture(Fixture):
+            def rest(self, endpoint):
+                if "/rules/branches/" in endpoint:
+                    return [{"type": "required_status_checks", "parameters": {
+                        "required_status_checks": [{"context": name} for name in self.requirements or []]
+                    }}]
+                if endpoint.endswith("/protection"):
+                    raise watch.ReadError("protection unavailable")
+                if "/branches/" in endpoint:
+                    return {"protected": self.requirements is None}
+                if "/check-runs?" in endpoint:
+                    return {"check_runs": self.checks}
+                return super().rest(endpoint)
+
+        cases = [
+            (None, [{**a, "isRequired": True}], {visible, required}, {visible}),
+            ([], [a], {visible, required}, {visible}),
+            (["A", "B"], [a], {visible, required}, {visible}),
+            (["A"], [a, pending_b], {visible, required}, {required}),
+            (["A", "B"], [a, b], {visible, required}, {visible, required}),
+            (None, [], {visible, required}, set()),
+            ([], [], {visible, required}, set()),
+            (["A", "B"], [a, b], {visible}, {visible}),
+            (["A", "B"], [a, b], {required}, {required}),
+        ]
+        for requirements, checks, kinds, expected in cases:
+            with self.subTest(requirements=requirements, checks=checks, kinds=kinds):
+                fixture = ChecksFixture([demand(kind, PULL + "89") for kind in kinds], "backport")
+                fixture.requirements = requirements
+                fixture.checks = checks
+                observer = watch.Observer(fixture, self.cursor)
+                self.assertTrue(observer.poll())
+                self.assertEqual({post["event"] for post in fixture.posts}, {PREFIX + k for k in expected})
+                self.assertEqual(len({post["key"] for post in fixture.posts}), len(expected))
+                for post in fixture.posts:
+                    self.assertEqual(post["revision"], HEAD)
+                    payload = json.loads(post["observation"])
+                    if post["event"] == PREFIX + required:
+                        self.assertEqual(payload["requirements"][0][2][0][-1], "failure")
+                    else:
+                        self.assertEqual(payload["count"], len(checks))
+                initial = fixture.posts.copy()
+                self.assertTrue(observer.poll())
+                self.assertEqual(fixture.posts, initial + initial)
+                if kinds == {visible}:
+                    self.assertFalse(any("/rules/branches/" in path for path in fixture.reads))
+
     def test_required_source_and_latest_attempt_must_match(self):
         observer = self.watch.Observer(None, self.cursor)
         required = [("ci", 42), ("macos", None)]

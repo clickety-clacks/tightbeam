@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote
 
 PREFIX = "uncle-enzo/github-watch/"
 KINDS = {
+    "pr.observed-checks-terminal": "pull",
     "pr.checks-completed": "pull",
     "pr.merged": "pull",
     "pr.closed": "pull",
@@ -299,16 +300,21 @@ class Observer:
         before = self.read(endpoint)
         head, base, state = self.pull_identity(before)
         completed = []
-        if "pr.checks-completed" in kinds and state == "open":
-            requirements = self.requirements(repository, base)
+        checks = []
+        visible_demand = "pr.observed-checks-terminal" in kinds
+        required_demand = "pr.checks-completed" in kinds
+        if state == "open":
+            requirements = self.requirements(repository, base) if required_demand else None
+            if visible_demand or requirements:
+                checks = self.checks(repository, head)
             if requirements == []:
                 print(f"github-watch: no required checks for {scope} on {base}", file=sys.stderr)
             elif requirements:
-                checks = self.checks(repository, head)
                 if self.requirements(repository, base) == requirements:
                     completed = self.completed_requirements(requirements, checks)
                 else:
-                    raise ReadError("applicable requirements moved during read")
+                    # The visible snapshot is independent of the requirements.
+                    print(f"github-watch: applicable requirements moved for {scope}", file=sys.stderr)
 
         terminal = kinds & {"pr.merged", "pr.closed", "pr.settled"}
         timeline = []
@@ -323,6 +329,13 @@ class Observer:
         after = self.read(endpoint)
         if self.pull_identity(after) != (head, base, state):
             raise ReadError("pull request moved during read")
+
+        if visible_demand and checks and all(self.terminal(row) for row in checks):
+            attempts = [[row["source"], row["id"], row["conclusion"]] for row in checks]
+            self.post("pr.observed-checks-terminal", scope, head, [head, attempts], {
+                "state": "observed-checks-terminal", "count": len(checks),
+                "attemptsDigest": digest(attempts), "evidence": scope + "/checks",
+            })
 
         if completed:
             attempts = [

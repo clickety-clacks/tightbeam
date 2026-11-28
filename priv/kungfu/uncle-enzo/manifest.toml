@@ -14,6 +14,15 @@ command = "sentinels/github-watch"
 requires = ["GH_CONFIG_DIR"]
 
 [[sentinels.events]]
+name = "pr.observed-checks-terminal"
+description = "A nonempty snapshot of all visible checks for the observed pull request head is terminal."
+details = [
+  { name = "scope", description = "Canonical GitHub subject URL." },
+  { name = "revision", description = "Observed commit OID." },
+  { name = "observation", description = "JSON with source identity, state and evidence." },
+]
+
+[[sentinels.events]]
 name = "pr.checks-completed"
 description = "All known required checks for the observed pull request head are terminal."
 details = [
