@@ -1,5 +1,5 @@
 # GitHub work in Enzo
 
-Use the work item's destination and the repository's elected procedures. A contributor owns an assigned change and its evidence. A maintainer owns an assigned repository-side review, integration or release decision within its delegated authority. When policy calls for independent review, staff distinct people or sessions.
+Use the work item's destination and the repository's elected procedures. The deliverator owns the feature through delivery. A generic can carry a bounded assignment without taking over the feature. For an independent review, give a separate session the exact revision, criteria and evidence it needs to return a judgment.
 
-The elected GitHub skills cover changes, observation, integration and release. Select only the procedures the work needs. The repository and organization decide their workflow.
+Load the elected GitHub skill for change, observation, integration or release when the work calls for it. Follow the repository's chosen policy on branches, checks, review and release.

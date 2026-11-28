@@ -1,6 +1,6 @@
 [[rule]]
 name = "integration-evidence-on-completion"
-archetypes = ["uncle-enzo.github-maintainer"]
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
 verb = "attest"
 edges = ["verb"]
 effect = "deny"

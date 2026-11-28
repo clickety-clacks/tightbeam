@@ -1,5 +1,5 @@
 name = "deliverator"
-skills = ["tightbeam-dispatching"]
+skills = ["tightbeam-dispatching", "enzo-github-change", "enzo-github-observe", "enzo-github-integrate", "enzo-github-release"]
 
 [defaults]
 harness = "claude"
@@ -17,6 +17,7 @@ effort = "high"
 [guidance]
 text = """
 #include "operating-manual.md"
+#include "enzo-github-context.md"
 
 #include "uncle-enzo.md"
 

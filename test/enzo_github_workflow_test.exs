@@ -30,26 +30,36 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "test")
     assert {:ok, _} = Identity.publish_live!(base, candidate)
     refute "agentic-engineering" in Identity.public_kungfu_names(base)
-    elected = "uncle-enzo.github-maintainer"
+    elected = "uncle-enzo.deliverator"
     snapshot = Identity.snapshot!(base, elected, :codex)
     assert snapshot.guidance =~ "Use the work item's destination"
-    assert Map.has_key?(snapshot.skills, "enzo-github-observe")
+    review = Identity.snapshot!(base, "uncle-enzo.generic", :codex)
+    for skill <- ~w(change observe integrate release) do
+      assert Map.has_key?(snapshot.skills, "enzo-github-" <> skill)
+      assert Map.has_key?(review.skills, "enzo-github-" <> skill)
+    end
+    assert "tightbeam-dispatching" in snapshot.archetype.skills
 
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
     :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',1,1)")
 
-    Org.create(db, %{
-      session_key: "fixture-maintainer",
-      display_name: "Fixture maintainer",
-      owner_user_id: "owner",
-      origin: "user:owner",
-      archetype: elected,
-      host: "fixture-host",
-      harness: "codex",
-      provider: "openai",
-      model: Model.new("gpt-6.2-sol")
-    })
+    for {session, archetype} <- [
+          {"fixture-deliverator", elected},
+          {"fixture-reviewer", "uncle-enzo.generic"}
+        ] do
+      Org.create(db, %{
+        session_key: session,
+        display_name: session,
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: archetype,
+        host: "fixture-host",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-6.2-sol")
+      })
+    end
 
     handlers = Gateway.handlers(%{db: db, base_dir: base, wake_scheduler: :enzo_fixture})
     Rules.load!(base, Map.keys(handlers))
@@ -70,12 +80,12 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
       )
 
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
-    {:ok, [[token]]} = DB.query(db, "SELECT cliToken FROM sessions WHERE sessionKey='fixture-maintainer'")
+    {:ok, [[token]]} = DB.query(db, "SELECT cliToken FROM sessions WHERE sessionKey='fixture-deliverator'")
     url = "http://127.0.0.1:#{port}"
 
     File.write!(
       Path.join(root, ".tightbeam-session"),
-      JSON.encode!(%{url: url, token: token, sessionKey: "fixture-maintainer"})
+      JSON.encode!(%{url: url, token: token, sessionKey: "fixture-deliverator"})
     )
 
     bin = Path.join(root, "bin")
@@ -94,7 +104,7 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
       {"ENZO_FIXTURE_READS", Path.join(root, "github-reads")}
     ]
 
-    %{db: db, root: root, base: base, env: env}
+    %{db: db, root: root, base: base, env: env, url: url}
   end
 
   test "Enzo-only trunk queue separates head-check evidence and landing on a linked row", ctx do
@@ -118,6 +128,7 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
       ~s({"oid":"#{@merge}","pr":17,"ref":"refs/heads/main","repo":"github.com/example/widget"}))
     attach(ctx, item, "github-evidence", scope <> "/checks")
     complete_with_evidence!(ctx, item, "code", scope <> "/checks")
+    assert_feature_owner(ctx, item)
     assert %{"uncle-enzo/github-pr" => [^scope]} = metadata(ctx, item)
     assert observations(ctx, "release.published") == []
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
@@ -149,6 +160,7 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     attach(ctx, item, "github-pr", merged)
     attach(ctx, item, "github-evidence", [tag, release])
     complete_with_evidence!(ctx, item, "release", release)
+    assert_feature_owner(ctx, item)
     assert %{"uncle-enzo/github-target" => [^target]} = metadata(ctx, item)
     assert metadata(ctx, sibling) == %{}
   end
@@ -191,12 +203,13 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
 
     assignment =
       cli!(ctx, [
-        "assign", "--subject", "Verify integration", "--session", "fixture-maintainer",
+        "assign", "--subject", "Verify integration", "--session", "fixture-deliverator",
         "--work-item", item, "--effect-kind", effect_kind,
         "--memento", "uncle-enzo/github-target=" <> target
       ])
 
     id = Map.fetch!(assignment, "id")
+    if effect_kind == "release", do: independent_review!(ctx, item, id)
     args = ["attest", id, "--kind", "completion", "--note", "Verified the observed integration"]
     {refusal, status} = run_cli(ctx, args)
     assert status != 0
@@ -210,9 +223,56 @@ defmodule Tightbeam.EnzoGitHubWorkflowTest do
     assert metadata_for(ctx, "attest:" <> attest)["uncle-enzo/github-evidence"] == [evidence]
   end
 
+  defp independent_review!(ctx, item, integration) do
+    revision = "https://github.com/example/widget/commit/" <> @head
+
+    review =
+      cli!(ctx, [
+        "assign", "--subject", "Independently verify the exact backport revision",
+        "--session", "fixture-reviewer", "--work-item", item,
+        "--reviews", integration, "--effect-kind", "review"
+      ])
+
+    review_id = Map.fetch!(review, "id")
+    reviewer = reviewer_context(ctx)
+    verdict =
+      cli!(reviewer, [
+        "attest", review_id, "--kind", "verdict", "--verdict", "reviewed-clean",
+        "--note", "The synthetic backport satisfies the bounded compatibility criteria",
+        "--memento", "uncle-enzo/github-revision=" <> revision
+      ])
+
+    assert metadata_for(ctx, "attest:" <> verdict["attest"]["id"])["uncle-enzo/github-revision"] ==
+             [revision]
+
+    assert_feature_owner(ctx, item)
+  end
+
+  defp reviewer_context(ctx) do
+    key = "fixture-reviewer"
+    assert {:ok, [[token]]} = DB.query(ctx.db, "SELECT cliToken FROM sessions WHERE sessionKey=?1", [key])
+    root = Path.join(ctx.root, "review")
+    File.mkdir!(root)
+
+    File.write!(
+      Path.join(root, ".tightbeam-session"),
+      JSON.encode!(%{url: ctx.url, token: token, sessionKey: key})
+    )
+
+    env = Map.put(Map.new(ctx.env), "TIGHTBEAM_TOKEN", token)
+    %{ctx | root: root, env: env}
+  end
+
   defp work!(ctx, title) do
-    result = cli!(ctx, ["work-item-create", "--title", title])
-    Map.fetch!(result, "id")
+    item = cli!(ctx, ["work-item-create", "--title", title]) |> Map.fetch!("id")
+    cli!(ctx, ["work-item-update", item, "--delivery-owner", "fixture-deliverator"])
+    assert_feature_owner(ctx, item)
+    item
+  end
+
+  defp assert_feature_owner(ctx, item) do
+    assert {:ok, [["fixture-deliverator"]]} =
+             DB.query(ctx.db, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id=?1", [item])
   end
 
   defp subscribe(ctx, event, scope) do

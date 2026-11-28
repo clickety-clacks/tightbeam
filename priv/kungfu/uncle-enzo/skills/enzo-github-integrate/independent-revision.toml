@@ -1,8 +1,8 @@
-# Elect only for maintainer assignments whose local policy requires exact review.
+# Elect only for assignments whose local policy requires exact review.
 # Narrow the selectors or target predicate before copying this into identity rules.
 [[rule]]
 name = "integration-needs-independent-judgment"
-archetypes = ["uncle-enzo.github-maintainer"]
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
 verb = "attest"
 edges = ["verb"]
 effect = "deny"
@@ -15,7 +15,7 @@ deny_when = [
 
 [[rule]]
 name = "integration-needs-clean-judgment"
-archetypes = ["uncle-enzo.github-maintainer"]
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
 verb = "attest"
 edges = ["verb"]
 effect = "deny"
@@ -28,7 +28,7 @@ deny_when = [
 
 [[rule]]
 name = "integration-needs-review-of-current-revision"
-archetypes = ["uncle-enzo.github-maintainer"]
+archetypes = ["uncle-enzo.deliverator", "uncle-enzo.generic"]
 verb = "attest"
 edges = ["verb"]
 effect = "deny"
